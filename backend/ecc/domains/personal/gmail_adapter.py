@@ -101,6 +101,7 @@ resource type no-op-succeeds rather than raises" contract interpretation.
 from __future__ import annotations
 
 import base64
+import logging
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -137,6 +138,8 @@ from .gmail_shared import (
     pack_credential,
     unpack_credential,
 )
+
+_logger = logging.getLogger(__name__)
 
 GOOGLE_OAUTH_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_OAUTH_BASE_URL = "https://oauth2.googleapis.com"
@@ -1423,7 +1426,22 @@ class GmailAdapter:
         }
         return f"{GOOGLE_OAUTH_AUTHORIZE_URL}?{urlencode(params)}"
 
-    def handle_oauth_callback(self, code: str, state: str) -> ConnectorAuthorization:
+    def handle_oauth_callback(
+        self,
+        code: str,
+        state: str,
+        *,
+        revoke_on_reject: Callable[[str | None], bool] | None = None,
+    ) -> ConnectorAuthorization:
+        """`revoke_on_reject` (Spec A S1.10): when given, a rejection
+        inside the post-exchange guard below revokes the just-minted grant
+        only if `revoke_on_reject(email)` returns True, where `email` is
+        the validated Google account address, or None when the rejection
+        happened before it was known. When omitted, every such rejection
+        revokes unconditionally (the historical behavior). The hook can
+        never hide the rejection: if it raises, the revoke is skipped and
+        the original `AdapterAuthorizationError` still propagates.
+        """
         settings = get_settings()
         if not settings.gmail_oauth_client_id or not settings.gmail_oauth_client_secret:
             raise AdapterAuthorizationError("Gmail OAuth client is not configured")
@@ -1482,6 +1500,10 @@ class GmailAdapter:
         # has a value to revoke (empty, if parsing failed before assignment
         # -- a harmless no-op per the same contract noted above).
         refresh_token: str | None = None
+        # Set only once `emailAddress` has passed validation below, so the
+        # `revoke_on_reject` hook sees None for every earlier rejection
+        # (never a raw, unvalidated profile value).
+        resolved_email: str | None = None
         try:
             try:
                 body = response.json()
@@ -1606,13 +1628,15 @@ class GmailAdapter:
             # call below -- round 7 review, same gap class as `scope` above.
             if not isinstance(email_address, str) or not email_address:
                 raise AdapterAuthorizationError("Gmail profile response missing emailAddress")
+            resolved_email = email_address
 
             if not self.is_account_allowed(email_address):
                 # No email in the message (Spec A S1.6 / T7): this text
                 # reaches logs and the 422 `error` field.
                 raise AdapterAuthorizationError("Gmail account is not on the internal allowlist")
         except Exception:
-            self._revoke_best_effort(refresh_token or "")
+            if self._should_revoke_on_reject(revoke_on_reject, resolved_email):
+                self._revoke_best_effort(refresh_token or "")
             raise
 
         credential = pack_credential(
@@ -2932,6 +2956,26 @@ class GmailAdapter:
         except (ValueError, TypeError):
             return None
         self._revoke_best_effort(credential.get("refresh_token", ""))
+
+    @staticmethod
+    def _should_revoke_on_reject(
+        revoke_on_reject: Callable[[str | None], bool] | None, email: str | None
+    ) -> bool:
+        """Decide whether a rejected callback revokes its minted grant.
+        No hook -> always (historical behavior). A hook that raises ->
+        skip, logging only the exception class (never its message or the
+        email), so the caller's original rejection is what propagates.
+        """
+        if revoke_on_reject is None:
+            return True
+        try:
+            return revoke_on_reject(email) is True
+        except Exception as exc:
+            _logger.warning(
+                "gmail_revoke_on_reject_hook_failed",
+                extra={"error_class": type(exc).__name__},
+            )
+            return False
 
     def _revoke_best_effort(self, refresh_token: str) -> None:
         """Shared by `disconnect` and the single `try/except` guarding

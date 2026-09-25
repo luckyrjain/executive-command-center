@@ -614,6 +614,171 @@ def test_handle_oauth_callback_rejects_non_allowlisted_account(
         get_settings.cache_clear()
 
 
+# --- handle_oauth_callback `revoke_on_reject` hook (Spec A S1.10) ----------
+
+
+class _HookError(RuntimeError):
+    pass
+
+
+def _revoke_hook(mode: str, seen: list[str | None]) -> Any:
+    """`None` mode means "no hook" (historical unconditional revoke)."""
+    if mode == "none":
+        return None
+
+    def hook(email: str | None) -> bool:
+        seen.append(email)
+        if mode == "raises":
+            raise _HookError(f"hook blew up for {email}")
+        return mode == "true"
+
+    return hook
+
+
+@pytest.mark.parametrize(
+    ("hook_mode", "expect_revoke"),
+    [("none", True), ("true", True), ("false", False), ("raises", False)],
+)
+@pytest.mark.parametrize(
+    ("rejection", "expected_email"),
+    [
+        # Profile lookup 5xx: Google already minted a grant, but the
+        # account's email is not yet known.
+        ("email_unknown", None),
+        # Allowlist rejection: the validated email is known.
+        ("email_known", _ALLOWED_EMAIL),
+    ],
+)
+def test_handle_oauth_callback_revoke_on_reject_hook(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    rejection: str,
+    expected_email: str | None,
+    hook_mode: str,
+    expect_revoke: bool,
+) -> None:
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv(
+        "ECC_GMAIL_OAUTH_ALLOWLIST",
+        _ALLOWED_EMAIL if rejection == "email_unknown" else "someone-else@example.test",
+    )
+    get_settings.cache_clear()
+    revoked_tokens: list[str] = []
+    seen: list[str | None] = []
+    try:
+        adapter = GmailAdapter(
+            transport=_oauth_transport(
+                profile_status=500 if rejection == "email_unknown" else 200,
+                revoked_tokens=revoked_tokens,
+            )
+        )
+        with (
+            caplog.at_level("DEBUG"),
+            pytest.raises(AdapterAuthorizationError) as excinfo,
+        ):
+            adapter.handle_oauth_callback(
+                "auth-code", "state-value", revoke_on_reject=_revoke_hook(hook_mode, seen)
+            )
+        # The original rejection always propagates, never the hook's error.
+        assert not isinstance(excinfo.value.__context__, _HookError)
+        if rejection == "email_unknown":
+            assert "profile lookup failed" in str(excinfo.value)
+        else:
+            assert str(excinfo.value) == "Gmail account is not on the internal allowlist"
+        assert revoked_tokens == (["refresh-1"] if expect_revoke else [])
+        assert seen == ([] if hook_mode == "none" else [expected_email])
+        if hook_mode == "raises":
+            records = [r for r in caplog.records if r.msg == "gmail_revoke_on_reject_hook_failed"]
+            assert len(records) == 1
+            assert records[0].__dict__["error_class"] == "_HookError"
+            assert _ALLOWED_EMAIL not in caplog.text
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_revoke_on_reject_hook_sees_none_for_invalid_email(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A profile body with a non-string `emailAddress` is rejected before
+    the email is validated, so the hook must see None -- never the raw
+    unvalidated value."""
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    get_settings.cache_clear()
+    revoked_tokens: list[str] = []
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/token":
+            return _json_response(_token_response())
+        if request.url.path == "/gmail/v1/users/me/profile":
+            return _json_response({"emailAddress": 12345})
+        if request.url.path == "/revoke":
+            revoked_tokens.append(request.content.decode().removeprefix("token="))
+            return httpx.Response(200)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    def hook(email: str | None) -> bool:
+        seen.append(email)
+        return False
+
+    try:
+        adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+        with pytest.raises(AdapterAuthorizationError, match="missing emailAddress"):
+            adapter.handle_oauth_callback("auth-code", "state-value", revoke_on_reject=hook)
+        assert seen == [None]
+        assert revoked_tokens == []
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_revoke_on_reject_hook_not_called_before_exchange(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed token exchange minted nothing, so there is nothing to
+    revoke and the hook is never consulted."""
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+    revoked_tokens: list[str] = []
+    seen: list[str | None] = []
+    try:
+        adapter = GmailAdapter(
+            transport=_oauth_transport(token_status=400, revoked_tokens=revoked_tokens)
+        )
+        with pytest.raises(AdapterAuthorizationError, match="token exchange failed"):
+            adapter.handle_oauth_callback(
+                "auth-code", "state-value", revoke_on_reject=_revoke_hook("true", seen)
+            )
+        assert seen == []
+        assert revoked_tokens == []
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_revoke_on_reject_hook_not_called_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    get_settings.cache_clear()
+    revoked_tokens: list[str] = []
+    seen: list[str | None] = []
+    try:
+        adapter = GmailAdapter(transport=_oauth_transport(revoked_tokens=revoked_tokens))
+        authorization = adapter.handle_oauth_callback(
+            "auth-code", "state-value", revoke_on_reject=_revoke_hook("true", seen)
+        )
+        assert authorization.external_account_id == _ALLOWED_EMAIL
+        assert seen == []
+        assert revoked_tokens == []
+    finally:
+        get_settings.cache_clear()
+
+
 def test_handle_oauth_callback_rejects_when_not_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

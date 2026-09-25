@@ -96,6 +96,12 @@ from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.platform import audit_outbox, authz, cursor_pagination, idempotency
 from ecc.platform.authz import UnknownResourceTypeError
+from ecc.platform.connector_security import (
+    is_personal_resource,
+    personal_data_isolation_enabled,
+    personal_data_share_guard,
+    require_not_personal_data,
+)
 from ecc.platform.request_models import EmptyBody as _EmptyBody
 
 router = APIRouter(prefix="/api/v1/delegations", tags=["delegations"])
@@ -523,6 +529,14 @@ def _grant_evidence(
             action="read",
         ):
             continue
+        # S1.3 (Spec A, Arch N8): a personal-data row is skipped exactly
+        # like one the delegator lost access to -- never granted, and never
+        # a failure of the whole accept. `authorize()` above already
+        # confirmed the row is in this workspace.
+        if personal_data_isolation_enabled() and is_personal_resource(
+            session, item.resource_type, item.resource_id
+        ):
+            continue
         session.execute(
             text(
                 f"UPDATE {item.resource_type} SET visibility = 'shared_explicitly' "  # noqa: S608
@@ -620,7 +634,12 @@ def create_delegation_endpoint(
         ) from exc
 
     request_hash = idempotency.request_hash(payload, "create")
-    with session.begin():
+    # A refused personal-data evidence item unwinds `session.begin()`
+    # (rollback) before the guard writes its refusal audit.
+    with (
+        personal_data_share_guard(auth, request, path="delegation_create") as refusal,
+        session.begin(),
+    ):
         idempotency.lock_idempotency(session, auth, idempotency_key)
         cached = idempotency.load_cached(
             session, auth, idempotency_key, request_hash, domain="collaboration_delegations"
@@ -675,6 +694,19 @@ def create_delegation_endpoint(
                 action="read",
             ):
                 raise HTTPException(status_code=404, detail="EVIDENCE_NOT_FOUND")
+
+        # S1.3: every evidence item -- including the obligation itself,
+        # which accept grants too -- was just confirmed by `authorize()` to
+        # be in this workspace, so the unscoped personal-data predicate
+        # reveals nothing about any other workspace's rows.
+        if personal_data_isolation_enabled():
+            evidence_to_check = [(payload.obligation_type, payload.obligation_resource_id)]
+            evidence_to_check.extend(
+                (item.resource_type, item.resource_id) for item in payload.evidence
+            )
+            for resource_type, resource_id in evidence_to_check:
+                refusal.resource_id = resource_id
+                require_not_personal_data(session, resource_type, resource_id)
 
         delegation_id = uuid4()
         session.execute(
