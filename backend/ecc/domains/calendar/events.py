@@ -433,7 +433,7 @@ def update_calendar_event(
                     SET {", ".join(assignments)}
                     WHERE workspace_id = :workspace_id AND id = :event_id
                     RETURNING {_SELECT_FIELDS}
-                    """
+                    """  # noqa: S608 -- SET keys from extra="forbid" Patch fields; values bound
                 ),
                 values,
             )

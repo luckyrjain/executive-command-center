@@ -106,7 +106,7 @@ def count_recommendations(auth: AuthDep, session: SessionDep) -> RecommendationC
               AND ({visibility_sql})
               AND archived_at IS NULL
               AND status = ANY(CAST(:statuses AS text[]))
-        """),
+        """),  # noqa: S608 -- authz visibility fragment; values bound
         {
             "workspace_id": auth.workspace_id,
             "statuses": ["proposed", "pending_confirmation"],
