@@ -396,11 +396,23 @@ def list_relationships(
     # which is always `entity_id`, already known visible) is simpler than
     # branching on `direction` to single out "the other one" and has the
     # identical effect.
+    # Distinct `param_prefix`es so each fragment binds its own parameters,
+    # rather than relying on both calls happening to produce identical ones.
     src_visibility_sql, src_visibility_params = authz.visible_resource_filter_sql(
-        session, auth, resource_type="pkos_nodes", action="read", table_alias="src"
+        session,
+        auth,
+        resource_type="pkos_nodes",
+        action="read",
+        table_alias="src",
+        param_prefix="src_",
     )
-    tgt_visibility_sql, _ = authz.visible_resource_filter_sql(
-        session, auth, resource_type="pkos_nodes", action="read", table_alias="tgt"
+    tgt_visibility_sql, tgt_visibility_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="pkos_nodes",
+        action="read",
+        table_alias="tgt",
+        param_prefix="tgt_",
     )
     clauses = [entity_clause, f"({src_visibility_sql})", f"({tgt_visibility_sql})"]
     params: dict[str, Any] = {
@@ -408,6 +420,7 @@ def list_relationships(
         "entity_id": entity_id,
         "limit": limit + 1,
         **src_visibility_params,
+        **tgt_visibility_params,
     }
     if relationship_type is not None:
         clauses.append("e.edge_type = :relationship_type")
