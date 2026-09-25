@@ -434,7 +434,7 @@ def list_relationships(
                 WHERE e.workspace_id = :workspace_id AND {" AND ".join(clauses)}
                 ORDER BY e.id
                 LIMIT :limit
-                """
+                """  # noqa: S608 -- literal clauses + authz fragments; values bound
             ),
             params,
         )

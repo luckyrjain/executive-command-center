@@ -473,7 +473,7 @@ def load_resource(session: Session, *, resource_type: str, resource_id: UUID) ->
     require_known_resource_type(resource_type)
     row = (
         session.execute(
-            text(f"SELECT workspace_id, owner_id, visibility FROM {resource_type} WHERE id = :id"),  # noqa: S608
+            text(f"SELECT workspace_id, owner_id, visibility FROM {resource_type} WHERE id = :id"),  # noqa: S608 -- resource_type allowlisted by require_known_resource_type
             {"id": resource_id},
         )
         .mappings()
