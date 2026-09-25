@@ -31,7 +31,7 @@ from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -53,6 +53,13 @@ from .authz import (
     require_grantable,
     require_known_resource_type,
     users_id_for_account,
+)
+from .connector_security import (
+    is_personal_resource,
+    personal_data_isolation_enabled,
+    personal_data_share_guard,
+    refuse_personal_data_share,
+    require_not_personal_data,
 )
 
 
@@ -246,6 +253,7 @@ def _require_owner_admin_or_resource_owner(
 @router.post("/grants", response_model=GrantResponse, status_code=status.HTTP_201_CREATED)
 def create_grant_endpoint(
     payload: GrantCreateRequest,
+    request: Request,
     auth: AuthDep,
     session: SessionDep,
     _csrf: CsrfDep,
@@ -257,7 +265,12 @@ def create_grant_endpoint(
             status_code=status.HTTP_400_BAD_REQUEST, detail="RESOURCE_TYPE_NOT_GRANTABLE"
         ) from exc
 
-    with session.begin():
+    # A refused personal-data share unwinds `session.begin()` (rollback,
+    # row lock released) before the guard writes its refusal audit.
+    with (
+        personal_data_share_guard(auth, request, path="grant", resource_id=payload.resource_id),
+        session.begin(),
+    ):
         # Locked first, authorized against the locked value second -- see
         # `_load_resource_for_update`'s own docstring. Without this, a
         # concurrent ownership transfer away from this caller (a non-
@@ -271,6 +284,11 @@ def create_grant_endpoint(
         if resource is None or resource.workspace_id != auth.workspace_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="RESOURCE_NOT_FOUND")
         _require_owner_admin_or_resource_owner(session, auth, resource)
+        # Only after the row is confirmed to be in the caller's own
+        # workspace (the predicate is an unscoped EXISTS-by-id) and the
+        # caller is entitled to share it.
+        if personal_data_isolation_enabled():
+            require_not_personal_data(session, payload.resource_type, payload.resource_id)
 
         grantee_membership = (
             session.execute(
@@ -507,7 +525,11 @@ class GrantPreviewResponse(BaseModel):
 
 @router.post("/grants/preview", response_model=GrantPreviewResponse)
 def preview_grant_endpoint(
-    payload: GrantPreviewRequest, auth: AuthDep, session: SessionDep, _csrf: CsrfDep
+    payload: GrantPreviewRequest,
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
 ) -> GrantPreviewResponse:
     """Read-only dry run of `POST /grants` -- `UX-STATES.md`'s "Sharing
     previews exactly what becomes visible" requirement, computed from the
@@ -542,6 +564,18 @@ def preview_grant_endpoint(
         session.rollback()
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="RESOURCE_NOT_FOUND")
     _require_owner_admin_or_resource_owner(session, auth, resource)
+    # Same placement as `create_grant_endpoint`: workspace already verified.
+    if personal_data_isolation_enabled() and is_personal_resource(
+        session, payload.resource_type, payload.resource_id
+    ):
+        session.rollback()
+        raise refuse_personal_data_share(
+            auth,
+            request,
+            resource_type=payload.resource_type,
+            resource_id=payload.resource_id,
+            path="grant_preview",
+        )
 
     grantee_membership = (
         session.execute(
@@ -693,6 +727,7 @@ class OwnershipTransferListResponse(BaseModel):
 )
 def create_ownership_transfer_endpoint(
     payload: OwnershipTransferCreateRequest,
+    request: Request,
     auth: AuthDep,
     session: SessionDep,
     _csrf: CsrfDep,
@@ -714,7 +749,10 @@ def create_ownership_transfer_endpoint(
             status_code=status.HTTP_400_BAD_REQUEST, detail="RESOURCE_TYPE_NOT_GRANTABLE"
         ) from exc
 
-    with session.begin():
+    with (
+        personal_data_share_guard(auth, request, path="transfer", resource_id=payload.resource_id),
+        session.begin(),
+    ):
         # Locked FIRST, authorized against the locked value second -- see
         # `_load_resource_for_update`'s own docstring. Two concurrent
         # transfers of the same resource are now fully serialized: the
@@ -728,6 +766,9 @@ def create_ownership_transfer_endpoint(
         if resource is None or resource.workspace_id != auth.workspace_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="RESOURCE_NOT_FOUND")
         _require_owner_admin_or_resource_owner(session, auth, resource)
+        # Workspace verified above; see `create_grant_endpoint`.
+        if personal_data_isolation_enabled():
+            require_not_personal_data(session, payload.resource_type, payload.resource_id)
         locked_owner_id = resource.owner_id
 
         to_membership = (

@@ -711,13 +711,24 @@ def collect_member_artifacts(
 # --- cleanup ------------------------------------------------------------------
 
 
-def cleanup_workspace(workspace_id: UUID, account_ids: Sequence[UUID]) -> None:
+def cleanup_workspace(
+    workspace_id: UUID,
+    account_ids: Sequence[UUID],
+    *,
+    extra_cleanup_tables: Sequence[str] = (),
+) -> None:
     """Deletes every row this fixture's production calls can write for
     `workspace_id`, the workspace itself, and the identities' `accounts`
     rows (`accounts.email` is globally unique, so leftovers would collide
-    with a later run)."""
+    with a later run).
+
+    `extra_cleanup_tables`: workspace-scoped tables a *consumer* test
+    writes to that this fixture's own calls never do (e.g.
+    `resource_grants`, `delegations`). Deleted first, in the order given
+    (children first), since such rows typically FK to `users` or to the
+    fixture's own rows."""
     with engine.begin() as connection:
-        for table in _CLEANUP_TABLES:
+        for table in (*extra_cleanup_tables, *_CLEANUP_TABLES):
             connection.execute(
                 text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
                 {"workspace_id": workspace_id},
@@ -761,12 +772,17 @@ def _mailbox(
 
 
 @contextmanager
-def build_gmail_sync_world(*, env: Mapping[str, str] | None = None) -> Iterator[GmailSyncWorld]:
+def build_gmail_sync_world(
+    *,
+    env: Mapping[str, str] | None = None,
+    extra_cleanup_tables: Sequence[str] = (),
+) -> Iterator[GmailSyncWorld]:
     """Two members of one new workspace, each with a real-synced Gmail
     mailbox: A (`owner`, the workspace's original user) and B (`member`).
     `env` overrides are applied for the sync and stay applied while the
     world is yielded (see `gmail_sync_harness`). The harness stays active
-    until the world is torn down; the workspace is deleted afterwards."""
+    until the world is torn down; the workspace is deleted afterwards,
+    including `extra_cleanup_tables` (see `cleanup_workspace`)."""
     suffix = uuid4().hex[:10]
     workspace_id = uuid4()
     user_ids = {"a": uuid4(), "b": uuid4()}
@@ -845,7 +861,9 @@ def build_gmail_sync_world(*, env: Mapping[str, str] | None = None) -> Iterator[
                 harness=harness,
             )
     finally:
-        cleanup_workspace(workspace_id, list(account_ids.values()))
+        cleanup_workspace(
+            workspace_id, list(account_ids.values()), extra_cleanup_tables=extra_cleanup_tables
+        )
 
 
 @pytest.fixture
@@ -865,7 +883,8 @@ GmailSyncWorldFactory = Callable[..., GmailSyncWorld]
 
 @pytest.fixture
 def gmail_sync_world_factory() -> Iterator[GmailSyncWorldFactory]:
-    """Factory form: `world = gmail_sync_world_factory(env={...})`, callable
+    """Factory form: `world = gmail_sync_world_factory(env={...},
+    extra_cleanup_tables=(...))`, callable
     more than once per test; every world built is torn down (harness,
     then workspace, most recent first) at the end of the test. Worlds
     nest: while a later world is alive its harness's patches are the
@@ -873,7 +892,13 @@ def gmail_sync_world_factory() -> Iterator[GmailSyncWorldFactory]:
     world."""
     with ExitStack() as stack:
 
-        def build(*, env: Mapping[str, str] | None = None) -> GmailSyncWorld:
-            return stack.enter_context(build_gmail_sync_world(env=env))
+        def build(
+            *,
+            env: Mapping[str, str] | None = None,
+            extra_cleanup_tables: Sequence[str] = (),
+        ) -> GmailSyncWorld:
+            return stack.enter_context(
+                build_gmail_sync_world(env=env, extra_cleanup_tables=extra_cleanup_tables)
+            )
 
         yield build
