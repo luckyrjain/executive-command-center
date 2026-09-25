@@ -3330,7 +3330,8 @@ def test_oauth_callback_revokes_new_grant_when_integrity_error_handler_reselect_
         second_state = httpx.URL(second_start.json()["authorization_url"]).params["state"]
 
         _fail_next_matching_execute(
-            monkeypatch, "SELECT id, status, encrypted_credentials FROM connector_accounts"
+            monkeypatch,
+            "SELECT id, status, owner_id, encrypted_credentials FROM connector_accounts",
         )
         with pytest.raises(Exception):  # noqa: B017, PT011 -- the real, unhandled 500
             client.get(
