@@ -41,7 +41,8 @@ Remediation Spec A S1.4), the member's Gmail-derived personal rows are
 excluded from that check too: their personal connectors are disconnected
 in the removal transaction (provider grant revoked after commit, iff
 `revoke_is_safe`), their Gmail-only person nodes are re-owned to the
-earliest-joined other active owner, and every other personal row is
+earliest-joined other active owner (the member's Gmail-derived
+`entity_aliases` follow their node's owner), and every other personal row is
 retained untouched (DS2: no purge, `domain_consents` unchanged).
 
 **"Offers export before finalizing" (the plan's own phrase) is the
@@ -377,6 +378,69 @@ def _reassign_nodes(
         )
 
 
+def _reassign_gmail_aliases(
+    session: Session,
+    auth: AuthContext,
+    request: Request,
+    *,
+    removed_users_id: UUID,
+    now: datetime,
+) -> None:
+    """Plan note N11: with `ECC_PERSONAL_DATA_ISOLATION` on, the Gmail sync
+    writes each person node's `entity_aliases` row owned by the mailbox
+    owner (workspace knowledge, DS3 (a')). Such a *Gmail-derived* alias
+    (its `source_id` is a `gmail_sync` evidence row) owned by the removed
+    member follows its node: it is re-owned to the node's current owner
+    whenever that is no longer the removed member -- the Gmail-only nodes
+    `_reassign_nodes` just re-owned (row-locked by that UPDATE), and nodes
+    already transferred away before removal. An alias whose node the member
+    still owns (a mixed-source node) keeps blocking with it, as does any
+    alias not written by the Gmail sync. One guarded statement; one
+    `entity_alias.ownership_reassigned` audit row per alias it returned."""
+    rows = session.execute(
+        text(
+            "UPDATE entity_aliases SET owner_id = n.owner_id, updated_at = :now, "
+            "version = entity_aliases.version + 1 FROM pkos_nodes n "
+            "WHERE entity_aliases.workspace_id = :workspace_id "
+            "AND entity_aliases.owner_id = :removed "
+            "AND n.workspace_id = entity_aliases.workspace_id "
+            "AND n.id = entity_aliases.entity_id AND n.owner_id <> :removed "
+            "AND EXISTS (SELECT 1 FROM pkos_evidence ev "
+            "WHERE ev.workspace_id = entity_aliases.workspace_id "
+            "AND ev.id = entity_aliases.source_id "
+            "AND ev.source_type = :evidence_source_type) "
+            "RETURNING entity_aliases.id, entity_aliases.version, entity_aliases.owner_id"
+        ),
+        {
+            "now": now,
+            "workspace_id": auth.workspace_id,
+            "removed": removed_users_id,
+            **personal_sql_params(),
+        },
+    ).all()
+    for alias_id, version, to_owner_id in sorted(rows):
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="entity_alias.ownership_reassigned",
+            aggregate_type="entity_alias",
+            aggregate_id=alias_id,
+            aggregate_version=version,
+            changed_fields=["owner_id"],
+            payload={
+                "aggregate_id": str(alias_id),
+                "version": version,
+                "reason": "member_removed",
+                "from_owner_id": str(removed_users_id),
+                "to_owner_id": str(to_owner_id),
+            },
+            now=now,
+            domain="identity",
+            metadata={"reason": "member_removed"},
+        )
+
+
 def _revoke_after_removal(pending: list[_PendingRemovalRevoke]) -> None:
     """Call only after the removal transaction has committed and the
     request session's connection is released. Decides revoke safety for
@@ -630,7 +694,8 @@ def remove_member_endpoint(
         if isolation:
             # Mutate FIRST, check SECOND, all in this one transaction (a 409
             # below rolls every disconnect/re-own/audit back). Lock order:
-            # membership advisory lock (above) -> connector rows -> nodes.
+            # membership advisory lock (above) -> connector rows -> nodes
+            # -> the member's Gmail-derived aliases.
             pending_revokes = _disconnect_personal_connectors(
                 session, auth, request, removed_users_id=user_id, now=now
             )
@@ -657,6 +722,7 @@ def remove_member_endpoint(
                     target_users_id=reassign_target,
                     now=now,
                 )
+            _reassign_gmail_aliases(session, auth, request, removed_users_id=user_id, now=now)
         # With isolation, the member's personal rows no longer block, but
         # every `pkos_nodes` row still owned after the re-own above does --
         # so a node whose evidence changed concurrently is either re-owned

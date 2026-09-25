@@ -35,6 +35,7 @@ from ecc.auth import AuthContext
 from ecc.config import get_settings
 from ecc.database import SessionFactory
 from ecc.domains.engineering.connectors import ConnectorAccountContext
+from ecc.platform.connector_security import personal_content_scope
 
 # `OllamaAdapter` is a type-annotation-only reference (`from __future__
 # import annotations` makes every annotation a string at runtime) and
@@ -85,7 +86,13 @@ _MAX_ACTION_DETECTIONS_PER_CALL = 5
 
 
 def _register_message_evidence(
-    session: Session, *, workspace_id: UUID, node_id: UUID, external_message_id: str, now: datetime
+    session: Session,
+    *,
+    workspace_id: UUID,
+    owner_id: UUID,
+    node_id: UUID,
+    external_message_id: str,
+    now: datetime,
 ) -> UUID:
     """One fresh `pkos_evidence` row citing the specific message that
     triggered a detection run -- distinct from whatever (possibly much
@@ -96,23 +103,31 @@ def _register_message_evidence(
     person." `source_ref` is deliberately namespaced (`gmail:detect_
     action:...`, not `resolve_or_create_person`'s own bare `gmail:...`)
     so the two purposes never collide on the same `sha256`.
+
+    `owner_id` is the mailbox owner (the connector account's own
+    `owner_id`); with `ECC_PERSONAL_DATA_ISOLATION` on the row is written
+    `private` to them (Spec A S1.8(a)), off it is exactly the previous row
+    (see `personal_content_scope`).
     """
     evidence_id = uuid4()
     source_ref = f"gmail:detect_action:{external_message_id}"
+    scope = personal_content_scope(owner_id)
     session.execute(
         text(
             """
             INSERT INTO pkos_evidence (
                 id, workspace_id, node_id, source_type, source_ref, sha256,
-                captured_at, evidence_state
+                captured_at, evidence_state, owner_id, visibility
             ) VALUES (
                 :id, :workspace_id, :node_id, 'gmail_sync', :source_ref, :sha256,
-                :now, 'available'
+                :now, 'available', :owner_id, :visibility
             )
             """
         ),
         {
             "id": evidence_id,
+            "owner_id": scope.owner_id,
+            "visibility": scope.visibility,
             "workspace_id": workspace_id,
             "node_id": node_id,
             "source_ref": source_ref,
@@ -333,6 +348,7 @@ def _detect_action_for_message(
         evidence_id = _register_message_evidence(
             session,
             workspace_id=workspace_id,
+            owner_id=owner_id,
             node_id=node_id,
             external_message_id=external_message_id,
             now=now,
@@ -393,10 +409,15 @@ def _detect_action_for_message(
             evidence_ids=[evidence_id],
             source="ai",
         )
+        # `auth.user_id` is the mailbox owner (built above from the
+        # connector account's own `owner_id`), which `create_recommendation`
+        # always makes the row's owner; with `ECC_PERSONAL_DATA_ISOLATION`
+        # on the recommendation is private to them (Spec A S1.8(a)).
         create_recommendation(
             session,
             auth,
             recommendation_payload,
             synthetic_request(uuid4(), uuid4()),
             f"email-detect-action:{external_message_id}",
+            visibility=personal_content_scope(owner_id).visibility,
         )

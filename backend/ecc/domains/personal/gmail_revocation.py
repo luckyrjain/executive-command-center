@@ -251,12 +251,15 @@ def cascade_email_revocation(
 
     # `pkos_evidence` gained an `owner_id` column from the same migration
     # `0063`, but -- unlike `attention_items`/`recommendations` above --
-    # it is never set at write time here (`gmail_adapter.py`'s own two
-    # `INSERT INTO pkos_evidence` sites list no `owner_id` column at all)
-    # and so falls back to that migration's generic "workspace's
-    # earliest-created user" default, unrelated to which owner's Gmail
-    # sync actually produced a given evidence row -- deliberately NOT
-    # trusted for scoping. `external_message_id`s must be captured BEFORE
+    # it is set to the mailbox owner at write time only while
+    # `ECC_PERSONAL_DATA_ISOLATION` is on (`gmail_adapter.py`'s
+    # `resolve_or_create_person` and `gmail_action_detection.py`'s
+    # `_register_message_evidence`, Spec A S1.8(a)). Rows written with the
+    # flag off (and every pre-existing row until the S1.8(b) backfill) fall
+    # back to that migration's generic "workspace's earliest-created user"
+    # default, unrelated to which owner's Gmail sync actually produced a
+    # given evidence row -- so `owner_id` is deliberately NOT trusted for
+    # scoping here. `external_message_id`s must be captured BEFORE
     # `email_messages` is deleted below (no FK from `pkos_evidence` back
     # to it -- the identical "an audit/derived record must remain
     # resolvable independent of the content it once pointed at" reasoning

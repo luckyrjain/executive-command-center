@@ -57,6 +57,11 @@ from ecc.observability import (
 )
 from ecc.platform import audit_outbox, authz
 from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
+from ecc.platform.connector_security import (
+    EMAIL_TASK_TYPES,
+    PersonalRowScope,
+    personal_content_scope,
+)
 from ecc.platform.idempotency import (
     held_idempotency_lock,
     load_cached,
@@ -859,6 +864,20 @@ def _persist_terminal(
     input_ref: dict[str, Any],
 ) -> AiRun:
     completed_at = datetime.now(UTC)
+    # Spec A S1.8(a) (`ECC_PERSONAL_DATA_ISOLATION`): an `EMAIL_TASK_TYPES`
+    # run and its steps are private to the mailbox owner. That owner is
+    # `auth.user_id` -- the run's own actor, not a caller-supplied value:
+    # every email task reads mail only through `email.get_thread_content`,
+    # which scopes to `owner_id = auth.user_id`, so the run can only ever
+    # have read the actor's own mailbox (the sync-triggered caller builds
+    # `auth` from the connector account's `owner_id`). Flag off, or any
+    # other task type: exactly the previous rows (`workspace`; steps owned
+    # by the workspace's original user).
+    scope = (
+        personal_content_scope(auth.user_id)
+        if task_type in EMAIL_TASK_TYPES
+        else PersonalRowScope(owner_id=None, visibility="workspace")
+    )
     # Deliberately not wrapped in `with session.begin():` -- unlike every
     # other domain module's single top-level route-handler transaction,
     # `execute_run` (and therefore this function) is called both from a
@@ -883,7 +902,7 @@ def _persist_terminal(
                 :policy_version, :model_id, :provider, :prompt_id, :prompt_version,
                 CAST(:input_ref AS jsonb), CAST(:output AS jsonb), CAST(:evidence AS jsonb),
                 :error_code, :prompt_tokens, :output_tokens, 0.0, :attempts,
-                :started_at, :completed_at, :started_at, :completed_at, :actor_id, 'workspace'
+                :started_at, :completed_at, :started_at, :completed_at, :actor_id, :visibility
             )
             """
         ),
@@ -908,6 +927,7 @@ def _persist_terminal(
             "attempts": attempts,
             "started_at": started_at,
             "completed_at": completed_at,
+            "visibility": scope.visibility,
         },
     )
     for step in steps:
@@ -919,7 +939,8 @@ def _persist_terminal(
                     owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :run_id, :sequence, :kind, :status,
-                    CAST(:trace AS jsonb), :created_at, {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
+                    CAST(:trace AS jsonb), :created_at,
+                    COALESCE(CAST(:owner_id AS uuid), {WORKSPACE_ORIGINAL_OWNER_SQL}), :visibility
                 )
                 """
             ),
@@ -932,6 +953,8 @@ def _persist_terminal(
                 "status": step["status"],
                 "trace": dumps(step["trace"], default=str),
                 "created_at": completed_at,
+                "owner_id": scope.owner_id,
+                "visibility": scope.visibility,
             },
         )
     # Emits `ai_run.completed.v1`/`ai_run.failed.v1`/`ai_run.cancelled.v1`

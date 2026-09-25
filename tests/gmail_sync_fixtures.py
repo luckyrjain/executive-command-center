@@ -395,6 +395,10 @@ class GmailSyncWorld:
     # registry, env overrides) -- follow-up disconnect/removal/purge calls
     # made through `client`/`harness` hit the fake Google, never the network.
     harness: GmailSyncHarness
+    # `build_gmail_sync_world(bystander=True)` only: an `owner` who joined
+    # before A and never connects Gmail -- then *they*, not A, are the
+    # workspace's original user the default-owner triggers resolve to.
+    bystander_user_id: UUID | None = None
 
     @property
     def fake_google(self) -> FakeGoogle:
@@ -776,9 +780,12 @@ def build_gmail_sync_world(
     *,
     env: Mapping[str, str] | None = None,
     extra_cleanup_tables: Sequence[str] = (),
+    bystander: bool = False,
 ) -> Iterator[GmailSyncWorld]:
     """Two members of one new workspace, each with a real-synced Gmail
     mailbox: A (`owner`, the workspace's original user) and B (`member`).
+    `bystander=True` first adds an `owner` who never syncs Gmail and joined
+    before A (so is the original user instead; `world.bystander_user_id`).
     `env` overrides are applied for the sync and stay applied while the
     world is yielded (see `gmail_sync_harness`). The harness stays active
     until the world is torn down; the workspace is deleted afterwards,
@@ -801,6 +808,7 @@ def build_gmail_sync_world(
         for k in user_ids
     }
     account_ids: dict[str, UUID] = {}
+    bystander_user_id = uuid4() if bystander else None
 
     with engine.begin() as connection:
         connection.execute(
@@ -810,6 +818,15 @@ def build_gmail_sync_world(
             ),
             {"id": workspace_id, "now": now},
         )
+        if bystander_user_id is not None:
+            account_ids["bystander"] = create_identity(
+                connection,
+                workspace_id=workspace_id,
+                user_id=bystander_user_id,
+                email=f"gmail-sync-bystander-{suffix}@example.test",
+                now=now - timedelta(seconds=1),
+                role="owner",
+            )
         # A first (earliest `users.created_at`) -- the workspace's original
         # user, which the `*_default_owner_from_workspace_original_user`
         # triggers resolve to.
@@ -859,6 +876,7 @@ def build_gmail_sync_world(
                 shared_person_node_id=members["a"].person_node_ids[shared_email],
                 colliding_external_message_id=colliding_id,
                 harness=harness,
+                bystander_user_id=bystander_user_id,
             )
     finally:
         cleanup_workspace(
@@ -896,9 +914,12 @@ def gmail_sync_world_factory() -> Iterator[GmailSyncWorldFactory]:
             *,
             env: Mapping[str, str] | None = None,
             extra_cleanup_tables: Sequence[str] = (),
+            bystander: bool = False,
         ) -> GmailSyncWorld:
             return stack.enter_context(
-                build_gmail_sync_world(env=env, extra_cleanup_tables=extra_cleanup_tables)
+                build_gmail_sync_world(
+                    env=env, extra_cleanup_tables=extra_cleanup_tables, bystander=bystander
+                )
             )
 
         yield build

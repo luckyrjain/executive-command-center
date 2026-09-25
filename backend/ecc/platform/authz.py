@@ -385,11 +385,14 @@ _UNOWNABLE_FOR_REMOVAL_PURPOSES: frozenset[str] = frozenset({"audit_events"})
 
 # Spec A S1.4(a) (`ECC_PERSONAL_DATA_ISOLATION`): per-table predicates
 # selecting the member-owned rows that do NOT block member removal --
-# exactly § "Personal data set" (retained, never transferred: DS2), taken
-# from `connector_security.PERSONAL_ROW_PREDICATES` (the one definition,
-# shared with `is_personal_resource`). `pkos_nodes` is deliberately absent:
-# `membership_removal` re-owns Gmail-only person nodes *before* this check,
-# so every node the member still owns here blocks.
+# exactly § "Personal data set" plus the steps of email `ai_runs` (plan note
+# N11) (retained, never transferred: DS2), taken from
+# `connector_security.PERSONAL_ROW_PREDICATES` (the one definition, shared
+# with `is_personal_resource`). `pkos_nodes` and `entity_aliases` are
+# deliberately absent: `membership_removal` re-owns Gmail-only person nodes
+# (and the member's Gmail-derived aliases follow their node's owner)
+# *before* this check, so every node or alias the member still owns here
+# blocks.
 _PERSONAL_ROWS_NOT_BLOCKING_REMOVAL: Mapping[str, str] = PERSONAL_ROW_PREDICATES
 
 

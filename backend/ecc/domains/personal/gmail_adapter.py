@@ -129,6 +129,7 @@ from ecc.domains.engineering.connectors import (
     PermissionState,
     SyncOutcome,
 )
+from ecc.platform.connector_security import personal_content_scope, personal_knowledge_owner
 
 from .crypto import encrypt_field
 from .gmail_shared import (
@@ -775,6 +776,13 @@ def resolve_or_create_person(
         node_id = uuid4()
         evidence_id = uuid4()
         canonical_name = display_name.strip() or email
+        # Spec A S1.8(a) / plan note N11 (`ECC_PERSONAL_DATA_ISOLATION`):
+        # the `gmail_sync` evidence row is private to the mailbox owner;
+        # the node and its alias stay workspace knowledge (DS3 (a')) but
+        # the alias is owned by the mailbox owner like the node already
+        # is, not by the default-owner trigger's "earliest workspace
+        # user". Flag off: both inserts write exactly the previous rows.
+        evidence_scope = personal_content_scope(owner_id)
         try:
             session.execute(
                 text(
@@ -802,15 +810,17 @@ def resolve_or_create_person(
                     """
                     INSERT INTO pkos_evidence (
                         id, workspace_id, node_id, source_type, source_ref, sha256,
-                        captured_at, evidence_state
+                        captured_at, evidence_state, owner_id, visibility
                     ) VALUES (
                         :id, :workspace_id, :node_id, 'gmail_sync', :source_ref, :sha256,
-                        :now, 'available'
+                        :now, 'available', :owner_id, :visibility
                     )
                     """
                 ),
                 {
                     "id": evidence_id,
+                    "owner_id": evidence_scope.owner_id,
+                    "visibility": evidence_scope.visibility,
                     "workspace_id": workspace_id,
                     "node_id": node_id,
                     "source_ref": source_ref,
@@ -823,15 +833,16 @@ def resolve_or_create_person(
                     """
                     INSERT INTO entity_aliases (
                         id, workspace_id, entity_id, alias_type, normalized_value,
-                        source_id, confidence, created_at
+                        source_id, confidence, created_at, owner_id
                     ) VALUES (
                         :id, :workspace_id, :entity_id, :alias_type, :normalized_value,
-                        :source_id, 1.00, :now
+                        :source_id, 1.00, :now, :owner_id
                     )
                     """
                 ),
                 {
                     "id": uuid4(),
+                    "owner_id": personal_knowledge_owner(owner_id),
                     "workspace_id": workspace_id,
                     "entity_id": node_id,
                     "alias_type": _EMAIL_ALIAS_TYPE,
