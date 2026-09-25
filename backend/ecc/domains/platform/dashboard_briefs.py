@@ -197,29 +197,22 @@ def _build_sections(
     # against real Postgres before this fix (a `visibility='private'` item
     # owned by user A appeared in user B's own `GET /api/v1/dashboard/
     # today` response); confirmed absent after.
-    attention_visibility_sql, attention_visibility_params = authz.visible_resource_filter_sql(
-        session, auth, resource_type="attention_items", action="read", table_alias="ai"
-    )
-    attention_rows = (
-        session.execute(
-            text(
-                f"""
-                SELECT ai.entity_type, ai.entity_id, ai.source_entity_version, ai.score,
-                       ai.confidence, ai.factors, ai.explanation, ai.pinned
-                FROM attention_items ai
-                WHERE ai.workspace_id = :workspace_id
-                  AND ai.expires_at > :now
-                  AND ai.dismissed_at IS NULL
-                  AND (ai.deferred_until IS NULL OR ai.deferred_until <= :now)
-                  AND ({attention_visibility_sql})
-                ORDER BY ai.pinned DESC, ai.score DESC, ai.entity_type ASC, ai.entity_id ASC
-                LIMIT 20
-                """  # noqa: S608 -- authz visibility fragment; values bound
-            ),
-            {"workspace_id": workspace_id, "now": now, **attention_visibility_params},
-        )
-        .mappings()
-        .all()
+    attention_rows = authz.list_visible_resources(
+        session,
+        auth,
+        resource_type="attention_items",
+        columns=(
+            "entity_type, entity_id, source_entity_version, score, "
+            "confidence, factors, explanation, pinned"
+        ),
+        order_by="pinned DESC, score DESC, entity_type ASC, entity_id ASC",
+        extra_clauses=[
+            "expires_at > :now",
+            "dismissed_at IS NULL",
+            "(deferred_until IS NULL OR deferred_until <= :now)",
+        ],
+        extra_params={"now": now},
+        limit_clause="LIMIT 20",
     )
     priorities: list[dict[str, Any]] = []
     for row in attention_rows:
@@ -367,30 +360,14 @@ def _build_sections(
         if len(waiting) == 5:
             break
 
-    risks_visibility_sql, risks_visibility_params = authz.visible_resource_filter_sql(
-        session, auth, resource_type="risks", action="read", table_alias="risks"
-    )
-    risk_rows = (
-        session.execute(
-            text(
-                f"""
-                SELECT id, description, probability, impact, status,
-                       review_at, version
-                FROM risks
-                WHERE workspace_id = :workspace_id
-                  AND ({risks_visibility_sql})
-                  AND archived_at IS NULL
-                  AND status <> 'closed'
-                ORDER BY probability * impact DESC,
-                         review_at ASC NULLS LAST,
-                         id ASC
-                LIMIT 10
-                """  # noqa: S608 -- authz visibility fragment; values bound
-            ),
-            {"workspace_id": workspace_id, **risks_visibility_params},
-        )
-        .mappings()
-        .all()
+    risk_rows = authz.list_visible_resources(
+        session,
+        auth,
+        resource_type="risks",
+        columns="id, description, probability, impact, status, review_at, version",
+        order_by="probability * impact DESC, review_at ASC NULLS LAST, id ASC",
+        extra_clauses=["archived_at IS NULL", "status <> 'closed'"],
+        limit_clause="LIMIT 10",
     )
     risks: list[dict[str, Any]] = []
     for row in risk_rows:
