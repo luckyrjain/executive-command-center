@@ -54,7 +54,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from threading import Lock
-from typing import Final
+from typing import Final, Literal
 
 from fastapi import Request, Response
 from sqlalchemy import event, text
@@ -676,23 +676,55 @@ def record_audit_outbox_failure(domain: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def record_connector_enrollment_refused(provider: str, reason: str) -> None:
+# Bounded label vocabularies (Spec A "Metrics"). Defined here, not in
+# `ecc.platform.connector_security` (which re-exports `RevokeSite`/
+# `RevokeResult`), because that module imports this one -- the reverse
+# import would be a cycle. `provider` / `resource_type` stay `str`: they
+# are bounded by the connector registry / personal resource set, not by a
+# literal list this module can own.
+EnrollmentRefusedReason = Literal[
+    "identity_mismatch",
+    "owned_by_another_member",
+    "not_found",
+    "access_denied",
+    "membership_inactive",
+]
+PersonalDataSharePath = Literal["grant", "grant_preview", "transfer", "delegation_create"]
+RevokeSite = Literal[
+    "callback_failure",
+    "callback_duplicate",
+    "reconnect_replaced",
+    "disable",
+    "cascade",
+    "removal",
+    "adapter_callback",
+    "remediation",
+]
+RevokeResult = Literal["ok", "error", "skipped_unsafe"]
+ConnectorAccessDeniedRoute = Literal["sync", "disable"]
+GmailRefreshRejectedError = Literal["invalid_grant", "other"]
+GmailRefreshSinceReconnect = Literal["lt_1h", "1h_24h", "gt_24h", "unknown"]
+
+
+def record_connector_enrollment_refused(provider: str, reason: EnrollmentRefusedReason) -> None:
     connector_enrollment_refused_total.inc(provider, reason)
 
 
-def record_personal_data_share_refused(resource_type: str, path: str) -> None:
+def record_personal_data_share_refused(resource_type: str, path: PersonalDataSharePath) -> None:
     personal_data_share_refused_total.inc(resource_type, path)
 
 
-def record_connector_revoke(provider: str, site: str, result: str) -> None:
+def record_connector_revoke(provider: str, site: RevokeSite, result: RevokeResult) -> None:
     connector_revoke_total.inc(provider, site, result)
 
 
-def record_connector_access_denied(provider: str, route: str) -> None:
+def record_connector_access_denied(provider: str, route: ConnectorAccessDeniedRoute) -> None:
     connector_access_denied_total.inc(provider, route)
 
 
-def record_gmail_refresh_rejected(error: str, since_reconnect: str) -> None:
+def record_gmail_refresh_rejected(
+    error: GmailRefreshRejectedError, since_reconnect: GmailRefreshSinceReconnect
+) -> None:
     gmail_refresh_rejected_total.inc(error, since_reconnect)
 
 

@@ -2781,19 +2781,26 @@ class GmailAdapter:
         legible one (an unexplained `401` deep inside the sync call
         itself).
         """
+        # Spec A S1.6 / threat T7: these messages reach `sync_runs.
+        # error_summary` and logs, so they name only the exception *class*
+        # -- never the decoder's own text or any value read out of the
+        # stored credential (a malformed credential's content is by
+        # definition unknown and may be token material).
         try:
             parsed = unpack_credential(credential)
         except (ValueError, TypeError) as exc:
-            raise AdapterAuthorizationError(f"Gmail credential is malformed: {exc}") from exc
+            raise AdapterAuthorizationError(
+                f"Gmail credential is malformed ({type(exc).__name__})"
+            ) from None
         raw_expires_at = parsed.get("expires_at")
         if not isinstance(raw_expires_at, str) or not raw_expires_at:
             raise AdapterAuthorizationError("Gmail credential is missing expires_at")
         try:
             expires_at = datetime.fromisoformat(raw_expires_at)
-        except ValueError as exc:
+        except ValueError:
             raise AdapterAuthorizationError(
-                f"Gmail credential has an unparseable expires_at: {raw_expires_at!r}"
-            ) from exc
+                "Gmail credential has an unparseable expires_at"
+            ) from None
         if datetime.now(UTC) < expires_at - _TOKEN_REFRESH_MARGIN:
             return credential
 

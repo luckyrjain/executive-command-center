@@ -152,6 +152,7 @@ Covers, in the same order these tests physically appear below:
     `domain.enabled`.
 """
 
+import logging
 import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -169,6 +170,7 @@ from fastapi.testclient import TestClient
 from identity_fixtures import create_identity
 from sqlalchemy import text
 
+from ecc import observability
 from ecc.auth import AuthContext
 from ecc.config import get_settings
 from ecc.database import STATEMENT_TIMEOUT_MS, SessionFactory, engine
@@ -177,6 +179,7 @@ from ecc.domains.engineering.crypto import encrypt_credential
 from ecc.domains.personal import gmail_revocation
 from ecc.domains.personal.gmail_adapter import GmailAdapter
 from ecc.domains.personal.gmail_shared import pack_credential
+from ecc.logging import JsonFormatter
 from ecc.main import app
 
 settings = get_settings()
@@ -2406,3 +2409,127 @@ def test_disable_domain_still_reaches_a_reconnected_connector_on_a_fresh_key(
             {"workspace_id": ctx["workspace_id"], "id": thread_id},
         ).one_or_none()
     assert row is None, "the reconnected connector's thread must be purged by the fresh disable"
+
+
+# ---------------------------------------------------------------------------
+# Spec A T05 (S1.6): `finish_gmail_revocation` goes through `revoke_if_safe`
+# (`disconnected_row`, exclude = the disconnected row) + `revoke_guarded`.
+# ---------------------------------------------------------------------------
+
+
+def _cascade_revokes(result: str) -> float:
+    return observability.connector_revoke_total._values.get(("gmail", "cascade", result), 0.0)
+
+
+def _capturing_revoke_adapter(revoked_tokens: list[str]) -> GmailAdapter:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/revoke":
+            revoked_tokens.append(request.content.decode().removeprefix("token="))
+        return httpx.Response(200, json={})
+
+    return GmailAdapter(transport=httpx.MockTransport(handler))
+
+
+def _disable_email_domain(ctx: dict) -> Any:
+    return ctx["client"].post(
+        "/api/v1/personal/domains/email/disable",
+        headers=_headers(ctx["token"], str(uuid4())),
+    )
+
+
+def test_cascade_revoke_proceeds_under_global_scope_when_no_other_live_row(
+    gmail_revocation_context: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = gmail_revocation_context
+    monkeypatch.setenv("ECC_GMAIL_REVOKE_SCOPE", "global")
+    get_settings.cache_clear()
+    revoked_tokens: list[str] = []
+    monkeypatch.setattr(gmail_revocation, "_adapter", _capturing_revoke_adapter(revoked_tokens))
+    before = _cascade_revokes("ok")
+    try:
+        resp = _disable_email_domain(ctx)
+    finally:
+        get_settings.cache_clear()
+    assert resp.status_code == 200, resp.text
+    assert _connector_status(ctx["workspace_id"], ctx["account_id"]) == "disconnected"
+    assert revoked_tokens == ["refresh-1"]
+    assert _cascade_revokes("ok") == before + 1
+
+
+def test_cascade_revoke_skipped_under_global_scope_while_another_workspace_is_live(
+    gmail_revocation_context: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same Google account connected (live) in another workspace: under
+    `global` the cascade must not revoke the grant -- that would silently
+    break the other workspace's connection. Disconnect still happens."""
+    ctx = gmail_revocation_context
+    other_workspace_id = uuid4()
+    other_user_id = uuid4()
+    other_email = f"other-{other_user_id}@example.test"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Other Workspace', 'UTC', :now)"
+            ),
+            {"id": other_workspace_id, "now": now},
+        )
+        create_identity(
+            connection,
+            workspace_id=other_workspace_id,
+            user_id=other_user_id,
+            email=other_email,
+            now=now,
+        )
+        _insert_gmail_connector_account(
+            connection,
+            workspace_id=other_workspace_id,
+            owner_id=other_user_id,
+            external_account_id=_OWNER_EMAIL,
+            now=now,
+        )
+    monkeypatch.setenv("ECC_GMAIL_REVOKE_SCOPE", "global")
+    get_settings.cache_clear()
+    revoked_tokens: list[str] = []
+    monkeypatch.setattr(gmail_revocation, "_adapter", _capturing_revoke_adapter(revoked_tokens))
+    before = _cascade_revokes("skipped_unsafe")
+    try:
+        resp = _disable_email_domain(ctx)
+        assert resp.status_code == 200, resp.text
+        assert _connector_status(ctx["workspace_id"], ctx["account_id"]) == "disconnected"
+        assert revoked_tokens == []
+        assert _cascade_revokes("skipped_unsafe") == before + 1
+    finally:
+        get_settings.cache_clear()
+        _cleanup_workspace(other_workspace_id, emails=[other_email])
+
+
+def test_cascade_succeeds_and_counts_error_when_revoke_raises(
+    gmail_revocation_context: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    ctx = gmail_revocation_context
+
+    class _ExplodingRevokeAdapter(GmailAdapter):
+        def disconnect(self, account: ConnectorAccountContext) -> None:
+            raise RuntimeError(f"revoke blew up for {account.external_account_id}")
+
+    monkeypatch.setenv("ECC_GMAIL_REVOKE_SCOPE", "none")
+    get_settings.cache_clear()
+    monkeypatch.setattr(
+        gmail_revocation, "_adapter", _ExplodingRevokeAdapter(transport=_revoke_transport())
+    )
+    before = _cascade_revokes("error")
+    try:
+        with caplog.at_level(logging.WARNING, logger="ecc.platform.connector_security"):
+            resp = _disable_email_domain(ctx)
+    finally:
+        get_settings.cache_clear()
+    assert resp.status_code == 200, resp.text
+    assert _connector_status(ctx["workspace_id"], ctx["account_id"]) == "disconnected"
+    assert _cascade_revokes("error") == before + 1
+    rendered = " ".join(JsonFormatter().format(r) for r in caplog.records)
+    assert "error_class=RuntimeError" in rendered
+    assert _OWNER_EMAIL not in rendered

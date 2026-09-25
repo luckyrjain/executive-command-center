@@ -27,6 +27,7 @@ from ecc.auth import AuthContext
 from ecc.config import Settings, get_settings
 from ecc.database import SessionFactory, engine
 from ecc.domains.ai_runtime.router import TASK_REQUIREMENTS
+from ecc.logging import JsonFormatter
 from ecc.platform import connector_security
 from ecc.platform.connector_security import (
     EMAIL_TASK_TYPES,
@@ -40,7 +41,9 @@ from ecc.platform.connector_security import (
     record_revoke_skipped_unsafe,
     require_not_personal_data,
     revoke_guarded,
+    revoke_if_safe,
     revoke_is_safe,
+    revoke_scope_for,
     write_refusal_audit,
 )
 
@@ -829,7 +832,16 @@ def test_write_refusal_audit_never_raises_and_counts_failure(
     assert _audit_failures("connector_security") == before + 1
     assert "secret-detail" not in caplog.text
     assert "@example.test" not in caplog.text
-    assert any(getattr(r, "error_class", None) == "_Boom" for r in caplog.records)
+    # Rendered through the production formatter: `extra=` keys are dropped
+    # by `JsonFormatter`, so the class must be in the message itself.
+    rendered = [JsonFormatter().format(r) for r in caplog.records]
+    assert any(
+        "refusal_audit_write_failed" in line
+        and "error_class=_Boom" in line
+        and "event_type=connector_account.enrollment_refused" in line
+        for line in rendered
+    )
+    assert not any("secret-detail" in line or "@example.test" in line for line in rendered)
 
 
 def test_write_refusal_audit_db_failure_counted_once(
@@ -893,15 +905,180 @@ def test_revoke_guarded_swallows_exception_logs_class_only(
     assert _revokes("gmail", "removal", "error") == before + 1
     assert "ya29" not in caplog.text
     assert "@example.test" not in caplog.text
-    record = next(r for r in caplog.records if r.getMessage() == "connector_revoke_failed")
-    assert getattr(record, "error_class", None) == "_RevokeFailed"
+    record = next(r for r in caplog.records if r.getMessage().startswith("connector_revoke_failed"))
     assert record.exc_info is None
+    rendered = JsonFormatter().format(record)
+    assert "error_class=_RevokeFailed" in rendered
+    assert "provider=gmail" in rendered
+    assert "site=removal" in rendered
+    assert "ya29" not in rendered
+    assert "@example.test" not in rendered
 
 
 def test_record_revoke_skipped_unsafe_counts() -> None:
     before = _revokes("gmail", "callback_failure", "skipped_unsafe")
     record_revoke_skipped_unsafe(provider="gmail", site="callback_failure")
     assert _revokes("gmail", "callback_failure", "skipped_unsafe") == before + 1
+
+
+# ---------------------------------------------------------------------------
+# revoke_scope_for / revoke_if_safe
+# ---------------------------------------------------------------------------
+
+
+def _set_revoke_scope(monkeypatch: pytest.MonkeyPatch, scope: str) -> None:
+    monkeypatch.setenv("ECC_GMAIL_REVOKE_SCOPE", scope)
+    get_settings.cache_clear()
+
+
+def test_revoke_scope_for_gmail_follows_setting_other_providers_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    try:
+        _set_revoke_scope(monkeypatch, "global")
+        assert revoke_scope_for("gmail") == "global"
+        assert revoke_scope_for("gitlab") == "none"
+        _set_revoke_scope(monkeypatch, "none")
+        assert revoke_scope_for("gmail") == "none"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_revoke_if_safe_global_skips_while_live_row_exists_elsewhere(
+    two_workspaces: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = two_workspaces
+    with engine.begin() as connection:
+        own_row = _insert_connector(
+            connection,
+            workspace_id=ctx["ws_a"],
+            user_id=ctx["user_a"],
+            provider="gmail",
+            external_account_id=_GOOGLE_ACCOUNT,
+            now=ctx["now"],
+        )
+        _insert_connector(
+            connection,
+            workspace_id=ctx["ws_b"],
+            user_id=ctx["user_b"],
+            provider="gmail",
+            external_account_id=_GOOGLE_ACCOUNT,
+            now=ctx["now"],
+        )
+    adapter = _Adapter()
+    before = _revokes("gmail", "removal", "skipped_unsafe")
+    try:
+        _set_revoke_scope(monkeypatch, "global")
+        result = revoke_if_safe(
+            adapter,
+            object(),
+            provider="gmail",
+            external_account_id=_GOOGLE_ACCOUNT,
+            token_kind="disconnected_row",
+            exclude_row_id=own_row,
+            site="removal",
+        )
+    finally:
+        get_settings.cache_clear()
+    assert result == "skipped_unsafe"
+    assert adapter.calls == []
+    assert _revokes("gmail", "removal", "skipped_unsafe") == before + 1
+
+
+def test_revoke_if_safe_global_revokes_when_no_other_live_row(
+    two_workspaces: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = two_workspaces
+    with engine.begin() as connection:
+        own_row = _insert_connector(
+            connection,
+            workspace_id=ctx["ws_a"],
+            user_id=ctx["user_a"],
+            provider="gmail",
+            external_account_id=_GOOGLE_ACCOUNT,
+            now=ctx["now"],
+        )
+    adapter = _Adapter()
+    context = object()
+    before = _revokes("gmail", "removal", "ok")
+    try:
+        _set_revoke_scope(monkeypatch, "global")
+        result = revoke_if_safe(
+            adapter,
+            context,
+            provider="gmail",
+            external_account_id=_GOOGLE_ACCOUNT,
+            token_kind="disconnected_row",
+            exclude_row_id=own_row,
+            site="removal",
+        )
+    finally:
+        get_settings.cache_clear()
+    assert result == "ok"
+    assert adapter.calls == [context]
+    assert _revokes("gmail", "removal", "ok") == before + 1
+
+
+def test_revoke_if_safe_non_personal_provider_never_queries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _no_session() -> Any:
+        raise AssertionError("no safety-check session for a non-personal provider")
+
+    monkeypatch.setattr(connector_security, "SessionFactory", _no_session)
+    adapter = _Adapter()
+    before = _revokes("gitlab", "disable", "ok")
+    try:
+        _set_revoke_scope(monkeypatch, "global")
+        result = revoke_if_safe(
+            adapter,
+            object(),
+            provider="gitlab",
+            external_account_id="someone",
+            token_kind="disconnected_row",
+            exclude_row_id=uuid4(),
+            site="disable",
+        )
+    finally:
+        get_settings.cache_clear()
+    assert result == "ok"
+    assert _revokes("gitlab", "disable", "ok") == before + 1
+
+
+def test_revoke_if_safe_safety_check_failure_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    class _CheckFailed(RuntimeError):
+        pass
+
+    def _broken_factory() -> Any:
+        raise _CheckFailed("DETAIL: Key (external_account_id)=(owner@example.test)")
+
+    monkeypatch.setattr(connector_security, "SessionFactory", _broken_factory)
+    adapter = _Adapter()
+    before = _revokes("gmail", "cascade", "error")
+    try:
+        _set_revoke_scope(monkeypatch, "global")
+        with caplog.at_level(logging.WARNING, logger="ecc.platform.connector_security"):
+            result = revoke_if_safe(
+                adapter,
+                object(),
+                provider="gmail",
+                external_account_id=_GOOGLE_ACCOUNT,
+                token_kind="disconnected_row",
+                exclude_row_id=uuid4(),
+                site="cascade",
+            )
+    finally:
+        get_settings.cache_clear()
+    assert result == "error"
+    assert adapter.calls == []
+    assert _revokes("gmail", "cascade", "error") == before + 1
+    rendered = " ".join(JsonFormatter().format(r) for r in caplog.records)
+    assert "connector_revoke_safety_check_failed" in rendered
+    assert "error_class=_CheckFailed" in rendered
+    assert "@example.test" not in rendered
+    assert "DETAIL" not in rendered
 
 
 # ---------------------------------------------------------------------------
