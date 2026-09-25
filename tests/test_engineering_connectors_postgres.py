@@ -192,9 +192,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import new
+from json import dumps
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from identity_fixtures import create_identity
@@ -213,6 +215,7 @@ from ecc.domains.engineering.connectors import (
 )
 from ecc.domains.engineering.crypto import decrypt_credential, encrypt_credential
 from ecc.domains.engineering.sandbox_adapter import SandboxGithubAdapter
+from ecc.domains.personal.gmail_adapter import GmailAdapter
 from ecc.logging import JsonFormatter
 from ecc.main import app
 
@@ -687,7 +690,7 @@ class _OAuth2SpyAdapter:
     def handle_oauth_callback(self, code: str, state: str) -> ConnectorAuthorization:
         raise NotImplementedError
 
-    def ensure_fresh_credential(self, credential: str) -> str:
+    def ensure_fresh_credential(self, credential: str, *, reconnected_at: object = None) -> str:
         self.ensure_fresh_credential_calls.append(credential)
         if self.refresh_error is not None:
             raise AdapterAuthorizationError(self.refresh_error)
@@ -2302,6 +2305,144 @@ def test_sync_records_a_failed_run_when_oauth2_credential_refresh_is_rejected(
             {"id": account_id},
         ).scalar_one()
     assert decrypt_credential(encrypted) == "stale-credential"
+
+
+def _insert_connector_audit(
+    workspace_id: UUID, user_id: UUID, account_id: UUID, event_type: str, occurred_at: datetime
+) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO audit_events (
+                    id, workspace_id, event_type, aggregate_type, aggregate_id,
+                    aggregate_version, actor_id, request_id, correlation_id, occurred_at
+                ) VALUES (
+                    :id, :ws, :event_type, 'connector_account', :aggregate_id, 1, :actor_id,
+                    :request_id, :correlation_id, :occurred_at
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "ws": workspace_id,
+                "event_type": event_type,
+                "aggregate_id": account_id,
+                "actor_id": user_id,
+                "request_id": uuid4(),
+                "correlation_id": uuid4(),
+                "occurred_at": occurred_at,
+            },
+        )
+
+
+def _invalid_grant_gmail_adapter() -> GmailAdapter:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            headers={"content-type": "application/json"},
+            content=dumps({"error": "invalid_grant"}).encode(),
+        )
+
+    return GmailAdapter(transport=httpx.MockTransport(handler))
+
+
+_EXPIRED_GMAIL_CREDENTIAL = dumps(
+    {
+        "access_token": "old-access",
+        "refresh_token": "revoked-refresh",
+        "expires_at": "2020-01-01T00:00:00+00:00",
+    }
+)
+
+
+def _refresh_rejected(error: str, since_reconnect: str) -> float:
+    return observability.gmail_refresh_rejected_total._values.get((error, since_reconnect), 0.0)
+
+
+@pytest.mark.parametrize(
+    ("audit_rows", "expected_bucket"),
+    [
+        # Older `created`, newer `reconnected` 10 minutes ago -> reconnected wins.
+        (
+            [
+                ("connector_account.created", timedelta(days=10)),
+                ("connector_account.reconnected", timedelta(minutes=10)),
+            ],
+            "lt_1h",
+        ),
+        ([("connector_account.created", timedelta(hours=5))], "1h_24h"),
+        ([], "unknown"),
+    ],
+)
+def test_sync_refresh_rejection_feeds_the_refresh_canary(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+    audit_rows: list[tuple[str, timedelta]],
+    expected_bucket: str,
+) -> None:
+    """Spec A S1.13 wiring: the real `GmailAdapter` rejecting a refresh with
+    `invalid_grant` during `/sync` counts `ecc_gmail_refresh_rejected_total`
+    bucketed by the latest reconnected/created audit row -- the sync still
+    records the same failed run it always did."""
+    client, workspace_id, user_id, token = engineering_test_context
+    monkeypatch.setattr(
+        connector_accounts_module,
+        "connector_registry",
+        _registry_with(_invalid_grant_gmail_adapter()),
+    )
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="gmail", credential=_EXPIRED_GMAIL_CREDENTIAL
+    )
+    now = datetime.now(UTC)
+    for event_type, age in audit_rows:
+        _insert_connector_audit(workspace_id, user_id, account_id, event_type, now - age)
+    before = _refresh_rejected("invalid_grant", expected_bucket)
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "message"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["status"] == "failed"
+    assert "reconnect" in body["error_summary"]
+    assert _refresh_rejected("invalid_grant", expected_bucket) == before + 1
+
+
+def test_sync_refresh_canary_lookup_failure_does_not_break_the_sync(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing reconnect-time lookup is swallowed by the canary (counts
+    nothing) and, running in a savepoint, leaves phase 1's transaction
+    intact -- the failed run is still recorded."""
+    client, workspace_id, user_id, token = engineering_test_context
+    monkeypatch.setattr(
+        connector_accounts_module,
+        "connector_registry",
+        _registry_with(_invalid_grant_gmail_adapter()),
+    )
+
+    def _broken_lookup(session: Any, workspace_id: UUID, account_id: UUID) -> None:
+        with session.begin_nested():
+            session.execute(text("SELECT 1/0"))
+
+    monkeypatch.setattr(connector_accounts_module, "latest_reconnect_at", _broken_lookup)
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="gmail", credential=_EXPIRED_GMAIL_CREDENTIAL
+    )
+    before = dict(observability.gmail_refresh_rejected_total._values)
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "message"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["status"] == "failed"
+    assert dict(observability.gmail_refresh_rejected_total._values) == before
 
 
 def test_sync_backfill_without_since_passes_none_to_adapter(

@@ -485,7 +485,8 @@ connector_access_denied_total = _Counter(
 )
 gmail_refresh_rejected_total = _Counter(
     "ecc_gmail_refresh_rejected_total",
-    "Gmail token refreshes rejected by Google, by error class and time since reconnect.",
+    "Gmail token refreshes that failed (invalid_grant = rejected by Google; other = any "
+    "other failure incl. transport/5xx), by error class and time since reconnect.",
     ("error", "since_reconnect"),
 )
 

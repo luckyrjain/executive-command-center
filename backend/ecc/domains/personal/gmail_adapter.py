@@ -129,6 +129,11 @@ from ecc.domains.engineering.connectors import (
     PermissionState,
     SyncOutcome,
 )
+from ecc.observability import (
+    GmailRefreshRejectedError,
+    GmailRefreshSinceReconnect,
+    record_gmail_refresh_rejected,
+)
 from ecc.platform.connector_security import personal_content_scope, personal_knowledge_owner
 
 from .crypto import encrypt_field
@@ -179,6 +184,65 @@ _DEFAULT_BACKFILL_WINDOW = timedelta(days=30)
 # MAX_WAIT_SECONDS`'s own "small, bounded, not worth architecting a tighter
 # number around" sizing, just for a margin rather than a wait.
 _TOKEN_REFRESH_MARGIN = timedelta(seconds=60)
+
+
+# Spec A S1.13 refresh canary: `ecc_gmail_refresh_rejected_total`'s
+# `since_reconnect` label buckets -- a diagnostic breakdown, NOT the alert
+# filter. The rollout canary alerts on any rise of `error="invalid_grant"`
+# (all buckets) above the pre-rollout baseline. Gmail is not auto-synced, so
+# a refresh happens only on the next manual /sync after token expiry (maybe
+# days later -> `gt_24h`); and a duplicate-callback revoke writes no
+# reconnect audit row, so a grant-wide revoke hitting the existing row is
+# bucketed from its original connect. `other` includes transport/5xx noise
+# and is not the alert signal.
+_SINCE_RECONNECT_LT_1H = timedelta(hours=1)
+_SINCE_RECONNECT_LT_24H = timedelta(hours=24)
+
+
+def refresh_since_reconnect_bucket(
+    reconnected_at: datetime | None, now: datetime
+) -> GmailRefreshSinceReconnect:
+    """`since_reconnect` label for `ecc_gmail_refresh_rejected_total`:
+    `lt_1h` (age < 1h, including a small negative age from clock skew),
+    `1h_24h` (1h <= age < 24h), `gt_24h` (age >= 24h), or `unknown` when
+    no (re)connect timestamp is available.
+    """
+    if reconnected_at is None:
+        return "unknown"
+    age = now - reconnected_at
+    if age < _SINCE_RECONNECT_LT_1H:
+        return "lt_1h"
+    if age < _SINCE_RECONNECT_LT_24H:
+        return "1h_24h"
+    return "gt_24h"
+
+
+def _token_endpoint_error_class(response: httpx.Response) -> GmailRefreshRejectedError:
+    """`invalid_grant` iff the token endpoint's own error body says so
+    (RFC 6749 section 5.2 `{"error": "invalid_grant", ...}`); any other
+    error code, a non-JSON body, or a non-object body is `other`."""
+    # Never raises: runs outside the canary's own guard, on the path that
+    # must still surface `AdapterAuthorizationError` (a pathological body,
+    # e.g. deeply nested JSON, raises `RecursionError`, not `ValueError`).
+    try:
+        body = response.json()
+        if isinstance(body, dict) and body.get("error") == "invalid_grant":
+            return "invalid_grant"
+    except Exception:  # noqa: BLE001 -- classification is best-effort
+        return "other"
+    return "other"
+
+
+class _TokenRefreshFailed(AdapterAuthorizationError):
+    """A refresh attempt that reached (or tried to reach) the token
+    endpoint and failed -- carries the canary's `error` label. Still an
+    `AdapterAuthorizationError` with the exact same message, so every
+    caller's handling is unchanged."""
+
+    def __init__(self, message: str, error: GmailRefreshRejectedError = "other") -> None:
+        super().__init__(message)
+        self.error: GmailRefreshRejectedError = error
+
 
 # Gmail's own quota-error shape (`{"error": {"errors": [{"reason": ...}]}}`)
 # distinguishes rate limiting from every other 403 (insufficient scope,
@@ -2786,7 +2850,12 @@ class GmailAdapter:
             resource_type="thread", items_processed=0, status="succeeded", next_cursor=None
         )
 
-    def ensure_fresh_credential(self, credential: str) -> str:
+    def ensure_fresh_credential(
+        self,
+        credential: str,
+        *,
+        reconnected_at: Callable[[], datetime | None] | None = None,
+    ) -> str:
         """Called once by `connector_accounts.sync_connector_endpoint`,
         before every `backfill`/`incremental_sync` dispatch -- returns
         `credential` unchanged when its own stored `expires_at` is still
@@ -2815,6 +2884,17 @@ class GmailAdapter:
         failure mode (a clear, attributable refresh error) for a less
         legible one (an unexplained `401` deep inside the sync call
         itself).
+
+        Spec A S1.13 refresh canary: when the refresh attempt itself fails
+        (transport error, non-200 status, or an unusable 200 body) this
+        increments `ecc_gmail_refresh_rejected_total{error,
+        since_reconnect}` before re-raising the very same exception.
+        `reconnected_at` is an optional, lazily-called lookup of this
+        connector account's latest `connector_account.reconnected`/
+        `.created` audit time, supplied by the caller (this adapter has no
+        DB session); it is only called on a failed refresh. The canary is
+        observational only -- any failure inside it is swallowed and
+        counts nothing.
         """
         # Spec A S1.6 / threat T7: these messages reach `sync_runs.
         # error_summary` and logs, so they name only the exception *class*
@@ -2843,6 +2923,35 @@ class GmailAdapter:
         if not isinstance(refresh_token, str) or not refresh_token:
             raise AdapterAuthorizationError("Gmail credential is missing refresh_token")
 
+        try:
+            return self._refresh_credential(refresh_token)
+        except _TokenRefreshFailed as exc:
+            self._record_refresh_rejected(exc.error, reconnected_at)
+            raise
+
+    @staticmethod
+    def _record_refresh_rejected(
+        error: GmailRefreshRejectedError,
+        reconnected_at: Callable[[], datetime | None] | None,
+    ) -> None:
+        """S1.13 canary increment -- never raises. Logs only the two
+        label values (never a token, email, or the response body)."""
+        try:
+            reconnect_time = reconnected_at() if reconnected_at is not None else None
+            since_reconnect = refresh_since_reconnect_bucket(reconnect_time, datetime.now(UTC))
+            record_gmail_refresh_rejected(error, since_reconnect)
+            _logger.warning(
+                "Gmail token refresh rejected: error=%s since_reconnect=%s",
+                error,
+                since_reconnect,
+            )
+        except Exception as exc:  # noqa: BLE001 -- observational only
+            _logger.warning("Gmail refresh canary failed to record (%s)", type(exc).__name__)
+
+    def _refresh_credential(self, refresh_token: str) -> str:
+        """`ensure_fresh_credential`'s token-endpoint exchange. Every
+        failure raises `_TokenRefreshFailed` (an `AdapterAuthorizationError`)
+        carrying the S1.13 canary's `error` label."""
         settings = get_settings()
         try:
             response = self._oauth_client.post(
@@ -2855,23 +2964,25 @@ class GmailAdapter:
                 },
             )
         except httpx.HTTPError as exc:
-            raise AdapterAuthorizationError(f"Gmail token refresh failed: {exc}") from exc
+            raise _TokenRefreshFailed(f"Gmail token refresh failed: {exc}") from exc
         if response.status_code == 400:
-            raise AdapterAuthorizationError(
-                "Gmail refresh token was rejected -- reconnect this Gmail account"
+            raise _TokenRefreshFailed(
+                "Gmail refresh token was rejected -- reconnect this Gmail account",
+                _token_endpoint_error_class(response),
             )
         if response.status_code != 200:
-            raise AdapterAuthorizationError(
-                f"Gmail token refresh failed with status {response.status_code}"
+            raise _TokenRefreshFailed(
+                f"Gmail token refresh failed with status {response.status_code}",
+                _token_endpoint_error_class(response),
             )
         try:
             body = response.json()
         except ValueError as exc:
-            raise AdapterAuthorizationError(
+            raise _TokenRefreshFailed(
                 f"Gmail token refresh returned a non-JSON response body: {exc}"
             ) from exc
         if not isinstance(body, dict):
-            raise AdapterAuthorizationError(
+            raise _TokenRefreshFailed(
                 f"Gmail token refresh returned a non-object response body: {type(body).__name__}"
             )
         new_access_token = body.get("access_token")
@@ -2887,20 +2998,20 @@ class GmailAdapter:
             or new_expires_in is None
             or isinstance(new_expires_in, bool)
         ):
-            raise AdapterAuthorizationError(
+            raise _TokenRefreshFailed(
                 "Gmail token refresh response missing access_token/expires_in"
             )
         try:
             new_expires_in_seconds = float(new_expires_in)
         except (TypeError, ValueError) as exc:
-            raise AdapterAuthorizationError(
+            raise _TokenRefreshFailed(
                 f"Gmail token refresh returned a non-numeric expires_in: {new_expires_in!r}"
             ) from exc
         new_expires_at_epoch = datetime.now(UTC).timestamp() + new_expires_in_seconds
         try:
             new_expires_at = datetime.fromtimestamp(new_expires_at_epoch, tz=UTC)
         except (OverflowError, OSError, ValueError) as exc:
-            raise AdapterAuthorizationError(
+            raise _TokenRefreshFailed(
                 f"Gmail token refresh returned an out-of-range expires_in: {new_expires_in!r}"
             ) from exc
 
