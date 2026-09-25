@@ -58,7 +58,7 @@ from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import UTC, datetime
 from hashlib import sha256
 from secrets import token_urlsafe
-from typing import Annotated
+from typing import Annotated, NoReturn
 from urllib.parse import urlencode
 from uuid import uuid4
 
@@ -81,8 +81,14 @@ from ecc.domains.engineering.connector_accounts import (
 from ecc.domains.engineering.connectors import AdapterAuthorizationError, ConnectorAccountContext
 from ecc.domains.engineering.crypto import decrypt_credential, encrypt_credential
 from ecc.domains.personal.gmail_adapter import GmailAdapter
-from ecc.observability import queue_lifecycle_event
+from ecc.observability import RevokeSite, queue_lifecycle_event
 from ecc.platform import audit_outbox, authz
+from ecc.platform.connector_security import (
+    RevokeTokenKind,
+    integrity_error_log_fields,
+    is_unique_violation,
+    revoke_if_safe,
+)
 
 router = APIRouter(prefix="/api/v1/personal/gmail", tags=["personal"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -100,6 +106,11 @@ _STATE_TTL_SECONDS = 600
 # with no Gmail OAuth app configured never itself raises.
 _adapter = GmailAdapter()
 _logger = logging.getLogger(__name__)
+
+_UNIQUE_EXTERNAL_ACCOUNT_CONSTRAINT = "uq_connector_accounts_workspace_provider_external_id"
+
+# (credential context, token kind for `revoke_is_safe`, metric site label)
+_PendingRevoke = tuple[ConnectorAccountContext, RevokeTokenKind, RevokeSite]
 
 
 class OAuthStartResponse(BaseModel):
@@ -265,8 +276,16 @@ def gmail_oauth_callback_endpoint(
     # queue entry in this function remains in the always-drain
     # `pending_revokes` list, matching rounds 4-12's original reasoning,
     # which was correct for all of them except this one.
-    pending_revokes: list[ConnectorAccountContext] = []
-    pending_revokes_on_commit: list[ConnectorAccountContext] = []
+    #
+    # Spec A S1.6: each queued entry also carries its `revoke_is_safe`
+    # token kind and metric site, and the drain in `finally` goes through
+    # `revoke_if_safe` (never raises; under `ECC_GMAIL_REVOKE_SCOPE=global`
+    # a Google grant is revoked only when no live `connector_accounts` row
+    # anywhere still uses that Google account -- so the active-duplicate
+    # and reconnect-replaced grants are skipped while the row they sit
+    # beside is live).
+    pending_revokes: list[_PendingRevoke] = []
+    pending_revokes_on_commit: list[_PendingRevoke] = []
     response: ConnectorAccountResponse | None = None
     committed = False
     try:
@@ -300,7 +319,7 @@ def gmail_oauth_callback_endpoint(
                             "now": now,
                         },
                     )
-            except IntegrityError:
+            except IntegrityError as integrity_error:
                 # `uq_connector_accounts_workspace_provider_external_id`
                 # already has a row for this exact Google account -- two
                 # real cases, not one. (1) Two distinct, successfully-
@@ -362,6 +381,15 @@ def gmail_oauth_callback_endpoint(
                 # `_revoke_best_effort`'s own contract, not a correctness
                 # concern.
                 try:
+                    if not is_unique_violation(
+                        integrity_error, _UNIQUE_EXTERNAL_ACCOUNT_CONSTRAINT
+                    ):
+                        # Spec A S1.5: only the external-account unique
+                        # key is a duplicate. Anything else (an FK or
+                        # check violation) is a real failure -> 500. The
+                        # except-guard just below still queues the
+                        # minted grant for revoke.
+                        _raise_persist_failed(integrity_error)
                     existing = (
                         create_session.execute(
                             text(
@@ -400,11 +428,15 @@ def gmail_oauth_callback_endpoint(
                         ) from None
                     if existing["status"] == "active":
                         pending_revokes.append(
-                            ConnectorAccountContext(
-                                workspace_id=auth.workspace_id,
-                                connector_account_id=existing["id"],
-                                external_account_id=authorization.external_account_id,
-                                credential=authorization.credential,
+                            (
+                                ConnectorAccountContext(
+                                    workspace_id=auth.workspace_id,
+                                    connector_account_id=existing["id"],
+                                    external_account_id=authorization.external_account_id,
+                                    credential=authorization.credential,
+                                ),
+                                "duplicate",
+                                "callback_duplicate",
                             )
                         )
                         account = get_connector_account(
@@ -425,11 +457,15 @@ def gmail_oauth_callback_endpoint(
                             # -- and the rest of this transaction -- goes
                             # on to commit.
                             pending_revokes_on_commit.append(
-                                ConnectorAccountContext(
-                                    workspace_id=auth.workspace_id,
-                                    connector_account_id=existing["id"],
-                                    external_account_id=authorization.external_account_id,
-                                    credential=old_credential,
+                                (
+                                    ConnectorAccountContext(
+                                        workspace_id=auth.workspace_id,
+                                        connector_account_id=existing["id"],
+                                        external_account_id=authorization.external_account_id,
+                                        credential=old_credential,
+                                    ),
+                                    "replaced",
+                                    "reconnect_replaced",
                                 )
                             )
 
@@ -486,11 +522,15 @@ def gmail_oauth_callback_endpoint(
                         )
                 except Exception:
                     pending_revokes.append(
-                        ConnectorAccountContext(
-                            workspace_id=auth.workspace_id,
-                            connector_account_id=account_id,
-                            external_account_id=authorization.external_account_id,
-                            credential=authorization.credential,
+                        (
+                            ConnectorAccountContext(
+                                workspace_id=auth.workspace_id,
+                                connector_account_id=account_id,
+                                external_account_id=authorization.external_account_id,
+                                credential=authorization.credential,
+                            ),
+                            "minted_unpersisted",
+                            "callback_failure",
                         )
                     )
                     raise
@@ -506,11 +546,15 @@ def gmail_oauth_callback_endpoint(
                 # idempotent-if-redundant with whatever this exception's own
                 # `IntegrityError` branch may have already queued.
                 pending_revokes.append(
-                    ConnectorAccountContext(
-                        workspace_id=auth.workspace_id,
-                        connector_account_id=account_id,
-                        external_account_id=authorization.external_account_id,
-                        credential=authorization.credential,
+                    (
+                        ConnectorAccountContext(
+                            workspace_id=auth.workspace_id,
+                            connector_account_id=account_id,
+                            external_account_id=authorization.external_account_id,
+                            credential=authorization.credential,
+                        ),
+                        "minted_unpersisted",
+                        "callback_failure",
                     )
                 )
                 raise
@@ -552,11 +596,15 @@ def gmail_oauth_callback_endpoint(
                     )
                 except Exception:
                     pending_revokes.append(
-                        ConnectorAccountContext(
-                            workspace_id=auth.workspace_id,
-                            connector_account_id=account_id,
-                            external_account_id=authorization.external_account_id,
-                            credential=authorization.credential,
+                        (
+                            ConnectorAccountContext(
+                                workspace_id=auth.workspace_id,
+                                connector_account_id=account_id,
+                                external_account_id=authorization.external_account_id,
+                                credential=authorization.credential,
+                            ),
+                            "minted_unpersisted",
+                            "callback_failure",
                         )
                     )
                     raise
@@ -579,14 +627,59 @@ def gmail_oauth_callback_endpoint(
         # `pending_revokes_on_commit` only runs if `committed` -- its
         # entries are only actually being discarded when this request's
         # own replacement write for them landed for real.
-        for pending_context in pending_revokes:
-            _adapter.disconnect(pending_context)
+        _drain_pending_revokes(pending_revokes)
         if committed:
-            for pending_context in pending_revokes_on_commit:
-                _adapter.disconnect(pending_context)
+            _drain_pending_revokes(pending_revokes_on_commit)
 
     assert response is not None
     return response
+
+
+def _raise_persist_failed(exc: IntegrityError) -> NoReturn:
+    """Fail the request (500) for an `IntegrityError` that is not the
+    duplicate-account unique violation (Spec A S1.5/S1.6, threat T7).
+
+    Logs only `(sqlstate, constraint)` -- never `str(exc)`, whose psycopg
+    `DETAIL: Key (...)=(...)` / `Failing row contains (...)` text carries
+    row values (the Google email, encrypted credential bytes).
+
+    Raised as an `HTTPException` *from None* rather than letting the
+    `IntegrityError` propagate: FastAPI's exception middleware turns an
+    `HTTPException` into a plain 500 response *inside* the app, so no
+    exception ever reaches `request_observability_middleware`'s
+    `exc_info=True` log line (which would otherwise serialize the full
+    traceback -- including a chained `IntegrityError`'s message -- via
+    `JsonFormatter`). `from None` additionally suppresses the implicit
+    `__context__` chain for anything else that formats this exception
+    (`/oauth/complete` catches it and redirects with its code).
+    """
+    sqlstate, constraint = integrity_error_log_fields(exc)
+    _logger.error(
+        "gmail_oauth_callback_persist_failed: sqlstate=%s constraint=%s", sqlstate, constraint
+    )
+    raise HTTPException(status_code=500, detail="CONNECTOR_ACCOUNT_PERSIST_FAILED") from None
+
+
+def _drain_pending_revokes(pending: list[_PendingRevoke]) -> None:
+    """Revoke each queued grant iff `revoke_is_safe` allows it (Spec A
+    S1.6). Never raises. The same credential can be queued twice (a
+    branch's own entry, then the wide `except Exception` guard's) -- it is
+    attempted, and counted, once.
+    """
+    seen: set[str] = set()
+    for context, token_kind, site in pending:
+        if context.credential in seen:
+            continue
+        seen.add(context.credential)
+        revoke_if_safe(
+            _adapter,
+            context,
+            provider="gmail",
+            external_account_id=context.external_account_id,
+            token_kind=token_kind,
+            exclude_row_id=None,
+            site=site,
+        )
 
 
 @router.get("/oauth/complete", include_in_schema=False)
@@ -674,11 +767,12 @@ def gmail_oauth_complete_endpoint(
         # user (the frontend's own `fetch` catches it and shows an
         # alert). This is the one endpoint where an unhandled exception
         # reaches the browser directly via a top-level navigation --
-        # logged here (the stack trace is otherwise lost, since redirecting
-        # instead of re-raising is what keeps the user out of a raw error
-        # page) and reported to the frontend as the same generic
-        # `GMAIL_OAUTH_FAILED` code `/oauth/callback`'s own `Adapter
-        # AuthorizationError` branch already uses.
+        # redirecting instead of re-raising is what keeps the user out of
+        # a raw error page, so the failure is recorded here (it would
+        # otherwise leave no trace, since nothing propagates to the
+        # request middleware) and reported to the frontend as the same
+        # generic `GMAIL_OAUTH_FAILED` code `/oauth/callback`'s own
+        # `AdapterAuthorizationError` branch already uses.
         #
         # Logs only the code-defined error code and the exception *class*
         # (Spec A S1.6 / threat T7) -- never `str(exc)` or a traceback

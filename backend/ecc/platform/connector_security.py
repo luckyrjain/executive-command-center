@@ -1,20 +1,25 @@
 """Shared connector-ownership / personal-data-isolation primitives (Spec A
 "Shared definitions": personal data set, revocation safety, refusal audit).
 
-Call sites adopt each helper incrementally: the personal-data share refusal
+Call sites adopt each helper incrementally: conflict narrowing and the
+guarded, safety-checked revoke sites (Gmail callback, engineering disable,
+Gmail revocation cascade) are adopted; the personal-data share refusal
 (S1.3, behind `ECC_PERSONAL_DATA_ISOLATION`) is used by grant create/preview,
 ownership transfer and delegation create/accept; member removal --
 `identity/membership_removal.py` and `authz.owned_resource_summary` --
 uses the lock key, personal-data predicates and revoke-safety helpers;
-Gmail callback identity binding and guarded revoke sites are adopted by
-later tasks. Keeping the definitions in one
+Gmail callback identity binding is adopted by a later task. Keeping the
+definitions in one
 place is the point -- the personal-data predicates, the revoke-safety rule
 and the membership-mutation lock key must not drift between call sites.
 
 Logging discipline (Spec A T7): nothing here ever logs or labels an email
 address, an external account id, a credential, or an exception *message*
 (psycopg's ``DETAIL: Key (...)=(...)`` text carries row values). Only
-exception class names, SQLSTATEs and constraint names are logged.
+exception class names, SQLSTATEs and constraint names are logged -- and
+they go into the %-formatted log *message*, not ``extra=``:
+``ecc.logging.JsonFormatter`` serializes a fixed field set, so ``extra``
+keys never reach production logs.
 """
 
 from __future__ import annotations
@@ -38,6 +43,8 @@ from ecc.auth import AuthContext
 from ecc.config import get_settings
 from ecc.database import SessionFactory
 from ecc.observability import (
+    RevokeResult,
+    RevokeSite,
     record_audit_outbox_failure,
     record_connector_revoke,
     record_personal_data_share_refused,
@@ -201,17 +208,8 @@ def integrity_error_log_fields(exc: IntegrityError) -> tuple[str | None, str | N
 
 RevokeScope = Literal["none", "global"]
 RevokeTokenKind = Literal["minted_unpersisted", "replaced", "duplicate", "disconnected_row"]
-RevokeSite = Literal[
-    "callback_failure",
-    "callback_duplicate",
-    "reconnect_replaced",
-    "disable",
-    "cascade",
-    "removal",
-    "adapter_callback",
-    "remediation",
-]
-RevokeResult = Literal["ok", "error", "skipped_unsafe"]
+# `RevokeSite` / `RevokeResult` live in `ecc.observability` (this module
+# imports it; the reverse would be a cycle) and are re-exported here.
 
 _LIVE_ROW_EXISTS_SQL: Final = """
     SELECT EXISTS (
@@ -283,8 +281,10 @@ def revoke_guarded[C](
         adapter.disconnect(context)
     except Exception as exc:
         _logger.warning(
-            "connector_revoke_failed",
-            extra={"provider": provider, "site": site, "error_class": type(exc).__name__},
+            "connector_revoke_failed provider=%s site=%s error_class=%s",
+            provider,
+            site,
+            type(exc).__name__,
         )
         record_connector_revoke(provider, site, "error")
         return False
@@ -295,6 +295,72 @@ def revoke_guarded[C](
 def record_revoke_skipped_unsafe(*, provider: str, site: RevokeSite) -> None:
     """Count a revoke deliberately skipped because `revoke_is_safe` said no."""
     record_connector_revoke(provider, site, "skipped_unsafe")
+
+
+def revoke_scope_for(provider: str) -> RevokeScope:
+    """The revoke-safety scope that applies to `provider`.
+
+    Personal providers (Gmail) use `ECC_GMAIL_REVOKE_SCOPE`: their OAuth
+    revoke may end the whole Google grant, shared by every row for the
+    same Google account. Every other registered provider's `disconnect()`
+    is a documented no-op (PAT-based; `gitlab_adapter.py` / `github_
+    adapter.py` / `jira_adapter.py` / `datadog_adapter.py`), so there is
+    no grant to protect: `"none"` -- no safety query, and no misleading
+    `skipped_unsafe` count for a revoke that would not have done anything.
+    """
+    if provider in PERSONAL_PROVIDERS:
+        return get_settings().gmail_revoke_scope
+    return "none"
+
+
+def revoke_if_safe[C](
+    adapter: _Disconnector[C],
+    context: C,
+    *,
+    provider: str,
+    external_account_id: str | None,
+    token_kind: RevokeTokenKind,
+    exclude_row_id: UUID | None,
+    site: RevokeSite,
+) -> RevokeResult:
+    """`revoke_is_safe` then `revoke_guarded` -- the one entry point every
+    provider revoke site uses. Never raises.
+
+    Call only AFTER the caller's business transaction has committed or
+    rolled back and its session released: the safety check runs on its
+    own short-lived `SessionFactory()` session, closed before the
+    (possibly slow, blocking) provider network call. Under scope `"none"`
+    no session is opened at all.
+
+    A failure of the safety check itself fails closed: the revoke is not
+    attempted, the exception class is logged, and the attempt is counted
+    as `result="error"`.
+    """
+    scope = revoke_scope_for(provider)
+    if scope != "none":
+        try:
+            with SessionFactory() as check_session:
+                safe = revoke_is_safe(
+                    check_session,
+                    provider=provider,
+                    external_account_id=external_account_id,
+                    token_kind=token_kind,
+                    exclude_row_id=exclude_row_id,
+                    scope=scope,
+                )
+        except Exception as exc:
+            _logger.warning(
+                "connector_revoke_safety_check_failed provider=%s site=%s error_class=%s",
+                provider,
+                site,
+                type(exc).__name__,
+            )
+            record_connector_revoke(provider, site, "error")
+            return "error"
+        if not safe:
+            record_revoke_skipped_unsafe(provider=provider, site=site)
+            return "skipped_unsafe"
+    return "ok" if revoke_guarded(adapter, context, provider=provider, site=site) else "error"
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +391,13 @@ def write_refusal_audit(
     Never raises: on failure it logs the exception class and counts
     `ecc_audit_outbox_failures_total{domain="connector_security"}`; the
     caller still returns its refusal.
+
+    Call only AFTER the caller's business transaction has ended (committed
+    or rolled back) -- never while that transaction still holds row locks
+    on `users` / `workspaces`: the audit INSERT here runs on a second
+    pooled connection whose FK checks take `KEY SHARE` locks on those same
+    rows, so calling it mid-transaction can self-deadlock the request
+    (and holds two pool connections at once).
     """
     domain = "connector_security"
     payload: dict[str, str] = {"reason": reason, payload_key: provider_or_type}
@@ -354,8 +427,9 @@ def write_refusal_audit(
         if written or not isinstance(exc, SQLAlchemyError):
             record_audit_outbox_failure(domain)
         _logger.error(
-            "refusal_audit_write_failed",
-            extra={"event_type": event_type, "error_class": type(exc).__name__},
+            "refusal_audit_write_failed event_type=%s error_class=%s",
+            event_type,
+            type(exc).__name__,
         )
 
 

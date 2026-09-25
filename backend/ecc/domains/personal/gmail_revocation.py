@@ -169,6 +169,7 @@ from ecc.auth import AuthContext
 from ecc.domains.engineering.connector_accounts import get_encrypted_credential
 from ecc.domains.engineering.connectors import ConnectorAccountContext
 from ecc.domains.engineering.crypto import decrypt_credential
+from ecc.platform.connector_security import revoke_if_safe
 
 from .gmail_adapter import GmailAdapter
 
@@ -528,9 +529,21 @@ def finish_gmail_revocation(pending: list[PendingGmailRevoke]) -> None:
     pending entry (an owner may have had more than one connected Gmail
     account) -- each is independently best-effort, so one failing does not
     stop the rest from being attempted.
+
+    Spec A S1.6: each revoke goes through `revoke_if_safe` (never raises;
+    logs only the exception class; counts `ecc_connector_revoke_total
+    {site="cascade"}`). Under `ECC_GMAIL_REVOKE_SCOPE=global` a grant is
+    skipped while another live `connector_accounts` row -- in any
+    workspace -- still uses the same Google account, since revoking it
+    could end that other connection's grant too.
     """
     for adapter, context in pending:
-        try:
-            adapter.disconnect(context)
-        except Exception:  # noqa: BLE001 -- best-effort revocation, never raises to the caller
-            pass
+        revoke_if_safe(
+            adapter,
+            context,
+            provider="gmail",
+            external_account_id=context.external_account_id,
+            token_kind="disconnected_row",
+            exclude_row_id=context.connector_account_id,
+            site="cascade",
+        )

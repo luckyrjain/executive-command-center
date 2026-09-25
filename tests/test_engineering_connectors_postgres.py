@@ -184,6 +184,7 @@ endpoint's idempotency handling, not the gmail-provider gate itself):
     the account is no longer `disconnected`.
 """
 
+import logging
 import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -199,6 +200,7 @@ from fastapi.testclient import TestClient
 from identity_fixtures import create_identity
 from sqlalchemy import text
 
+from ecc import observability
 from ecc.config import get_settings
 from ecc.database import STATEMENT_TIMEOUT_MS, engine
 from ecc.domains.engineering import connector_accounts as connector_accounts_module
@@ -211,6 +213,7 @@ from ecc.domains.engineering.connectors import (
 )
 from ecc.domains.engineering.crypto import decrypt_credential, encrypt_credential
 from ecc.domains.engineering.sandbox_adapter import SandboxGithubAdapter
+from ecc.logging import JsonFormatter
 from ecc.main import app
 
 settings = get_settings()
@@ -493,6 +496,10 @@ class _SlowAuthorizeAdapter:
 
     def disconnect(self, account: ConnectorAccountContext) -> None:
         return None
+
+
+def _revoke_count(provider: str, site: str, result: str) -> float:
+    return observability.connector_revoke_total._values.get((provider, site, result), 0.0)
 
 
 def _registry_with(adapter: Any) -> ConnectorRegistry:
@@ -1133,6 +1140,72 @@ def test_create_connector_rejects_duplicate_connection(
     )
     assert second.status_code == 409
     assert second.json()["error"]["code"] == "CONNECTOR_ALREADY_CONNECTED"
+
+
+def _bogus_actor_on_connector_insert(monkeypatch: pytest.MonkeyPatch) -> UUID:
+    """Forces an FK violation (not the unique-key conflict) on the
+    `connector_accounts` INSERT by swapping its actor for a nonexistent user.
+    Returns the bogus id so a test can assert it never reaches a log line.
+    """
+    from sqlalchemy.orm import Session as OrmSession
+
+    bogus_actor = uuid4()
+    original_execute = OrmSession.execute
+
+    def patched_execute(
+        self: OrmSession, statement: object, *args: object, **kwargs: object
+    ) -> object:
+        if "INSERT INTO connector_accounts" in str(statement) and args:
+            params = args[0]
+            if isinstance(params, dict) and "actor_id" in params:
+                args = ({**params, "actor_id": bogus_actor}, *args[1:])
+        return original_execute(self, statement, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(OrmSession, "execute", patched_execute)
+    return bogus_actor
+
+
+def test_create_connector_fk_violation_is_a_500_not_a_409_and_logs_only_sqlstate(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Spec A S1.5: only `uq_connector_accounts_workspace_provider_external_
+    id` means "already connected". Any other integrity failure is a 500,
+    logged as SQLSTATE + constraint only -- no driver DETAIL row values,
+    and no traceback from the request middleware."""
+    client, workspace_id, _user_id, token = engineering_test_context
+    bogus_actor = _bogus_actor_on_connector_insert(monkeypatch)
+
+    with caplog.at_level(logging.DEBUG):
+        response = client.post(
+            "/api/v1/engineering/connectors",
+            json={"provider": "sandbox", "credential": "token-fk"},
+            headers=_headers(token, key=str(uuid4())),
+        )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "CONNECTOR_ACCOUNT_PERSIST_FAILED"
+    with engine.begin() as connection:
+        count = connection.execute(
+            text("SELECT count(*) FROM connector_accounts WHERE workspace_id = :ws"),
+            {"ws": workspace_id},
+        ).scalar_one()
+    assert count == 0
+    app_records = [r for r in caplog.records if not r.name.startswith("httpx")]
+    persist_lines = [
+        r.getMessage()
+        for r in app_records
+        if r.getMessage().startswith("connector_account_persist_failed")
+    ]
+    assert len(persist_lines) == 1
+    assert "sqlstate=23503" in persist_lines[0]
+    assert "constraint=None" not in persist_lines[0]
+    for record in app_records:
+        assert record.exc_info is None
+        rendered = JsonFormatter().format(record)
+        for secret in (str(bogus_actor), "DETAIL", "Key ("):
+            assert secret not in rendered
 
 
 def test_create_connector_idempotency_replay_and_conflict(
@@ -2492,6 +2565,127 @@ def test_disable_succeeds_when_adapter_disconnect_raises(
     assert response.status_code == 200
     assert response.json()["status"] == "disconnected"
     assert len(raising.disconnect_calls) == 1
+
+
+def test_disable_revoke_raising_is_logged_by_class_and_counted_as_error(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Spec A S1.6: the disable revoke goes through `revoke_guarded` --
+    never fails the request, logs only the exception class (never its
+    message), counts `ecc_connector_revoke_total{result="error"}`."""
+    client, workspace_id, user_id, token = engineering_test_context
+    raising = _RaisingDisconnectAdapter()
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(raising))
+    account_id = _insert_connector_account(workspace_id, user_id)
+    before = _revoke_count("sandbox", "disable", "error")
+
+    with caplog.at_level(logging.WARNING, logger="ecc.platform.connector_security"):
+        response = client.post(
+            f"/api/v1/engineering/connectors/{account_id}/disable",
+            headers=_headers(token, key=str(uuid4())),
+        )
+
+    assert response.status_code == 200
+    assert _revoke_count("sandbox", "disable", "error") == before + 1
+    rendered = " ".join(JsonFormatter().format(r) for r in caplog.records)
+    assert "error_class=RuntimeError" in rendered
+    assert "revocation endpoint down" not in rendered
+
+
+def _second_workspace_with_live_connector(
+    *, provider: str, external_account_id: str
+) -> tuple[UUID, UUID]:
+    """Another workspace (own member) holding a live row for the same
+    external account. Returns `(workspace_id, accounts.id)` for cleanup."""
+    workspace_id = uuid4()
+    user_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Other Workspace', 'UTC', :now)"
+            ),
+            {"id": workspace_id, "now": now},
+        )
+        identity_account_id = create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            email=f"{user_id}@example.test",
+            now=now,
+        )
+    _insert_connector_account(
+        workspace_id, user_id, provider=provider, external_account_id=external_account_id
+    )
+    return workspace_id, identity_account_id
+
+
+def _cleanup_second_workspace(workspace_id: UUID, identity_account_id: UUID) -> None:
+    _cleanup_workspace(workspace_id)
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM accounts WHERE id = :id"), {"id": identity_account_id})
+
+
+def test_disable_gmail_revoke_skipped_under_global_scope_while_another_workspace_is_live(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spec A revocation safety (`disconnected_row`, exclude = this row):
+    under `ECC_GMAIL_REVOKE_SCOPE=global` a Gmail grant is not revoked while
+    another workspace still has a live row for the same Google account."""
+    client, workspace_id, user_id, token = engineering_test_context
+    monkeypatch.setenv("ECC_GMAIL_REVOKE_SCOPE", "global")
+    get_settings.cache_clear()
+    spy = _SpyDisconnectAdapter(provider="gmail")
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(spy))
+    google_account = f"shared-{uuid4()}@example.test"
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="gmail", external_account_id=google_account
+    )
+    other_ws, other_identity = _second_workspace_with_live_connector(
+        provider="gmail", external_account_id=google_account
+    )
+    before = _revoke_count("gmail", "disable", "skipped_unsafe")
+    try:
+        response = client.post(
+            f"/api/v1/engineering/connectors/{account_id}/disable",
+            headers=_headers(token, key=str(uuid4())),
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "disconnected"
+        assert spy.disconnect_calls == []
+        assert _revoke_count("gmail", "disable", "skipped_unsafe") == before + 1
+    finally:
+        _cleanup_second_workspace(other_ws, other_identity)
+        get_settings.cache_clear()
+
+
+def test_disable_gmail_revoke_proceeds_under_global_scope_when_no_other_live_row(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, workspace_id, user_id, token = engineering_test_context
+    monkeypatch.setenv("ECC_GMAIL_REVOKE_SCOPE", "global")
+    get_settings.cache_clear()
+    spy = _SpyDisconnectAdapter(provider="gmail")
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(spy))
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="gmail", external_account_id=f"solo-{uuid4()}@example.test"
+    )
+    before = _revoke_count("gmail", "disable", "ok")
+    try:
+        response = client.post(
+            f"/api/v1/engineering/connectors/{account_id}/disable",
+            headers=_headers(token, key=str(uuid4())),
+        )
+        assert response.status_code == 200, response.text
+        assert [c.connector_account_id for c in spy.disconnect_calls] == [account_id]
+        assert _revoke_count("gmail", "disable", "ok") == before + 1
+    finally:
+        get_settings.cache_clear()
 
 
 def test_disable_succeeds_when_credential_cannot_be_decrypted(
