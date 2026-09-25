@@ -134,7 +134,7 @@ intended caller; wiring it here would be speculative.
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any, Literal, Protocol, cast
+from typing import Annotated, Any, Literal, NoReturn, Protocol, cast
 from uuid import UUID, uuid4
 
 from fastapi import (
@@ -159,6 +159,11 @@ from ecc.observability import (
     record_idempotency_conflict,
 )
 from ecc.platform import audit_outbox, authz
+from ecc.platform.connector_security import (
+    integrity_error_log_fields,
+    is_unique_violation,
+    revoke_if_safe,
+)
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 from ecc.platform.request_models import EmptyBody as _EmptyBody
 
@@ -278,6 +283,25 @@ _MAX_ADAPTER_ERROR_LENGTH = 300
 # problem -- even though they do not prevent the concurrent-call overlap
 # itself.
 _STALE_RUNNING_SYNC_THRESHOLD = timedelta(minutes=10)
+
+
+def _raise_connector_persist_failed(exc: IntegrityError) -> NoReturn:
+    """Fail a connector create (500) for an `IntegrityError` that is not the
+    duplicate-account unique violation (Spec A S1.5/S1.6, threat T7).
+
+    Logs only `(sqlstate, constraint)` -- never `str(exc)`, whose psycopg
+    `DETAIL: Key (...)=(...)` / `Failing row contains (...)` text carries
+    row values (external account ids/emails, encrypted credential bytes).
+    Raised as an `HTTPException` *from None*: FastAPI converts it to a 500
+    response inside the app, so no exception (and no chained `IntegrityError`
+    message) reaches `request_observability_middleware`'s `exc_info=True`
+    log line.
+    """
+    sqlstate, constraint = integrity_error_log_fields(exc)
+    _logger.error(
+        "connector_account_persist_failed: sqlstate=%s constraint=%s", sqlstate, constraint
+    )
+    raise HTTPException(status_code=500, detail="CONNECTOR_ACCOUNT_PERSIST_FAILED") from None
 
 
 def _sanitize_adapter_error(message: str) -> str:
@@ -928,7 +952,17 @@ def create_connector_endpoint(
                         "now": now,
                     },
                 )
-        except IntegrityError:
+        except IntegrityError as integrity_error:
+            # Spec A S1.5: only the external-account unique key means "this
+            # identity is already connected". Any other integrity failure
+            # (an FK or check violation) is a real error -> 500, logged as
+            # SQLSTATE + constraint name only (S1.6 / threat T7). See
+            # `_raise_connector_persist_failed` for why it is raised as a
+            # sanitized `HTTPException` from None.
+            if not is_unique_violation(
+                integrity_error, "uq_connector_accounts_workspace_provider_external_id"
+            ):
+                _raise_connector_persist_failed(integrity_error)
             # `begin_nested()`'s own `__exit__` already rolled back to the
             # SAVEPOINT on the exception above -- the outer transaction
             # itself is still open and healthy, so a fresh read here is
@@ -2163,10 +2197,21 @@ def disable_connector_endpoint(
     session.close()
     if pending_revoke is not None:
         adapter, context = pending_revoke
-        try:
-            adapter.disconnect(context)
-        except Exception:  # noqa: BLE001 -- best-effort revocation, never blocks disconnect
-            pass
+        # Spec A S1.6: never raises (logs the exception class only, counts
+        # `ecc_connector_revoke_total`); for a personal provider the grant
+        # is revoked only if no *other* live row still uses the same
+        # external account (`revoke_is_safe`, on its own short session --
+        # `session` is already closed). Non-personal providers' revokes are
+        # documented no-ops and skip the check (`revoke_scope_for`).
+        revoke_if_safe(
+            adapter,
+            context,
+            provider=account.provider,
+            external_account_id=context.external_account_id,
+            token_kind="disconnected_row",
+            exclude_row_id=account_id,
+            site="disable",
+        )
     return response
 
 

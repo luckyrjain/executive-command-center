@@ -276,6 +276,7 @@ uses repeatedly for `_adapter`, just applied one layer lower).
 
 from __future__ import annotations
 
+import logging
 import threading
 from base64 import urlsafe_b64encode
 from collections.abc import Iterator
@@ -294,12 +295,14 @@ from identity_fixtures import create_identity
 from sqlalchemy import text
 
 import ecc.domains.personal.gmail_oauth as gmail_oauth_module
+from ecc import observability
 from ecc.auth import AuthContext
 from ecc.config import get_settings
 from ecc.database import STATEMENT_TIMEOUT_MS, engine
 from ecc.domains.engineering.connectors import AdapterAuthorizationError, ConnectorAccountContext
 from ecc.domains.engineering.crypto import decrypt_credential
 from ecc.domains.personal.gmail_adapter import REQUIRED_SCOPES, GmailAdapter
+from ecc.logging import JsonFormatter
 from ecc.main import app
 
 settings = get_settings()
@@ -2682,6 +2685,9 @@ def test_oauth_callback_revokes_the_discarded_grant_when_racing_an_active_row(
     """
     client, workspace_id, _user_id, token = gmail_test_context
     monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    # Revoke scope `none` (per-token): preserves this test's intent that the
+    # grant IS revoked; `*_under_global_revoke_scope` variants assert the skip.
+    monkeypatch.setenv("ECC_GMAIL_REVOKE_SCOPE", "none")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
@@ -2757,6 +2763,9 @@ def test_oauth_callback_releases_pool_connection_and_row_lock_before_revoking(
     """
     client, _workspace_id, _user_id, token = gmail_test_context
     monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    # Revoke scope `none` (per-token): preserves this test's intent that the
+    # grant IS revoked; `*_under_global_revoke_scope` variants assert the skip.
+    monkeypatch.setenv("ECC_GMAIL_REVOKE_SCOPE", "none")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
@@ -2865,6 +2874,9 @@ def test_oauth_callback_reactivation_releases_pool_connection_and_row_lock_befor
     """
     client, _workspace_id, _user_id, token = gmail_test_context
     monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    # Revoke scope `none` (per-token): preserves this test's intent that the
+    # grant IS revoked; `*_under_global_revoke_scope` variants assert the skip.
+    monkeypatch.setenv("ECC_GMAIL_REVOKE_SCOPE", "none")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
@@ -2980,6 +2992,9 @@ def test_oauth_callback_reactivates_disconnected_account(
     """
     client, workspace_id, _user_id, token = gmail_test_context
     monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    # Revoke scope `none` (per-token): preserves this test's intent that the
+    # grant IS revoked; `*_under_global_revoke_scope` variants assert the skip.
+    monkeypatch.setenv("ECC_GMAIL_REVOKE_SCOPE", "none")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
@@ -3283,6 +3298,9 @@ def test_oauth_callback_revokes_new_grant_when_integrity_error_handler_reselect_
     """
     client, workspace_id, _user_id, token = gmail_test_context
     monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    # Revoke scope `none` (per-token): preserves this test's intent that the
+    # grant IS revoked; `*_under_global_revoke_scope` variants assert the skip.
+    monkeypatch.setenv("ECC_GMAIL_REVOKE_SCOPE", "none")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
@@ -3446,6 +3464,9 @@ def test_oauth_callback_reactivation_failure_preserves_still_live_credential_of_
     """
     client, workspace_id, _user_id, token = gmail_test_context
     monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    # Revoke scope `none` (per-token): preserves this test's intent that the
+    # grant IS revoked; `*_under_global_revoke_scope` variants assert the skip.
+    monkeypatch.setenv("ECC_GMAIL_REVOKE_SCOPE", "none")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
@@ -3512,5 +3533,239 @@ def test_oauth_callback_reactivation_failure_preserves_still_live_credential_of_
             ).one()
         assert row[0] == "error"
         assert "refresh-1" in decrypt_credential(row[1])
+    finally:
+        get_settings.cache_clear()
+
+
+# --- Spec A T05: conflict narrowing (S1.5) + guarded, safety-checked revokes
+# (S1.6) at the callback's revoke sites ---------------------------------------
+
+
+def _revoke_count(site: str, result: str) -> float:
+    return observability.connector_revoke_total._values.get(("gmail", site, result), 0.0)
+
+
+def _configure_gmail_oauth(monkeypatch: pytest.MonkeyPatch, *, revoke_scope: str) -> None:
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_REVOKE_SCOPE", revoke_scope)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
+    get_settings.cache_clear()
+
+
+def _complete_consent(client: TestClient, token: str, code: str) -> Any:
+    start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+    state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
+    return client.get(
+        "/api/v1/personal/gmail/oauth/callback", params={"code": code, "state": state}
+    )
+
+
+def _bogus_actor_on_connector_insert(monkeypatch: pytest.MonkeyPatch) -> UUID:
+    """Forces an FK violation (not the unique-key conflict) on the
+    `connector_accounts` INSERT by swapping its actor for a user id that
+    does not exist. Returns that bogus id so a test can assert it never
+    reaches a log line (psycopg's `DETAIL: Key (...)=(...)` would carry it).
+    """
+    from sqlalchemy.orm import Session as OrmSession
+
+    bogus_actor = uuid4()
+    original_execute = OrmSession.execute
+
+    def patched_execute(
+        self: OrmSession, statement: object, *args: object, **kwargs: object
+    ) -> object:
+        if "INSERT INTO connector_accounts" in str(statement) and args:
+            params = args[0]
+            if isinstance(params, dict) and "actor_id" in params:
+                args = ({**params, "actor_id": bogus_actor}, *args[1:])
+        return original_execute(self, statement, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(OrmSession, "execute", patched_execute)
+    return bogus_actor
+
+
+def test_oauth_callback_fk_violation_is_a_500_not_a_duplicate_and_logs_only_sqlstate(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """S1.5: only `uq_connector_accounts_workspace_provider_external_id` is a
+    duplicate. An FK violation on the INSERT must fail the request (500),
+    log only SQLSTATE + constraint name (never the driver's DETAIL row
+    values), keep the request middleware from logging a traceback, and
+    still revoke the freshly minted grant (no live row anywhere -> safe even
+    under the default `global` scope)."""
+    client, workspace_id, _user_id, token = gmail_test_context
+    _configure_gmail_oauth(monkeypatch, revoke_scope="global")
+    revoked_tokens: list[str] = []
+    monkeypatch.setattr(
+        gmail_oauth_module,
+        "_adapter",
+        GmailAdapter(transport=_oauth_transport(revoked_tokens=revoked_tokens)),
+    )
+    try:
+        bogus_actor = _bogus_actor_on_connector_insert(monkeypatch)
+        with caplog.at_level(logging.DEBUG):
+            response = _complete_consent(client, token, "auth-code")
+
+        assert response.status_code == 500
+        assert response.json()["error"]["code"] == "CONNECTOR_ACCOUNT_PERSIST_FAILED"
+        assert revoked_tokens == ["refresh-1"]
+        with engine.begin() as connection:
+            count = connection.execute(
+                text("SELECT count(*) FROM connector_accounts WHERE workspace_id = :ws"),
+                {"ws": workspace_id},
+            ).scalar_one()
+        assert count == 0
+
+        app_records = [r for r in caplog.records if not r.name.startswith("httpx")]
+        persist_lines = [
+            r.getMessage()
+            for r in app_records
+            if r.getMessage().startswith("gmail_oauth_callback_persist_failed")
+        ]
+        assert len(persist_lines) == 1
+        assert "sqlstate=23503" in persist_lines[0]
+        assert "constraint=" in persist_lines[0]
+        assert "constraint=None" not in persist_lines[0]
+        for record in app_records:
+            assert record.exc_info is None
+            rendered = JsonFormatter().format(record)
+            for secret in (str(bogus_actor), _ALLOWED_EMAIL, "DETAIL", "Key ("):
+                assert secret not in rendered
+    finally:
+        get_settings.cache_clear()
+
+
+def test_oauth_callback_active_duplicate_revoke_skipped_under_global_revoke_scope(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`global` variant of `test_oauth_callback_revokes_the_discarded_grant_
+    when_racing_an_active_row`: the losing consent's grant may be the SAME
+    Google grant the live row uses, so it is not revoked while that row is
+    live -- counted as `skipped_unsafe`."""
+    client, _workspace_id, _user_id, token = gmail_test_context
+    _configure_gmail_oauth(monkeypatch, revoke_scope="global")
+    monkeypatch.setattr(gmail_oauth_module, "_adapter", GmailAdapter(transport=_oauth_transport()))
+    try:
+        first = _complete_consent(client, token, "auth-code")
+        assert first.status_code == 200
+        revoked_tokens: list[str] = []
+        monkeypatch.setattr(
+            gmail_oauth_module,
+            "_adapter",
+            GmailAdapter(
+                transport=_oauth_transport(
+                    token_body=_token_response(access_token="access-3", refresh_token="refresh-3"),
+                    revoked_tokens=revoked_tokens,
+                )
+            ),
+        )
+        skipped_before = _revoke_count("callback_duplicate", "skipped_unsafe")
+        ok_before = _revoke_count("callback_duplicate", "ok")
+
+        second = _complete_consent(client, token, "auth-code-3")
+
+        assert second.status_code == 200
+        assert second.json()["id"] == first.json()["id"]
+        assert revoked_tokens == []
+        assert _revoke_count("callback_duplicate", "skipped_unsafe") == skipped_before + 1
+        assert _revoke_count("callback_duplicate", "ok") == ok_before
+    finally:
+        get_settings.cache_clear()
+
+
+def test_oauth_callback_reconnect_replaced_revoke_skipped_under_global_revoke_scope(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`global` variant of `test_oauth_callback_reactivates_disconnected_
+    account`: reactivation still succeeds with the new credential, but the
+    replaced one is not revoked -- after commit the row is live again, and
+    under a grant-wide revoke the old token's grant may be the new one's."""
+    client, _workspace_id, _user_id, token = gmail_test_context
+    _configure_gmail_oauth(monkeypatch, revoke_scope="global")
+    monkeypatch.setattr(gmail_oauth_module, "_adapter", GmailAdapter(transport=_oauth_transport()))
+    try:
+        first = _complete_consent(client, token, "auth-code")
+        assert first.status_code == 200
+        account_id = first.json()["id"]
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE connector_accounts SET status = 'disconnected', "
+                    "disconnected_at = :now WHERE id = :id"
+                ),
+                {"id": account_id, "now": datetime.now(UTC)},
+            )
+        revoked_tokens: list[str] = []
+        monkeypatch.setattr(
+            gmail_oauth_module,
+            "_adapter",
+            GmailAdapter(
+                transport=_oauth_transport(
+                    token_body=_token_response(access_token="access-2", refresh_token="refresh-2"),
+                    revoked_tokens=revoked_tokens,
+                )
+            ),
+        )
+        skipped_before = _revoke_count("reconnect_replaced", "skipped_unsafe")
+
+        second = _complete_consent(client, token, "auth-code-2")
+
+        assert second.status_code == 200
+        assert second.json()["status"] == "active"
+        assert revoked_tokens == []
+        assert _revoke_count("reconnect_replaced", "skipped_unsafe") == skipped_before + 1
+        with engine.begin() as connection:
+            stored = connection.execute(
+                text("SELECT encrypted_credentials FROM connector_accounts WHERE id = :id"),
+                {"id": account_id},
+            ).scalar_one()
+        assert loads(decrypt_credential(stored))["refresh_token"] == "refresh-2"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_oauth_callback_succeeds_and_counts_error_when_revoke_raises(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """S1.6: a revoke that raises (not just one Google rejects) must never
+    fail the callback -- `revoke_guarded` swallows it, logs only the class,
+    and counts `result="error"`."""
+    client, _workspace_id, _user_id, token = gmail_test_context
+    _configure_gmail_oauth(monkeypatch, revoke_scope="none")
+    monkeypatch.setattr(gmail_oauth_module, "_adapter", GmailAdapter(transport=_oauth_transport()))
+
+    class _ExplodingRevokeAdapter(GmailAdapter):
+        def disconnect(self, account: ConnectorAccountContext) -> None:
+            raise RuntimeError(f"revoke blew up for {account.external_account_id}")
+
+    try:
+        first = _complete_consent(client, token, "auth-code")
+        assert first.status_code == 200
+        monkeypatch.setattr(
+            gmail_oauth_module,
+            "_adapter",
+            _ExplodingRevokeAdapter(
+                transport=_oauth_transport(
+                    token_body=_token_response(access_token="access-5", refresh_token="refresh-5")
+                )
+            ),
+        )
+        error_before = _revoke_count("callback_duplicate", "error")
+        with caplog.at_level(logging.WARNING, logger="ecc.platform.connector_security"):
+            second = _complete_consent(client, token, "auth-code-5")
+
+        assert second.status_code == 200
+        assert _revoke_count("callback_duplicate", "error") == error_before + 1
+        rendered = " ".join(JsonFormatter().format(r) for r in caplog.records)
+        assert "error_class=RuntimeError" in rendered
+        assert _ALLOWED_EMAIL not in rendered
     finally:
         get_settings.cache_clear()
