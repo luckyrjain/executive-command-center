@@ -591,7 +591,7 @@ def list_candidates(
                 WHERE {" AND ".join(clauses)}
                 ORDER BY resolution_candidates.created_at DESC, resolution_candidates.id DESC
                 LIMIT :limit
-                """
+                """  # noqa: S608 -- literal clauses + authz fragments; values bound
             ),
             params,
         )
@@ -666,7 +666,7 @@ def count_candidates(
               ON right_entity.workspace_id = resolution_candidates.workspace_id
              AND right_entity.id = resolution_candidates.right_entity_id
             WHERE {" AND ".join(clauses)}
-        """),
+        """),  # noqa: S608 -- literal clauses + authz fragments; values bound
         params,
     ).scalar_one()
     session.rollback()

@@ -1007,7 +1007,7 @@ def list_attention(
               COALESCE(t.created_at, c.created_at, r.created_at, wl.created_at, eth.created_at) ASC,
               ai.entity_id ASC
             LIMIT :limit
-        """),
+        """),  # noqa: S608 -- authz visibility fragment; values bound
             {"workspace_id": auth.workspace_id, "now": now, "limit": limit, **visibility_params},
         )
         .mappings()
@@ -1037,7 +1037,7 @@ def count_attention(auth: AuthDep, session: SessionDep) -> AttentionCount:
                    OR ai.dismissed_entity_version <> ai.source_entity_version)
               AND (ai.deferred_until IS NULL OR ai.deferred_until <= :now)
               AND ({visibility_sql})
-        """),
+        """),  # noqa: S608 -- authz visibility fragment; values bound
         {"workspace_id": auth.workspace_id, "now": now, **visibility_params},
     ).scalar_one()
     session.rollback()

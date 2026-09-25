@@ -342,7 +342,7 @@ def _run_lexical_query(
                 )
                 ORDER BY score DESC, entity_id ASC
                 LIMIT :fetch_limit
-                """
+                """  # noqa: S608 -- float constants + authz fragment; values bound
             ),
             params,
         )
@@ -454,7 +454,7 @@ def _run_hybrid_query(
                 )
                 ORDER BY score DESC, entity_id ASC
                 LIMIT :fetch_limit
-                """
+                """  # noqa: S608 -- authz visibility fragment; values bound
             ),
             params,
         )
