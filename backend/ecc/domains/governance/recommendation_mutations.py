@@ -341,7 +341,7 @@ def _transition(
     updated = (
         session.execute(
             text(
-                f"UPDATE recommendations SET {', '.join(clauses)} "
+                f"UPDATE recommendations SET {', '.join(clauses)} "  # noqa: S608 -- SET keys are literals from callers; values bound
                 f"WHERE workspace_id=:workspace_id AND id=:recommendation_id RETURNING {FIELDS}"
             ),
             params,

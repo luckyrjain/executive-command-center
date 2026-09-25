@@ -543,7 +543,7 @@ def _fetch_participants(
                 WHERE mp.workspace_id = :workspace_id AND mp.meeting_id = :meeting_id
                   AND ({visibility_sql})
                 ORDER BY mp.created_at, mp.id
-                """
+                """  # noqa: S608 -- authz visibility fragment; values bound
             ),
             {"workspace_id": auth.workspace_id, "meeting_id": meeting_id, **visibility_params},
         )

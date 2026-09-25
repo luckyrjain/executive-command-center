@@ -171,6 +171,8 @@ def is_personal_resource(session: Session, resource_type: str, resource_id: UUID
     data set. Any resource_type outside that set -> False (no query). A
     nonexistent id -> False.
     """
+    # `statement` is a code-defined `_PERSONAL_PREDICATES` value, never
+    # request text; `resource_type` only selects which one.
     statement = _PERSONAL_PREDICATES.get(resource_type)
     if statement is None:
         return False

@@ -413,7 +413,7 @@ def count_tasks(auth: AuthDep, session: SessionDep) -> TaskCount:
               AND ({visibility_sql})
               AND archived_at IS NULL
               AND status NOT IN ('completed', 'cancelled')
-        """),
+        """),  # noqa: S608 -- authz visibility fragment; values bound
         {"workspace_id": auth.workspace_id, **visibility_params},
     ).scalar_one()
     return TaskCount(count=count)
@@ -537,7 +537,7 @@ def update_task(
                 SET {", ".join(assignments)}
                 WHERE workspace_id = :workspace_id AND id = :task_id
                 RETURNING {_SELECT_FIELDS}
-                """
+                """  # noqa: S608 -- SET keys from extra="forbid" Patch fields; values bound
                 ),
                 values,
             )
