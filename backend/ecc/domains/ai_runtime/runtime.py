@@ -478,6 +478,10 @@ class ToolDispatchFailed:
 
 
 def _resolve_handler(handler_ref: str) -> Any:
+    # Not request-derived: handler_ref is only ever a migration-seeded
+    # `tool_definitions` row (no API inserts one or sets handler_ref; the
+    # immutability trigger freezes it past draft), reached only after `tool_name` passed
+    # the task's `eligible_tools` allowlist in `_dispatch_tool`.
     module_name, _, func_name = handler_ref.partition(":")
     module = import_module(module_name)
     return getattr(module, func_name)

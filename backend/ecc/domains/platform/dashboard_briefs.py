@@ -147,7 +147,7 @@ def _build_sections(
                   AND coalesce(ce.ends_at, m.standalone_ends_at) > :start_at
                 ORDER BY starts_at ASC, m.id ASC
                 LIMIT 8
-                """
+                """  # noqa: S608 -- authz visibility fragment; values bound
             ),
             {
                 "workspace_id": workspace_id,
@@ -214,7 +214,7 @@ def _build_sections(
                   AND ({attention_visibility_sql})
                 ORDER BY ai.pinned DESC, ai.score DESC, ai.entity_type ASC, ai.entity_id ASC
                 LIMIT 20
-                """
+                """  # noqa: S608 -- authz visibility fragment; values bound
             ),
             {"workspace_id": workspace_id, "now": now, **attention_visibility_params},
         )
@@ -268,7 +268,7 @@ def _build_sections(
                          coalesce(c.due_at, c.due_date::timestamp) ASC,
                          c.id ASC
                 LIMIT 20
-                """
+                """  # noqa: S608 -- authz visibility fragment; values bound
             ),
             {
                 "workspace_id": workspace_id,
@@ -336,7 +336,7 @@ def _build_sections(
                   AND blocked_on_person_id IS NOT NULL
                 ORDER BY entity_type ASC, id ASC
                 LIMIT 20
-                """
+                """  # noqa: S608 -- authz visibility fragment; values bound
             ),
             {
                 "workspace_id": workspace_id,
@@ -385,7 +385,7 @@ def _build_sections(
                          review_at ASC NULLS LAST,
                          id ASC
                 LIMIT 10
-                """
+                """  # noqa: S608 -- authz visibility fragment; values bound
             ),
             {"workspace_id": workspace_id, **risks_visibility_params},
         )
