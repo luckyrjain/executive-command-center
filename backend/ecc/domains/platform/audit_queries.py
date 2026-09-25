@@ -148,7 +148,7 @@ def list_audit_events(
                 WHERE {" AND ".join(conditions)}
                 ORDER BY occurred_at DESC, id DESC
                 LIMIT :limit
-                """
+                """  # noqa: S608 -- column names from literal tuple; values bound
             ),
             params,
         )
