@@ -2408,8 +2408,17 @@ def list_team_suggestions_endpoint(
     dict merge. Grouping by `suggested_team_name` happens in Python
     instead, over what are already small, pre-filtered row sets.
     """
-    # `order_by="id"` is arbitrary -- grouping happens in Python below over
-    # the whole result set, so row order from either query has no effect.
+    # `order_by="id"` is required by the helper -- the original inline
+    # queries had no ORDER BY at all. It has no effect on
+    # `repository_count`/`work_item_count` or on which `suggested_team_
+    # name` groups appear, since those are totals over the whole result
+    # set below. It DOES determine which specific rows land in
+    # `sample_items` when a group has more than `_TEAM_SUGGESTION_
+    # SAMPLE_CAP` matches of one resource type, since that list keeps
+    # only the first N rows seen per group. The original query gave no
+    # ordering guarantee either, so which rows were sampled in that case
+    # was already unspecified/planner-dependent; `id ASC` just makes the
+    # selection deterministic instead of leaving it to chance.
     repo_rows = authz.list_visible_resources(
         session,
         auth,
