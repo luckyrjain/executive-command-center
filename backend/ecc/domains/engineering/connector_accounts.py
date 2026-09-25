@@ -132,6 +132,8 @@ intended caller; wiring it here would be speculative.
 """
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal, NoReturn, Protocol, cast
@@ -156,6 +158,7 @@ from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import SessionFactory, get_session
 from ecc.observability import (
     queue_lifecycle_event,
+    record_connector_enrollment_refused,
     record_idempotency_conflict,
 )
 from ecc.platform import audit_outbox, authz
@@ -163,6 +166,7 @@ from ecc.platform.connector_security import (
     integrity_error_log_fields,
     is_unique_violation,
     revoke_if_safe,
+    write_refusal_audit,
 )
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 from ecc.platform.request_models import EmptyBody as _EmptyBody
@@ -302,6 +306,60 @@ def _raise_connector_persist_failed(exc: IntegrityError) -> NoReturn:
         "connector_account_persist_failed: sqlstate=%s constraint=%s", sqlstate, constraint
     )
     raise HTTPException(status_code=500, detail="CONNECTOR_ACCOUNT_PERSIST_FAILED") from None
+
+
+ReactivationRefusedReason = Literal["not_found", "access_denied"]
+
+
+class _ReactivationRefused(Exception):
+    """Raised inside `create_connector_endpoint`'s phase-3 transaction when
+    the caller may not reactivate the existing `disconnected` row (Spec A
+    S1.7). Carries no row data beyond the id the refusal audit is keyed on;
+    `_reactivation_refusal_guard` turns it into the HTTP refusal."""
+
+    def __init__(self, *, account_id: UUID, reason: ReactivationRefusedReason) -> None:
+        super().__init__(reason)
+        self.account_id = account_id
+        self.reason = reason
+
+
+@contextmanager
+def _reactivation_refusal_guard(
+    auth: AuthContext, request: Request, *, provider: str
+) -> Iterator[None]:
+    """Wrap phase 3 as the OUTERMOST context manager: `with guard,
+    SessionFactory() as s, s.begin():`. A `_ReactivationRefused` first
+    unwinds `s.begin()` (rollback, the `FOR UPDATE` lock released) and
+    closes the session, and only then is translated here into the refusal
+    audit (its own short transaction, per `write_refusal_audit`'s contract)
+    + `ecc_connector_enrollment_refused_total` + the same codes `/sync` and
+    `/disable` use: no read -> `404 CONNECTOR_NOT_FOUND`, read but no write
+    -> `403 INSUFFICIENT_ROLE`. The response body carries only the code, so
+    the row's content stays hidden. Its existence does not: on this endpoint
+    no row -> 201, a hidden disconnected row -> 404, an active row -> 409,
+    so a caller who already holds a valid credential for that external
+    identity can tell a hidden row exists (spec-required codes; the
+    pre-existing 409 for active rows reveals the same).
+    """
+    try:
+        yield
+    except _ReactivationRefused as refusal:
+        write_refusal_audit(
+            auth,
+            request,
+            event_type="connector_account.enrollment_refused",
+            aggregate_type="connector_account",
+            aggregate_id=refusal.account_id,
+            reason=refusal.reason,
+            provider_or_type=provider,
+        )
+        record_connector_enrollment_refused(provider, refusal.reason)
+        _logger.warning(
+            "connector_reactivation_refused provider=%s reason=%s", provider, refusal.reason
+        )
+        if refusal.reason == "not_found":
+            raise HTTPException(status_code=404, detail="CONNECTOR_NOT_FOUND") from None
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE") from None
 
 
 def _sanitize_adapter_error(message: str) -> str:
@@ -926,7 +984,11 @@ def create_connector_endpoint(
 
     # --- Phase 3: persist the account, on a fresh connection --------------
     account_id = uuid4()
-    with SessionFactory() as create_session, create_session.begin():
+    with (
+        _reactivation_refusal_guard(auth, request, provider=payload.provider),
+        SessionFactory() as create_session,
+        create_session.begin(),
+    ):
         try:
             # A SAVEPOINT (`begin_nested`), not a second top-level
             # transaction -- the INSERT below must stay inside the SAME
@@ -1063,6 +1125,36 @@ def create_connector_endpoint(
                 if cached_after_reactivation is not None:
                     return ConnectorAccountResponse.model_validate(cached_after_reactivation)
                 raise HTTPException(status_code=409, detail="CONNECTOR_ALREADY_CONNECTED") from None
+
+            # Spec A S1.7: reactivating writes this caller's credential into
+            # an existing row, so it goes through the same two-step authz as
+            # `/sync` and `/disable` on that row (read -> else 404, write ->
+            # else 403). `authorize()` is read-only and safe inside this open
+            # transaction; the refusal itself is audited by
+            # `_reactivation_refusal_guard` only after this transaction has
+            # rolled back. Accepted limitation (decision C15-a): a
+            # `workspace`-visible row grants write to every member whose role
+            # has it, so any such member may reactivate it with their own
+            # credential -- that stays allowed, and is audited as
+            # `connector_account.reconnected` with the reactivating actor.
+            if not authz.authorize(
+                create_session,
+                auth,
+                resource_type="connector_accounts",
+                resource_id=existing["id"],
+                action="read",
+            ):
+                raise _ReactivationRefused(account_id=existing["id"], reason="not_found") from None
+            if not authz.authorize(
+                create_session,
+                auth,
+                resource_type="connector_accounts",
+                resource_id=existing["id"],
+                action="write",
+            ):
+                raise _ReactivationRefused(
+                    account_id=existing["id"], reason="access_denied"
+                ) from None
 
             create_session.execute(
                 text(
