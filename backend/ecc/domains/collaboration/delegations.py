@@ -411,7 +411,7 @@ def _expire_due(
             text(
                 "UPDATE delegations SET status = 'expired', updated_at = :now "
                 "WHERE workspace_id = :workspace_id AND status = 'proposed' AND due_at < :now "
-                f"{clause}RETURNING id, delegator_account_id, recipient_account_id"
+                f"{clause}RETURNING id, delegator_account_id, recipient_account_id"  # noqa: S608 -- clause is a code literal; values bound
             ),
             params,
         )
@@ -539,7 +539,7 @@ def _grant_evidence(
             continue
         session.execute(
             text(
-                f"UPDATE {item.resource_type} SET visibility = 'shared_explicitly' "  # noqa: S608
+                f"UPDATE {item.resource_type} SET visibility = 'shared_explicitly' "  # noqa: S608 -- resource_type re-checked against authz allowlist above
                 "WHERE id = :id AND visibility = 'private'"
             ),
             {"id": item.resource_id},

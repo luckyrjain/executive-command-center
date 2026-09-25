@@ -129,7 +129,7 @@ def _load_resource_for_update(
     row = (
         session.execute(
             text(
-                f"SELECT workspace_id, owner_id, visibility FROM {resource_type} "  # noqa: S608
+                f"SELECT workspace_id, owner_id, visibility FROM {resource_type} "  # noqa: S608 -- resource_type allowlisted by require_known_resource_type
                 "WHERE id = :id FOR UPDATE"
             ),
             {"id": resource_id},
@@ -335,7 +335,7 @@ def create_grant_endpoint(
         if resource.visibility != "shared_explicitly":
             session.execute(
                 text(
-                    f"UPDATE {payload.resource_type} SET visibility = 'shared_explicitly' "  # noqa: S608
+                    f"UPDATE {payload.resource_type} SET visibility = 'shared_explicitly' "  # noqa: S608 -- resource_type allowlisted by require_grantable
                     "WHERE id = :id"
                 ),
                 {"id": payload.resource_id},
@@ -798,7 +798,7 @@ def create_ownership_transfer_endpoint(
 
         session.execute(
             text(
-                f"UPDATE {payload.resource_type} SET owner_id = :owner_id "  # noqa: S608
+                f"UPDATE {payload.resource_type} SET owner_id = :owner_id "  # noqa: S608 -- resource_type allowlisted by require_grantable
                 "WHERE id = :id"
             ),
             {"owner_id": to_users_id, "id": payload.resource_id},

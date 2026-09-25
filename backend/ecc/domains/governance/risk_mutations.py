@@ -231,7 +231,7 @@ def update_risk(
                     SET {", ".join(assignments)}
                     WHERE workspace_id = :workspace_id AND id = :risk_id
                     RETURNING {_RISK_FIELDS}
-                    """
+                    """  # noqa: S608 -- SET keys from extra="forbid" Patch fields; values bound
                 ),
                 params,
             )
