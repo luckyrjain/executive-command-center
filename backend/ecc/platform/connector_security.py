@@ -69,7 +69,9 @@ EMAIL_TASK_TYPES: Final[frozenset[str]] = frozenset({"email.detect_action"})
 # action-detection paths write (`gmail_action_detection.py`, `gmail_adapter.py`,
 # `attention.py`); mirrored by `gmail_revocation.py`'s cascade predicates.
 _EMAIL_ATTENTION_ENTITY_TYPE: Final = "email_thread"
-_EMAIL_RECOMMENDATION_TYPE: Final = "email_action_detected"
+# Public: reserved for the Gmail action-detection hook -- `POST /api/v1/
+# recommendations` refuses it (plan note N19(2)).
+EMAIL_RECOMMENDATION_TYPE: Final = "email_action_detected"
 _GMAIL_EVIDENCE_SOURCE_TYPE: Final = "gmail_sync"
 
 # The single source of truth for the personal data set: resource_type ->
@@ -116,6 +118,12 @@ _PERSONAL_PREDICATES: Final[dict[str, str]] = {
 
 PERSONAL_RESOURCE_TYPES: Final[frozenset[str]] = frozenset(_PERSONAL_PREDICATES)
 
+# `owner_id` of a personal-data row by id (no row -> not personal data).
+_PERSONAL_OWNER_STATEMENTS: Final[dict[str, str]] = {
+    table: f"SELECT {table}.owner_id FROM {table} WHERE {table}.id = :id AND ({fragment})"  # noqa: S608
+    for table, fragment in PERSONAL_ROW_PREDICATES.items()
+}
+
 # A "Gmail-only person node" (Spec A S1.4(c)): a `pkos_nodes` row with
 # `node_type='person'` that has at least one `gmail_sync` evidence row and
 # no evidence of any other `source_type`. A boolean SQL fragment over an
@@ -140,7 +148,7 @@ def personal_sql_params() -> dict[str, object]:
         "providers": sorted(PERSONAL_PROVIDERS),
         "task_types": sorted(EMAIL_TASK_TYPES),
         "attention_entity_type": _EMAIL_ATTENTION_ENTITY_TYPE,
-        "recommendation_type": _EMAIL_RECOMMENDATION_TYPE,
+        "recommendation_type": EMAIL_RECOMMENDATION_TYPE,
         "evidence_source_type": _GMAIL_EVIDENCE_SOURCE_TYPE,
         "person_node_type": "person",
     }
@@ -204,6 +212,31 @@ def personal_content_scope(mailbox_owner_id: UUID) -> PersonalRowScope:
     if personal_data_isolation_enabled():
         return PersonalRowScope(owner_id=mailbox_owner_id, visibility="private")
     return PersonalRowScope(owner_id=None, visibility="workspace")
+
+
+def personal_derived_row_scope(
+    session: Session, resource_type: str, resource_id: UUID
+) -> PersonalRowScope | None:
+    """Owner/visibility for a row *derived from* `(resource_type,
+    resource_id)` -- e.g. the task/commitment/risk a confirmed
+    `email_action_detected` recommendation creates (plan note N23), which
+    copies email-derived content (title/summary) out of the source.
+
+    Flag on and the source is in the personal data set -> the source row's
+    own owner (the mailbox owner) + `private`. Otherwise None: the caller
+    writes exactly what it wrote before this flag existed.
+    """
+    if not personal_data_isolation_enabled():
+        return None
+    statement = _PERSONAL_OWNER_STATEMENTS.get(resource_type)
+    if statement is None:
+        return None
+    owner_id = session.execute(
+        text(statement), {"id": resource_id, **personal_sql_params()}
+    ).scalar_one_or_none()
+    if owner_id is None:
+        return None
+    return PersonalRowScope(owner_id=owner_id, visibility="private")
 
 
 def personal_knowledge_owner(mailbox_owner_id: UUID) -> UUID | None:
