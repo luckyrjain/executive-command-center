@@ -1,10 +1,11 @@
 """Shared connector-ownership / personal-data-isolation primitives (Spec A
 "Shared definitions": personal data set, revocation safety, refusal audit).
 
-This module is deliberately a *foundation only*: nothing in a production
-request path calls it yet. Later tasks adopt each helper at its call sites
-(grant/transfer/delegation refusal, Gmail callback identity binding, guarded
-revoke sites, membership-removal lock key). Keeping the definitions in one
+Call sites adopt each helper incrementally: the personal-data share refusal
+(S1.3, behind `ECC_PERSONAL_DATA_ISOLATION`) is used by grant create/preview,
+ownership transfer and delegation create/accept; Gmail callback identity
+binding, guarded revoke sites and the membership-removal lock key are
+adopted by later tasks. Keeping the definitions in one
 place is the point -- the personal-data predicates, the revoke-safety rule
 and the membership-mutation lock key must not drift between call sites.
 
@@ -17,21 +18,26 @@ exception class names, SQLSTATEs and constraint names are logged.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Final, Literal, Protocol
 from uuid import UUID, uuid4
 
-from fastapi import Request
+from fastapi import HTTPException, Request, status
 from psycopg import errors as pg_errors
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext
+from ecc.config import get_settings
 from ecc.database import SessionFactory
 from ecc.observability import (
     record_audit_outbox_failure,
     record_connector_revoke,
+    record_personal_data_share_refused,
 )
 from ecc.platform.audit_outbox import write_audit_and_outbox
 
@@ -336,6 +342,86 @@ def write_refusal_audit(
             "refusal_audit_write_failed",
             extra={"event_type": event_type, "error_class": type(exc).__name__},
         )
+
+
+# ---------------------------------------------------------------------------
+# Personal-data share refusal (S1.3)
+# ---------------------------------------------------------------------------
+
+ShareRefusalPath = Literal["grant", "grant_preview", "transfer", "delegation_create"]
+
+
+def personal_data_isolation_enabled() -> bool:
+    """`ECC_PERSONAL_DATA_ISOLATION` (default off). Off -> every S1.3 call
+    site behaves exactly as before this flag existed."""
+    return get_settings().personal_data_isolation
+
+
+def refuse_personal_data_share(
+    auth: AuthContext,
+    request: Request | None,
+    *,
+    resource_type: str,
+    resource_id: UUID | None,
+    path: ShareRefusalPath,
+) -> HTTPException:
+    """Record a refused share of a personal-data row -- a `denied`
+    `personal_data.share_refused` audit in its own transaction plus
+    `ecc_personal_data_share_refused_total{resource_type,path}` -- and
+    return the existing `400 RESOURCE_TYPE_NOT_GRANTABLE` for the caller to
+    raise. Call only AFTER the business transaction has ended (rolled back),
+    never while it still holds row locks.
+    """
+    write_refusal_audit(
+        auth,
+        request,
+        event_type="personal_data.share_refused",
+        aggregate_type=resource_type,
+        aggregate_id=resource_id,
+        reason="personal_data",
+        provider_or_type=resource_type,
+        payload_key="resource_type",
+    )
+    record_personal_data_share_refused(resource_type, path)
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST, detail="RESOURCE_TYPE_NOT_GRANTABLE"
+    )
+
+
+@dataclass
+class ShareRefusalTarget:
+    """The row a `personal_data_share_guard` block is about to check; the
+    block sets `resource_id` before each `require_not_personal_data` call
+    when it checks more than one row (delegation evidence)."""
+
+    resource_id: UUID | None = None
+
+
+@contextmanager
+def personal_data_share_guard(
+    auth: AuthContext,
+    request: Request | None,
+    *,
+    path: ShareRefusalPath,
+    resource_id: UUID | None = None,
+) -> Iterator[ShareRefusalTarget]:
+    """Wrap a business transaction: `with personal_data_share_guard(...),
+    session.begin():`. A `PersonalDataNotGrantable` raised inside first
+    unwinds `session.begin()` (rollback, row locks released), then is
+    translated here into the refusal audit + metric + `400`. Every other
+    exception passes through untouched.
+    """
+    target = ShareRefusalTarget(resource_id=resource_id)
+    try:
+        yield target
+    except PersonalDataNotGrantable as exc:
+        raise refuse_personal_data_share(
+            auth,
+            request,
+            resource_type=exc.resource_type,
+            resource_id=target.resource_id,
+            path=path,
+        ) from None
 
 
 # ---------------------------------------------------------------------------
