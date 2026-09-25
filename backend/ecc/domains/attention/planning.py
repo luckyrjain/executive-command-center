@@ -586,7 +586,7 @@ def _fetch_candidates(
               AND (ai.deferred_until IS NULL OR ai.deferred_until <= :now)
               AND ({visibility_sql})
             ORDER BY ai.score DESC, ai.entity_id ASC
-            """
+            """  # noqa: S608 -- authz visibility fragment; values bound
         ),
         {"workspace_id": auth.workspace_id, "now": now, "tz": auth.timezone, **visibility_params},
     ).all()

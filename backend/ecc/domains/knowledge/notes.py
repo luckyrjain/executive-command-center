@@ -407,7 +407,7 @@ def update_note(
                     SET {", ".join(assignments)}
                     WHERE workspace_id = :workspace_id AND id = :note_id
                     RETURNING {_SELECT_FIELDS}
-                    """
+                    """  # noqa: S608 -- SET keys from extra="forbid" Patch fields; values bound
                 ),
                 values,
             )
