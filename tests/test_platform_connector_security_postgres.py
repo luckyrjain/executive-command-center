@@ -104,6 +104,7 @@ def _cleanup_workspace(workspace_id: UUID) -> None:
             "pkos_evidence",
             "pkos_nodes",
             "attention_items",
+            "ai_run_steps",
             "ai_runs",
             "sync_runs",
             "sync_cursors",
@@ -435,6 +436,25 @@ def _insert_ai_run(
     return run_id
 
 
+def _insert_ai_run_step(
+    connection: Any, *, workspace_id: UUID, user_id: UUID, run_id: UUID, now: datetime
+) -> UUID:
+    step_id = uuid4()
+    connection.execute(
+        text(
+            """
+            INSERT INTO ai_run_steps (
+                id, workspace_id, run_id, sequence, kind, status, trace, created_at, owner_id
+            ) VALUES (
+                :id, :ws, :run_id, 1, 'tool_call', 'succeeded', '{}'::jsonb, :now, :user_id
+            )
+            """
+        ),
+        {"id": step_id, "ws": workspace_id, "run_id": run_id, "user_id": user_id, "now": now},
+    )
+    return step_id
+
+
 def _insert_evidence(
     connection: Any, *, workspace_id: UUID, user_id: UUID, source_type: str, now: datetime
 ) -> UUID:
@@ -504,6 +524,12 @@ def personal_and_other_rows(two_workspaces: dict[str, Any]) -> dict[str, dict[st
         github_run, github_cursor = _insert_sync_rows(
             connection, workspace_id=ws, account_id=github, now=now
         )
+        personal_run = _insert_ai_run(
+            connection, workspace_id=ws, user_id=user, task_type="email.detect_action", now=now
+        )
+        other_run = _insert_ai_run(
+            connection, workspace_id=ws, user_id=user, task_type="attention.explain_item", now=now
+        )
         rows = {
             "personal": {
                 "connector_accounts": gmail,
@@ -519,12 +545,9 @@ def personal_and_other_rows(two_workspaces: dict[str, Any]) -> dict[str, dict[st
                     recommendation_type="email_action_detected",
                     now=now,
                 ),
-                "ai_runs": _insert_ai_run(
-                    connection,
-                    workspace_id=ws,
-                    user_id=user,
-                    task_type="email.detect_action",
-                    now=now,
+                "ai_runs": personal_run,
+                "ai_run_steps": _insert_ai_run_step(
+                    connection, workspace_id=ws, user_id=user, run_id=personal_run, now=now
                 ),
                 "pkos_evidence": _insert_evidence(
                     connection, workspace_id=ws, user_id=user, source_type="gmail_sync", now=now
@@ -544,12 +567,9 @@ def personal_and_other_rows(two_workspaces: dict[str, Any]) -> dict[str, dict[st
                     recommendation_type="task_suggestion",
                     now=now,
                 ),
-                "ai_runs": _insert_ai_run(
-                    connection,
-                    workspace_id=ws,
-                    user_id=user,
-                    task_type="attention.explain_item",
-                    now=now,
+                "ai_runs": other_run,
+                "ai_run_steps": _insert_ai_run_step(
+                    connection, workspace_id=ws, user_id=user, run_id=other_run, now=now
                 ),
                 "pkos_evidence": _insert_evidence(
                     connection, workspace_id=ws, user_id=user, source_type="manual_note", now=now
@@ -569,6 +589,8 @@ def test_personal_resource_types_cover_the_spec_set() -> None:
             "attention_items",
             "recommendations",
             "ai_runs",
+            # Plan note N11 (T14b): the steps of an email run follow it.
+            "ai_run_steps",
             "pkos_evidence",
         }
     )
@@ -589,6 +611,17 @@ def test_is_personal_resource_per_type(
         assert excinfo.value.resource_type == resource_type
         assert str(personal_id) not in str(excinfo.value)
         require_not_personal_data(session, resource_type, other_id)
+
+
+def test_ai_run_steps_predicate_probes_parent_by_primary_key() -> None:
+    """Review B-F1: the step predicate must be an EXISTS keyed on
+    `ai_runs.id = ai_run_steps.run_id` (a pkey probe / hashed semi-join),
+    never a correlated `run_id IN (SELECT ... WHERE workspace_id = ...)`
+    re-scanning the workspace's runs per step (22.6s at 40k steps, past
+    the 5s statement timeout under the membership lock)."""
+    fragment = PERSONAL_ROW_PREDICATES["ai_run_steps"]
+    assert fragment.startswith("EXISTS (SELECT 1 FROM ai_runs r WHERE r.id = ai_run_steps.run_id ")
+    assert " IN (" not in fragment
 
 
 def test_removal_exclusions_are_exactly_the_personal_data_set() -> None:

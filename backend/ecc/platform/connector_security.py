@@ -91,6 +91,20 @@ PERSONAL_ROW_PREDICATES: Final[Mapping[str, str]] = MappingProxyType(
         "attention_items": "attention_items.entity_type = :attention_entity_type",
         "recommendations": "recommendations.recommendation_type = :recommendation_type",
         "ai_runs": "ai_runs.task_type = ANY(:task_types)",
+        # The steps of an email `ai_runs` row (plan note N11). Their
+        # `trace` is redacted (tool name / outcome / schema-error path),
+        # but a step only exists as part of a mailbox owner's email run
+        # and is written with that run's owner/visibility, so it follows
+        # the parent: private, never shareable, not blocking removal.
+        # EXISTS keyed on the parent's primary key (one index probe per
+        # step), not a correlated `run_id IN (SELECT ...)` re-scanning the
+        # workspace's runs per step row -- `owned_resource_summary` counts
+        # every step a member owns under the membership lock.
+        "ai_run_steps": (
+            "EXISTS (SELECT 1 FROM ai_runs r WHERE r.id = ai_run_steps.run_id "
+            "AND r.workspace_id = ai_run_steps.workspace_id "
+            "AND r.task_type = ANY(:task_types))"
+        ),
         "pkos_evidence": "pkos_evidence.source_type = :evidence_source_type",
     }
 )
@@ -162,6 +176,40 @@ def require_not_personal_data(session: Session, resource_type: str, resource_id:
     """Raise `PersonalDataNotGrantable` when the row is personal data."""
     if is_personal_resource(session, resource_type, resource_id):
         raise PersonalDataNotGrantable(resource_type)
+
+
+@dataclass(frozen=True)
+class PersonalRowScope:
+    """`owner_id`/`visibility` for a Gmail-derived row at write time (Spec A
+    S1.8(a), `ECC_PERSONAL_DATA_ISOLATION`).
+
+    Content rows are written `private` and owned by the mailbox owner;
+    workspace knowledge (person nodes, their `entity_aliases`) stays
+    `workspace` (DS3 (a')) but is owned by the mailbox owner, not by the
+    default-owner trigger's "workspace's earliest user" (plan note N11).
+    Flag off -> `(None, "workspace")`: the insert leaves `owner_id` to the
+    table's default-owner trigger (fires on NULL) and writes the column's
+    default visibility -- exactly the previous rows. `mailbox_owner_id`
+    must always come from the connector account's own `owner_id` (or an
+    `AuthContext` built from it), never from request input.
+    """
+
+    owner_id: UUID | None
+    visibility: Literal["private", "workspace"]
+
+
+def personal_content_scope(mailbox_owner_id: UUID) -> PersonalRowScope:
+    """Owner/visibility for a Gmail-derived content row (evidence, email
+    `ai_runs` and their steps, email recommendations)."""
+    if personal_data_isolation_enabled():
+        return PersonalRowScope(owner_id=mailbox_owner_id, visibility="private")
+    return PersonalRowScope(owner_id=None, visibility="workspace")
+
+
+def personal_knowledge_owner(mailbox_owner_id: UUID) -> UUID | None:
+    """`owner_id` for Gmail-derived workspace knowledge (`entity_aliases`):
+    the mailbox owner with the flag on, else None (trigger default)."""
+    return mailbox_owner_id if personal_data_isolation_enabled() else None
 
 
 # ---------------------------------------------------------------------------

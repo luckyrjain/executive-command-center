@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from json import dumps
 from types import SimpleNamespace
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Literal, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -82,6 +82,8 @@ def create_recommendation(
     payload: RecommendationCreate,
     request: Request,
     idempotency_key: str,
+    *,
+    visibility: Literal["workspace", "private"] = "workspace",
 ) -> RecommendationResponse:
     """`generate_recommendation`'s full body, factored out so a non-HTTP
     caller can create a recommendation the exact same way `POST /api/v1/
@@ -98,6 +100,15 @@ def create_recommendation(
     can synthesize its own stable, replay-safe key (e.g. `f"email-detect-
     action:{message_id}"`) instead of requiring a browser-originated
     `Idempotency-Key` header that does not exist for it.
+
+    `visibility` (Spec A S1.8(a)): `"workspace"` for every caller except
+    the Gmail action-detection hook, which passes `"private"` when
+    `ECC_PERSONAL_DATA_ISOLATION` is on. The row's `owner_id` is always
+    `auth.user_id` -- exactly what the `created_by` default-owner trigger
+    already assigned -- never a separately supplied user, so a caller
+    cannot make a private row owned by someone other than the actor it
+    authenticated as (the detection hook builds `auth` from the connector
+    account's own owner, i.e. the mailbox owner).
     """
     authz.require_role_action(session, auth, "write")
     validate_action(payload.target_type, payload.proposed_action)
@@ -180,13 +191,14 @@ def create_recommendation(
                 id, workspace_id, recommendation_type, target_type, target_id,
                 proposed_action, proposed_fields, expected_version, rationale,
                 confidence, status, evidence_ids, expires_at, source, pinned,
-                created_by, updated_by, created_at, updated_at, version
+                created_by, updated_by, created_at, updated_at, version,
+                owner_id, visibility
             ) VALUES (
                 :id, :workspace_id, :recommendation_type, :target_type, :target_id,
                 CAST(:proposed_action AS jsonb), CAST(:proposed_fields AS jsonb),
                 :expected_version, :rationale, :confidence, 'proposed',
                 :evidence_ids, :expires_at, :source, false, :actor_id, :actor_id,
-                :created_at, :created_at, 1
+                :created_at, :created_at, 1, :actor_id, :visibility
             ) RETURNING {FIELDS}
             """
             ),
@@ -208,6 +220,7 @@ def create_recommendation(
                 "source": payload.source,
                 "actor_id": auth.user_id,
                 "created_at": now,
+                "visibility": visibility,
             },
         )
         .mappings()

@@ -160,6 +160,17 @@ def world_off() -> Iterator[RemovalWorld]:
 # --- small readers ---------------------------------------------------------------
 
 
+def _blocking_nodes(count: int) -> list[dict[str, object]]:
+    """`owned_resources` when `count` person nodes the member still owns
+    block removal: with the flag on, each node's Gmail-derived
+    `entity_aliases` row is owned by the mailbox owner too (T14b, plan note
+    N11) and blocks alongside its node."""
+    return [
+        {"resource_type": "entity_aliases", "count": count},
+        {"resource_type": "pkos_nodes", "count": count},
+    ]
+
+
 def _scalar(sql: str, **params: Any) -> Any:
     with engine.begin() as connection:
         return connection.execute(text(sql), params).scalar_one()
@@ -540,7 +551,7 @@ def test_mixed_source_node_blocks_removal_until_transferred(world_on: RemovalWor
     assert blocked.status_code == 409, blocked.text
     error = blocked.json()["error"]
     assert error["code"] == "OWNED_RESOURCES_BLOCK_REMOVAL"
-    assert error["details"]["owned_resources"] == [{"resource_type": "pkos_nodes", "count": 1}]
+    assert error["details"]["owned_resources"] == _blocking_nodes(1)
     # Refused atomically: nothing disconnected, re-owned or revoked.
     assert _connector(b.connector_account_id).status == "active"
     assert _membership_status(world.ws, b.user_id) == "active"
@@ -593,7 +604,7 @@ def test_gmail_only_nodes_keep_blocking_when_no_other_active_owner(
     assert response.status_code == 409, response.text
     error = response.json()["error"]
     assert error["code"] == "OWNED_RESOURCES_BLOCK_REMOVAL"
-    assert error["details"]["owned_resources"] == [{"resource_type": "pkos_nodes", "count": 2}]
+    assert error["details"]["owned_resources"] == _blocking_nodes(2)
     assert _connector(b.connector_account_id).status == "active"
     assert _membership_status(world.ws, b.user_id) == "active"
     assert world.fake_google.revoked_tokens == []
@@ -630,7 +641,7 @@ def test_node_turning_gmail_only_after_reown_selection_still_blocks(
     assert response.status_code == 409, response.text
     error = response.json()["error"]
     assert error["code"] == "OWNED_RESOURCES_BLOCK_REMOVAL"
-    assert error["details"]["owned_resources"] == [{"resource_type": "pkos_nodes", "count": 1}]
+    assert error["details"]["owned_resources"] == _blocking_nodes(1)
     # Everything done before the check (disconnect, re-own, audits) rolled back.
     assert _node_versions([racing, gmail_only]) == nodes_before
     assert _connector(b.connector_account_id).status == "active"
@@ -742,7 +753,7 @@ def test_concurrent_non_gmail_evidence_insert_during_reown_blocks_removal(
     assert response.status_code == 409, response.text
     error = response.json()["error"]
     assert error["code"] == "OWNED_RESOURCES_BLOCK_REMOVAL"
-    assert error["details"]["owned_resources"] == [{"resource_type": "pkos_nodes", "count": 1}]
+    assert error["details"]["owned_resources"] == _blocking_nodes(1)
     assert _node_versions([racing, other]) == nodes_before
     assert _audits(world.ws, "pkos_node.ownership_reassigned") == []
     assert _audits(world.ws, "connector_account.disabled") == []
