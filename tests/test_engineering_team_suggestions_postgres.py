@@ -538,6 +538,83 @@ def test_dismiss_team_suggestion_is_idempotent_on_replay(suggestions_context) ->
     assert first_body["skipped_unauthorized"] == second_body["skipped_unauthorized"]
 
 
+# --- SQL injection hardening (Snyk python/Sqli triage) ---------------------
+
+_INJECTION_SHAPED_NAME = "Platform' OR '1'='1"
+
+
+def test_confirm_team_suggestion_binds_injection_shaped_name_as_data(
+    suggestions_context,
+) -> None:
+    """`suggested_team_name` is request-controlled and must stay a bound
+    parameter: a quote-breaking value matches only the row carrying that
+    exact literal, never the "Platform" row an injected `OR` would hit.
+    """
+    client, workspace_id, user_id, token = suggestions_context
+    account_id = _insert_connector_account(workspace_id, user_id)
+    team_id = _insert_pkos_team(workspace_id, name="Platform")
+    platform_repo = _insert_repository(
+        workspace_id, account_id, user_id, name="acme/a", suggested_team_name="Platform"
+    )
+    literal_repo = _insert_repository(
+        workspace_id, account_id, user_id, name="acme/b", suggested_team_name=_INJECTION_SHAPED_NAME
+    )
+
+    response = client.post(
+        "/api/v1/engineering/team-suggestions/confirm",
+        json={"suggested_team_name": _INJECTION_SHAPED_NAME, "team_entity_id": str(team_id)},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 200
+    assert response.json()["updated"] == [str(literal_repo)]
+    assert response.json()["skipped_unauthorized"] == []
+
+    with engine.begin() as connection:
+        teams = dict(
+            connection.execute(
+                text(
+                    "SELECT id, team_entity_id FROM repositories WHERE workspace_id = :workspace_id"
+                ),
+                {"workspace_id": workspace_id},
+            ).all()
+        )
+    assert teams == {platform_repo: None, literal_repo: team_id}
+
+
+def test_dismiss_team_suggestion_binds_injection_shaped_name_as_data(
+    suggestions_context,
+) -> None:
+    client, workspace_id, user_id, token = suggestions_context
+    account_id = _insert_connector_account(workspace_id, user_id)
+    platform_repo = _insert_repository(
+        workspace_id, account_id, user_id, name="acme/a", suggested_team_name="Platform"
+    )
+    literal_repo = _insert_repository(
+        workspace_id, account_id, user_id, name="acme/b", suggested_team_name=_INJECTION_SHAPED_NAME
+    )
+
+    response = client.post(
+        "/api/v1/engineering/team-suggestions/dismiss",
+        json={"suggested_team_name": _INJECTION_SHAPED_NAME},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 200
+    assert response.json()["updated"] == [str(literal_repo)]
+    assert response.json()["skipped_unauthorized"] == []
+
+    with engine.begin() as connection:
+        dismissed = dict(
+            connection.execute(
+                text(
+                    "SELECT id, team_suggestion_dismissed_at IS NOT NULL FROM repositories "
+                    "WHERE workspace_id = :workspace_id"
+                ),
+                {"workspace_id": workspace_id},
+            ).all()
+        )
+    assert dismissed == {platform_repo: False, literal_repo: True}
+
+
 # --- I1 fix: bulk endpoints' main security surface -------------------------
 
 
