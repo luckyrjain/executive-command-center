@@ -35,7 +35,12 @@ from ecc.auth import AuthContext
 from ecc.config import get_settings
 from ecc.database import SessionFactory
 from ecc.domains.engineering.connectors import ConnectorAccountContext
-from ecc.platform.connector_security import personal_content_scope
+from ecc.platform.connector_security import (
+    MembershipInactiveError,
+    member_is_active,
+    personal_content_scope,
+    require_active_members_locked,
+)
 
 # `OllamaAdapter` is a type-annotation-only reference (`from __future__
 # import annotations` makes every annotation a string at runtime) and
@@ -298,6 +303,11 @@ def detect_actions_since(
         with SessionFactory() as session, session.begin():
             if not email_consent_active(session, context.workspace_id, owner_id):
                 return
+            # Spec A S1.11: likewise stop before the next Gmail fetch once
+            # the mailbox owner has been removed (the race-free re-check
+            # is on each write below; this one just avoids the fetch).
+            if not member_is_active(session, workspace_id=context.workspace_id, users_id=owner_id):
+                return
         try:
             _detect_action_for_message(
                 adapter,
@@ -310,6 +320,10 @@ def detect_actions_since(
                 headers=headers,
                 ollama_adapter=ollama_adapter,
             )
+        except MembershipInactiveError:
+            # The mailbox owner was removed mid-batch (Spec A S1.11): stop
+            # the whole batch, not just this message.
+            return
         except Exception:  # noqa: BLE001 -- one message's failure never stops the batch
             continue
 
@@ -345,6 +359,10 @@ def _detect_action_for_message(
         now=now,
     )
     with SessionFactory() as session, session.begin():
+        # Spec A S1.11: shared membership lock + the owner's active
+        # membership before the evidence write (raises
+        # `MembershipInactiveError`, ending the batch).
+        require_active_members_locked(session, workspace_id=workspace_id, users_ids=[owner_id])
         evidence_id = _register_message_evidence(
             session,
             workspace_id=workspace_id,
@@ -363,6 +381,14 @@ def _detect_action_for_message(
     # identical three-phase shape is the precedent this mirrors).
     from ecc.domains.ai_runtime.runtime import execute_run
 
+    # Spec A S1.11: cheap unlocked pre-check -- skip the model call for an
+    # owner removed since the evidence write. The race-free re-checks are
+    # the locked ones in the run persist and the recommendation insert
+    # (`require_active_actor=True` below).
+    with SessionFactory() as session, session.begin():
+        if not member_is_active(session, workspace_id=workspace_id, users_id=owner_id):
+            raise MembershipInactiveError
+
     with SessionFactory() as session:
         run = execute_run(
             "email.detect_action",
@@ -376,6 +402,7 @@ def _detect_action_for_message(
             session=session,
             auth=auth,
             ollama_adapter=ollama_adapter,
+            require_active_actor=True,
         )
         if run.status != "completed" or run.output is None:
             return
@@ -420,4 +447,5 @@ def _detect_action_for_message(
             synthetic_request(uuid4(), uuid4()),
             f"email-detect-action:{external_message_id}",
             visibility=personal_content_scope(owner_id).visibility,
+            require_active_actor=True,
         )

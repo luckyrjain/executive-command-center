@@ -61,6 +61,7 @@ from ecc.platform.connector_security import (
     EMAIL_TASK_TYPES,
     PersonalRowScope,
     personal_content_scope,
+    require_active_members_locked,
 )
 from ecc.platform.idempotency import (
     held_idempotency_lock,
@@ -866,6 +867,7 @@ def _persist_terminal(
     attempts: int,
     steps: list[dict[str, Any]],
     input_ref: dict[str, Any],
+    require_active_actor: bool = False,
 ) -> AiRun:
     completed_at = datetime.now(UTC)
     # Spec A S1.8(a) (`ECC_PERSONAL_DATA_ISOLATION`): an `EMAIL_TASK_TYPES`
@@ -892,6 +894,16 @@ def _persist_terminal(
     # commit()` below commits whichever transaction is actually active
     # either way, instead of requiring "no transaction is open yet" like
     # `Session.begin()` does.
+    if require_active_actor:
+        # Spec A S1.11 (opt-in; only the Gmail action-detection hook sets
+        # it): the actor is the mailbox owner, who owns this run and its
+        # steps. Shared membership lock before any row write in this
+        # transaction (earlier statements in it are reads only), then the
+        # actor's active membership; inactive -> `MembershipInactiveError`,
+        # nothing persisted (the caller's session rolls back).
+        require_active_members_locked(
+            session, workspace_id=auth.workspace_id, users_ids=[auth.user_id]
+        )
     session.execute(
         text(
             """
@@ -1704,7 +1716,12 @@ def execute_run(
     auth: AuthContext,
     ollama_adapter: OllamaAdapter | None = None,
     cancellation_token: CancellationToken | None = None,
+    require_active_actor: bool = False,
 ) -> AiRun:
+    """`require_active_actor` (Spec A S1.11, default off): the terminal
+    persist re-checks the actor's active membership under the shared
+    membership lock and raises `MembershipInactiveError` instead of
+    writing -- see `_persist_terminal`."""
     started_at = datetime.now(UTC)
     run_id = uuid4()
 
@@ -1742,6 +1759,7 @@ def execute_run(
             attempts=attempts,
             steps=steps or [],
             input_ref=input,
+            require_active_actor=require_active_actor,
         )
 
     port = TASK_PORTS.get(task_type)
@@ -2142,6 +2160,7 @@ def execute_run(
         attempts=repair_result.attempts,
         steps=steps,
         input_ref=input,
+        require_active_actor=require_active_actor,
     )
 
 

@@ -166,10 +166,13 @@ from ecc.observability import (
 from ecc.platform import audit_outbox, authz
 from ecc.platform.connector_security import (
     PERSONAL_PROVIDERS,
+    MembershipInactiveError,
     integrity_error_log_fields,
     is_unique_violation,
+    member_is_active,
     personal_content_scope,
     personal_data_isolation_enabled,
+    require_active_members_locked,
     revoke_if_safe,
     write_refusal_audit,
 )
@@ -1282,10 +1285,12 @@ def create_connector_endpoint(
 
 
 class SyncSkipped(Exception):
-    """Reifies one of `_run_connector_sync`'s phase-1 short-circuits (each
-    an `HTTPException` when reached through `sync_connector_endpoint`) so
-    a non-HTTP caller -- `_run_auto_backfill` below -- can catch it
-    without FastAPI/Starlette in scope. `code`/`status_code` are exactly
+    """Reifies one of `_run_connector_sync`'s skips -- its phase-1
+    short-circuits, and the phase-3 `MEMBERSHIP_INACTIVE` skip raised by
+    `_skip_run_if_membership_inactive` after it closes the reserved run
+    (Spec A S1.11) -- each an `HTTPException` when reached through
+    `sync_connector_endpoint`, so a non-HTTP caller -- `_run_auto_backfill`
+    below -- can catch it without FastAPI/Starlette in scope. `code`/`status_code` are exactly
     the `detail`/`status_code` `sync_connector_endpoint`'s own `except
     SyncSkipped` re-raises as an `HTTPException` with, so the two stay in
     lockstep by construction rather than by two independently-maintained
@@ -1398,6 +1403,66 @@ def _save_sync_cursor(
     )
 
 
+_MEMBERSHIP_INACTIVE_RUN_SUMMARY = "sync stopped: workspace membership is no longer active"
+
+
+def _sync_members(account: ConnectorAccount | None, actor_id: UUID) -> list[UUID]:
+    """Whose active membership a sync of `account` depends on (Spec A
+    S1.11): always the acting user; for a personal-provider connector also
+    its owner (the mailbox owner, who owns every row a personal sync
+    writes -- normally the actor too, since only the owner may sync it)."""
+    members = [actor_id]
+    if (
+        account is not None
+        and account.provider in PERSONAL_PROVIDERS
+        and account.owner_id is not None
+    ):
+        members.append(account.owner_id)
+    return members
+
+
+def _membership_inactive_skip(account_id: UUID, phase: int) -> SyncSkipped:
+    """`SyncSkipped("MEMBERSHIP_INACTIVE", 403)` plus one info line in the
+    same shape as `_run_auto_backfill`'s skip log (ids only, no emails)."""
+    _logger.info(
+        "connector sync skipped account_id=%s phase=%s code=MEMBERSHIP_INACTIVE",
+        account_id,
+        phase,
+    )
+    return SyncSkipped("MEMBERSHIP_INACTIVE", 403)
+
+
+@contextmanager
+def _skip_run_if_membership_inactive(
+    workspace_id: UUID, account_id: UUID, run_id: UUID
+) -> Iterator[None]:
+    """Wraps sync phase 3's outcome transaction (outermost, so that
+    transaction has already rolled back when this sees the error). A member
+    removed while phase 2 ran -> no outcome, cursor, account or audit write
+    lands for them; only the run this sync reserved in phase 1 is closed as
+    `failed` (so it does not sit `running` until reaped, blocking the next
+    sync), then `SyncSkipped("MEMBERSHIP_INACTIVE", 403)`.
+    """
+    try:
+        yield
+    except MembershipInactiveError:
+        with SessionFactory() as run_session, run_session.begin():
+            run_session.execute(
+                text(
+                    "UPDATE sync_runs SET status = 'failed', error_summary = :error, "
+                    "completed_at = :now WHERE workspace_id = :workspace_id AND id = :id "
+                    "AND status = 'running'"
+                ),
+                {
+                    "error": _MEMBERSHIP_INACTIVE_RUN_SUMMARY,
+                    "now": datetime.now(UTC),
+                    "workspace_id": workspace_id,
+                    "id": run_id,
+                },
+            )
+        raise _membership_inactive_skip(account_id, 3) from None
+
+
 def _run_connector_sync(
     session: Session,
     auth: AuthContext,
@@ -1462,6 +1527,28 @@ def _run_connector_sync(
     """
     # --- Phase 1: validate, reserve the run, read the cursor -------------
     with session.begin():
+        # Spec A S1.11: shared membership lock FIRST (lock order: membership
+        # -> idempotency -> the account row lock below), then the actor's
+        # active membership, re-checked in this transaction -- a removal
+        # that already committed skips the sync with nothing written; one
+        # that has not started waits for this phase to commit.
+        #
+        # Accepted limitation (documented, not restructured): for OAuth2
+        # providers this phase holds the WORKSPACE-WIDE shared membership
+        # lock across `ensure_fresh_credential` -- a token-endpoint POST
+        # (only when the access token has expired) of up to 10s. A
+        # concurrent member removal / role change waits on it and can fail
+        # with a 500 once its lock wait exceeds `STATEMENT_TIMEOUT_MS`
+        # (5s; retryable), and every other shared-lock writer in the
+        # workspace (callback, syncs, Gmail writes, transfers) queues
+        # behind that waiting removal meanwhile. Moving the refresh out of
+        # the locked section is Spec B's phase restructuring.
+        try:
+            require_active_members_locked(
+                session, workspace_id=auth.workspace_id, users_ids=[auth.user_id]
+            )
+        except MembershipInactiveError:
+            raise _membership_inactive_skip(account_id, 1) from None
         if idempotency is not None:
             lock_idempotency(session, auth, idempotency.key)
             cached = load_cached(
@@ -1486,6 +1573,13 @@ def _run_connector_sync(
             raise SyncSkipped("CONNECTOR_NOT_FOUND", 404)
         if account.status == "disconnected":
             raise SyncSkipped("CONNECTOR_DISCONNECTED", 409)
+        # The personal connector's owner too (still under the shared lock
+        # taken above): every row this sync writes is theirs.
+        if not all(
+            member_is_active(session, workspace_id=auth.workspace_id, users_id=member)
+            for member in _sync_members(account, auth.user_id)
+        ):
+            raise _membership_inactive_skip(account_id, 1)
 
         adapter = connector_registry.get(account.provider)
         if adapter is None:
@@ -1667,7 +1761,20 @@ def _run_connector_sync(
 
     # --- Phase 3: record the outcome, on a fresh connection ---------------
     completed_at = datetime.now(UTC)
-    with SessionFactory() as outcome_session, outcome_session.begin():
+    with (
+        _skip_run_if_membership_inactive(auth.workspace_id, account_id, run_id),
+        SessionFactory() as outcome_session,
+        outcome_session.begin(),
+    ):
+        # Spec A S1.11 / plan N15(1): the member(s) this sync writes for
+        # may have been removed while phase 2 ran; re-checked under the
+        # shared membership lock before any outcome write (see
+        # `_skip_run_if_membership_inactive`).
+        require_active_members_locked(
+            outcome_session,
+            workspace_id=auth.workspace_id,
+            users_ids=_sync_members(account, auth.user_id),
+        )
         if adapter_failed:
             # `AND status = 'running'`: see the success-path UPDATE's
             # identical comment below -- must not silently overwrite a
