@@ -274,14 +274,19 @@ def create_relationship(
             raise HTTPException(status_code=422, detail="INVALID_RELATIONSHIP")
         # See claims.py's identical check: evidence that exists but is no
         # longer `available` (deleted, missing, permission_denied) cannot
-        # back a new relationship either.
-        evidence_state = session.execute(
-            text(
-                "SELECT evidence_state FROM pkos_evidence"
-                " WHERE workspace_id = :workspace_id AND id = :evidence_id"
-            ),
-            {"workspace_id": auth.workspace_id, "evidence_id": payload.evidence_id},
-        ).scalar_one_or_none()
+        # back a new relationship either. Evidence the caller may not read
+        # (Spec A S1.14, flag-gated) is reported as not found.
+        evidence_state = (
+            session.execute(
+                text(
+                    "SELECT evidence_state FROM pkos_evidence"
+                    " WHERE workspace_id = :workspace_id AND id = :evidence_id"
+                ),
+                {"workspace_id": auth.workspace_id, "evidence_id": payload.evidence_id},
+            ).scalar_one_or_none()
+            if authz.cited_evidence_readable(session, auth, payload.evidence_id)
+            else None
+        )
         if evidence_state is None:
             raise HTTPException(status_code=404, detail="EVIDENCE_NOT_FOUND")
         if evidence_state != "available":

@@ -85,18 +85,29 @@ def get_entity_tool(
         .mappings()
         .all()
     )
+    # Spec A S1.14: only evidence the caller may read (flag-gated; off ->
+    # the fragment is `TRUE`).
+    evidence_visibility_sql, evidence_visibility_params = authz.evidence_visibility_filter_sql(
+        session, auth, table_alias="pkos_evidence"
+    )
     evidence_rows = (
         session.execute(
             text(
-                """
+                f"""
                 SELECT id, source_type, captured_at, evidence_state
                 FROM pkos_evidence
                 WHERE workspace_id = :workspace_id AND node_id = :entity_id
+                  AND ({evidence_visibility_sql})
                 ORDER BY captured_at DESC
                 LIMIT :limit
                 """
             ),
-            {"workspace_id": auth.workspace_id, "entity_id": entity_id, "limit": _MAX_EVIDENCE},
+            {
+                "workspace_id": auth.workspace_id,
+                "entity_id": entity_id,
+                "limit": _MAX_EVIDENCE,
+                **evidence_visibility_params,
+            },
         )
         .mappings()
         .all()

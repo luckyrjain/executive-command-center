@@ -208,6 +208,10 @@ def _validate_references(
         if found is None:
             raise HTTPException(status_code=404, detail="COUNTERPARTY_NOT_FOUND")
     if evidence_id is not None:
+        # Spec A S1.14 (flag-gated): evidence the caller may not read is
+        # reported exactly like an unknown id.
+        if not authz.cited_evidence_readable(session, auth, evidence_id):
+            raise HTTPException(status_code=404, detail="EVIDENCE_NOT_FOUND")
         found = session.execute(
             text(
                 """

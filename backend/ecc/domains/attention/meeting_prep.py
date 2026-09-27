@@ -771,13 +771,19 @@ def _fetch_dependencies(
 def _fetch_evidence(session: Session, auth: AuthContext, node_ids: list[UUID]) -> list[EvidenceRow]:
     if not node_ids:
         return []
+    # Spec A S1.14: only evidence the caller may read (flag-gated; off ->
+    # the fragment is `TRUE`).
+    visibility_sql, visibility_params = authz.evidence_visibility_filter_sql(
+        session, auth, table_alias="pkos_evidence"
+    )
     rows = (
         session.execute(
             text(
-                """
+                f"""
                 SELECT id, source_type, evidence_state
                 FROM pkos_evidence
                 WHERE workspace_id = :workspace_id AND node_id = ANY(:node_ids)
+                  AND ({visibility_sql})
                 ORDER BY id
                 LIMIT :limit
                 """
@@ -786,6 +792,7 @@ def _fetch_evidence(session: Session, auth: AuthContext, node_ids: list[UUID]) -
                 "workspace_id": auth.workspace_id,
                 "node_ids": node_ids,
                 "limit": _MAX_EVIDENCE,
+                **visibility_params,
             },
         )
         .mappings()

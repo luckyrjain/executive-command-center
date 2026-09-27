@@ -21,6 +21,7 @@ from ecc.domains.knowledge.embeddings import (
     vector_literal,
 )
 from ecc.platform import authz, cursor_pagination
+from ecc.platform.connector_security import personal_data_isolation_enabled
 
 router = APIRouter(prefix="/api/v1/knowledge", tags=["knowledge-retrieval"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -63,6 +64,24 @@ _SEMANTIC_CANDIDATE_LIMIT = 100
 # pure-semantic match as hybrid.
 _TRIGRAM_RELEVANCE_THRESHOLD = 0.15
 
+# Spec A S1.14, behind `ECC_PERSONAL_DATA_ISOLATION`: a retrieval document's
+# body is one projection shared by every member who can read the entity, so
+# it cannot be filtered per caller at search time. With the flag on it only
+# carries claims backed by evidence at least as widely visible as the
+# document: `workspace` evidence, or evidence owned by the owner of a
+# `private` entity (whose document only that owner can read). A claim backed
+# by a member's private (e.g. Gmail) evidence on a workspace entity is left
+# out of the shared body -- for every caller, its owner included.
+_SHARED_BODY_EVIDENCE_SQL = """
+              AND (
+                  ev.visibility = 'workspace'
+                  OR EXISTS (
+                      SELECT 1 FROM pkos_nodes n
+                      WHERE n.workspace_id = c.workspace_id AND n.id = c.subject_id
+                        AND n.visibility = 'private' AND n.owner_id = ev.owner_id
+                  )
+              )"""
+
 
 def _build_body(session: Session, workspace_id: UUID, entity_id: UUID, summary: str | None) -> str:
     """Derives a retrieval document's searchable body fresh from current
@@ -70,15 +89,16 @@ def _build_body(session: Session, workspace_id: UUID, entity_id: UUID, summary: 
     incrementally appending -- so a superseded claim drops out of search
     content automatically, with no separate bookkeeping to keep in sync."""
     parts = [summary] if summary else []
+    evidence_visibility_sql = _SHARED_BODY_EVIDENCE_SQL if personal_data_isolation_enabled() else ""
     claims = session.execute(
         text(
-            """
+            f"""
             SELECT c.predicate, c.value_json FROM knowledge_claims c
             JOIN pkos_evidence ev
               ON ev.workspace_id = c.workspace_id AND ev.id = c.source_id
             WHERE c.workspace_id = :workspace_id AND c.subject_id = :entity_id
               AND c.superseded_by IS NULL
-              AND ev.evidence_state = 'available'
+              AND ev.evidence_state = 'available'{evidence_visibility_sql}
             ORDER BY c.created_at
             """
         ),
@@ -260,11 +280,14 @@ def _decode_cursor(cursor: str) -> tuple[float, UUID]:
         raise HTTPException(status_code=400, detail="MALFORMED_CURSOR") from exc
 
 
-def _lexical_candidates_cte(visibility_sql: str) -> str:
-    # visibility_sql comes only from authz.visible_resource_filter_sql
+def _lexical_candidates_cte(visibility_sql: str, evidence_visibility_sql: str) -> str:
+    # visibility_sql / evidence_visibility_sql come only from authz.
+    # visible_resource_filter_sql / authz.evidence_visibility_filter_sql
     # (never request-controlled), same trust boundary as every other
     # f-string-embedded fragment in this module (_SCORE_* constants) --
-    # safe to splice directly.
+    # safe to splice directly. The evidence fragment (alias `e`) keeps the
+    # reported `evidence_state` to evidence the caller may read (Spec A
+    # S1.14; `TRUE` with the flag off).
     return f"""
     candidates AS (
         SELECT
@@ -285,6 +308,7 @@ def _lexical_candidates_cte(visibility_sql: str) -> str:
             (
                 SELECT e.evidence_state FROM pkos_evidence e
                 WHERE e.workspace_id = d.workspace_id AND e.node_id = d.entity_id
+                  AND ({evidence_visibility_sql})
                 ORDER BY e.captured_at DESC LIMIT 1
             ) AS evidence_state
         FROM retrieval_documents d
@@ -307,13 +331,13 @@ def _lexical_candidates_cte(visibility_sql: str) -> str:
 
 
 def _run_lexical_query(
-    session: Session, params: dict[str, Any], visibility_sql: str
+    session: Session, params: dict[str, Any], visibility_sql: str, evidence_visibility_sql: str
 ) -> Sequence[Any]:
     return (
         session.execute(
             text(
                 f"""
-                WITH {_lexical_candidates_cte(visibility_sql)}, ranked AS (
+                WITH {_lexical_candidates_cte(visibility_sql, evidence_visibility_sql)}, ranked AS (
                     SELECT *,
                         CASE
                             WHEN normalized_title = :query THEN {_SCORE_EXACT_NAME}
@@ -352,7 +376,11 @@ def _run_lexical_query(
 
 
 def _run_hybrid_query(
-    session: Session, params: dict[str, Any], visibility_sql: str
+    session: Session,
+    params: dict[str, Any],
+    visibility_sql: str,
+    evidence_visibility_sql: str,
+    merged_evidence_visibility_sql: str,
 ) -> Sequence[Any]:
     """Fuses lexical candidates with the nearest embedding_projections
     neighbors of the query vector. See the module-level _SCORE_* constants
@@ -366,12 +394,15 @@ def _run_hybrid_query(
     retrieval_documents), so it needs its own copy of the same visibility
     filter -- omitting it here would let a document invisible to the caller
     still surface through pure-semantic recall even though the lexical path
-    correctly excludes it."""
+    correctly excludes it. The same holds for the evidence filter:
+    `merged_evidence_visibility_sql` (alias `e2`) is the semantic-only
+    rows' copy of the candidates' `evidence_visibility_sql` (alias `e`)."""
     return (
         session.execute(
             text(
                 f"""
-                WITH {_lexical_candidates_cte(visibility_sql)}, semantic AS (
+                WITH {_lexical_candidates_cte(visibility_sql, evidence_visibility_sql)},
+                semantic AS (
                     SELECT
                         d.entity_type, d.entity_id, d.title, d.body,
                         d.source_version, d.updated_at,
@@ -415,6 +446,7 @@ def _run_hybrid_query(
                             SELECT e2.evidence_state FROM pkos_evidence e2
                             WHERE e2.workspace_id = :workspace_id
                               AND e2.node_id = COALESCE(l.entity_id, s.entity_id)
+                              AND ({merged_evidence_visibility_sql})
                             ORDER BY e2.captured_at DESC LIMIT 1
                         )) AS evidence_state
                     FROM candidates l
@@ -582,6 +614,11 @@ def retrieve(
     visibility_sql, visibility_params = authz.visible_resource_filter_sql(
         session, auth, resource_type="pkos_nodes", action="read", table_alias="n"
     )
+    # Spec A S1.14: the reported `evidence_state` only ever comes from
+    # evidence the caller may read (flag off -> `TRUE`).
+    evidence_visibility_sql, evidence_visibility_params = authz.evidence_visibility_filter_sql(
+        session, auth, table_alias="e", param_prefix="evidence_"
+    )
     cursor_payload = _decode_cursor(cursor) if cursor else None
     params: dict[str, Any] = {
         "workspace_id": auth.workspace_id,
@@ -593,22 +630,29 @@ def retrieve(
         "cursor_id": cursor_payload[1] if cursor_payload else None,
         "fetch_limit": limit + 1,
         **visibility_params,
+        **evidence_visibility_params,
     }
 
     if query_vector is not None:
+        merged_evidence_sql, merged_evidence_params = authz.evidence_visibility_filter_sql(
+            session, auth, table_alias="e2", param_prefix="merged_evidence_"
+        )
         rows = _run_hybrid_query(
             session,
             {
                 **params,
+                **merged_evidence_params,
                 "query_vector": vector_literal(query_vector),
                 "model_id": MODEL_ID,
                 "semantic_candidate_limit": _SEMANTIC_CANDIDATE_LIMIT,
             },
             visibility_sql,
+            evidence_visibility_sql,
+            merged_evidence_sql,
         )
         session.rollback()
         return _build_response(rows, query, mode, limit, True, degraded, degraded_reason)
 
-    rows = _run_lexical_query(session, params, visibility_sql)
+    rows = _run_lexical_query(session, params, visibility_sql, evidence_visibility_sql)
     session.rollback()
     return _build_response(rows, query, mode, limit, False, degraded, degraded_reason)
