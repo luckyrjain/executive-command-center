@@ -60,7 +60,7 @@ from hashlib import sha256
 from secrets import token_urlsafe
 from typing import Annotated, NoReturn
 from urllib.parse import urlencode
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
@@ -81,13 +81,18 @@ from ecc.domains.engineering.connector_accounts import (
 from ecc.domains.engineering.connectors import AdapterAuthorizationError, ConnectorAccountContext
 from ecc.domains.engineering.crypto import decrypt_credential, encrypt_credential
 from ecc.domains.personal.gmail_adapter import GmailAdapter
-from ecc.observability import RevokeSite, queue_lifecycle_event
+from ecc.observability import (
+    RevokeSite,
+    queue_lifecycle_event,
+    record_connector_enrollment_refused,
+)
 from ecc.platform import audit_outbox, authz
 from ecc.platform.connector_security import (
     RevokeTokenKind,
     integrity_error_log_fields,
     is_unique_violation,
     revoke_if_safe,
+    write_refusal_audit,
 )
 
 router = APIRouter(prefix="/api/v1/personal/gmail", tags=["personal"])
@@ -111,6 +116,23 @@ _UNIQUE_EXTERNAL_ACCOUNT_CONSTRAINT = "uq_connector_accounts_workspace_provider_
 
 # (credential context, token kind for `revoke_is_safe`, metric site label)
 _PendingRevoke = tuple[ConnectorAccountContext, RevokeTokenKind, RevokeSite]
+
+
+class _OwnerRefusal(Exception):
+    """The callback's Google account is already connected in this
+    workspace by a DIFFERENT member (Spec A S1.2, threat T2). Raised inside
+    the business transaction and re-raised past the broad `except
+    Exception` guard (which would queue the minted grant for the
+    unconditional revoke drain), so the transaction rolls back -- releasing
+    the `FOR UPDATE` row lock -- before the outer handler writes the
+    refusal audit and returns `409`. Carries only the conflicting row's id,
+    for the admin-only audit aggregate; nothing about that row reaches the
+    caller or a log line.
+    """
+
+    def __init__(self, connector_account_id: UUID) -> None:
+        super().__init__("connector owned by another member")
+        self.connector_account_id = connector_account_id
 
 
 class OAuthStartResponse(BaseModel):
@@ -288,6 +310,7 @@ def gmail_oauth_callback_endpoint(
     pending_revokes_on_commit: list[_PendingRevoke] = []
     response: ConnectorAccountResponse | None = None
     committed = False
+    owner_refusal: _OwnerRefusal | None = None
     try:
         with SessionFactory() as create_session, create_session.begin():
             try:
@@ -393,7 +416,7 @@ def gmail_oauth_callback_endpoint(
                     existing = (
                         create_session.execute(
                             text(
-                                "SELECT id, status, encrypted_credentials FROM "
+                                "SELECT id, status, owner_id, encrypted_credentials FROM "
                                 "connector_accounts WHERE workspace_id = :workspace_id "
                                 "AND provider = 'gmail' "
                                 "AND external_account_id = :external_account_id "
@@ -426,6 +449,12 @@ def gmail_oauth_callback_endpoint(
                         raise HTTPException(
                             status_code=409, detail="GMAIL_ACCOUNT_ALREADY_CONNECTED"
                         ) from None
+                    if existing["owner_id"] != auth.user_id:
+                        # Spec A S1.2: another member's connector for this
+                        # Google account -- never return, reactivate, or
+                        # overwrite it, whatever its status. A NULL owner
+                        # refuses too (fails closed).
+                        raise _OwnerRefusal(existing["id"])
                     if existing["status"] == "active":
                         pending_revokes.append(
                             (
@@ -520,6 +549,11 @@ def gmail_oauth_callback_endpoint(
                             "connector_account.reconnected",
                             "allowed",
                         )
+                except _OwnerRefusal:
+                    # A refusal, not a failure to persist: the minted
+                    # grant is NOT queued for the unconditional drain --
+                    # the refusal handler after the `with` decides it.
+                    raise
                 except Exception:
                     pending_revokes.append(
                         (
@@ -616,6 +650,11 @@ def gmail_oauth_callback_endpoint(
         # revoked on a rollback the way every other queued entry safely
         # can be).
         committed = True
+    except _OwnerRefusal as refusal:
+        # The `with` above has already rolled back and closed
+        # `create_session` (row lock released); nothing was queued in
+        # `pending_revokes` for this path. Handled below, after `finally`.
+        owner_refusal = refusal
     finally:
         # `create_session` is fully closed by this point (the `with` block
         # above has already exited) -- no pooled connection or row lock is
@@ -631,8 +670,58 @@ def gmail_oauth_callback_endpoint(
         if committed:
             _drain_pending_revokes(pending_revokes_on_commit)
 
+    if owner_refusal is not None:
+        _refuse_owned_by_another_member(
+            request,
+            auth,
+            owner_refusal,
+            ConnectorAccountContext(
+                workspace_id=auth.workspace_id,
+                connector_account_id=account_id,
+                external_account_id=authorization.external_account_id,
+                credential=authorization.credential,
+            ),
+        )
+
     assert response is not None
     return response
+
+
+def _refuse_owned_by_another_member(
+    request: Request,
+    auth: AuthContext,
+    refusal: _OwnerRefusal,
+    minted: ConnectorAccountContext,
+) -> NoReturn:
+    """Spec A S1.2 refusal tail, run only after the business transaction
+    rolled back: refusal audit (own txn, `denied`, no email) + metric ->
+    minted grant revoked iff `revoke_is_safe(minted_unpersisted)` (under
+    the default `global` scope never, since the other member's row is
+    live; under `none` -- D2 proved revoke per-token -- the minted token
+    alone is revoked, leaving the other member's grant intact) -> `409`
+    with the bare code and no data about the other member's row.
+    """
+    write_refusal_audit(
+        auth,
+        request,
+        event_type="connector_account.enrollment_refused",
+        aggregate_type="connector_account",
+        aggregate_id=refusal.connector_account_id,
+        reason="owned_by_another_member",
+        provider_or_type="gmail",
+    )
+    record_connector_enrollment_refused("gmail", "owned_by_another_member")
+    _logger.warning("gmail_oauth_callback_refused: reason=owned_by_another_member")
+    revoke_if_safe(
+        _adapter,
+        minted,
+        provider="gmail",
+        external_account_id=minted.external_account_id,
+        token_kind="minted_unpersisted",
+        exclude_row_id=None,
+        site="callback_failure",
+    )
+    raise HTTPException(status_code=409, detail="CONNECTOR_OWNED_BY_ANOTHER_MEMBER")
 
 
 def _raise_persist_failed(exc: IntegrityError) -> NoReturn:
