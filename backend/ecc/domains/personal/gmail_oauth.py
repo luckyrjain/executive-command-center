@@ -91,6 +91,7 @@ from ecc.platform.connector_security import (
     RevokeTokenKind,
     integrity_error_log_fields,
     is_unique_violation,
+    personal_content_scope,
     revoke_if_safe,
     write_refusal_audit,
 )
@@ -309,6 +310,15 @@ def gmail_oauth_callback_endpoint(
     pending_revokes: list[_PendingRevoke] = []
     pending_revokes_on_commit: list[_PendingRevoke] = []
     response: ConnectorAccountResponse | None = None
+    # Spec A S1.8(a), `ECC_PERSONAL_DATA_ISOLATION`: a newly connected
+    # mailbox is `private` to its owner -- the caller, who just completed
+    # their own Google consent (flag off -> `workspace`, as before). The
+    # owner is the caller either way. Only the INSERT is affected: the
+    # reconnect UPDATE below leaves an existing row's owner/visibility as
+    # they are -- a row written while the flag was off is moved by the
+    # visibility backfill (T15), which logs the previous value for
+    # `--restore`.
+    visibility = personal_content_scope(auth.user_id).visibility
     committed = False
     owner_refusal: _OwnerRefusal | None = None
     try:
@@ -327,7 +337,7 @@ def gmail_oauth_callback_endpoint(
                                 :id, :workspace_id, 'gmail', :external_account_id, :display_name,
                                 :granted_scopes, :encrypted_credentials, 'active', 1,
                                 :actor_id, :actor_id, :now, :now,
-                                :actor_id, 'workspace'
+                                :actor_id, :visibility
                             )
                             """
                         ),
@@ -340,6 +350,7 @@ def gmail_oauth_callback_endpoint(
                             "encrypted_credentials": encrypt_credential(authorization.credential),
                             "actor_id": auth.user_id,
                             "now": now,
+                            "visibility": visibility,
                         },
                     )
             except IntegrityError as integrity_error:
