@@ -111,7 +111,11 @@ from sqlalchemy.engine import RowMapping
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext
-from ecc.platform.connector_security import PERSONAL_ROW_PREDICATES, personal_sql_params
+from ecc.platform.connector_security import (
+    PERSONAL_ROW_PREDICATES,
+    personal_data_isolation_enabled,
+    personal_sql_params,
+)
 
 Role = Literal["owner", "admin", "member", "viewer"]
 Action = Literal["read", "write"]
@@ -960,4 +964,50 @@ def list_visible_resources(
         )
         .mappings()
         .all()
+    )
+
+
+# ---------------------------------------------------------------------------
+# Evidence readers that bypass the per-resource endpoints (Spec A S1.14)
+# ---------------------------------------------------------------------------
+
+
+def evidence_visibility_filter_sql(
+    session: Session,
+    auth: AuthContext,
+    *,
+    table_alias: str,
+    param_prefix: str = "evidence_",
+) -> tuple[str, dict[str, object]]:
+    """`visible_resource_filter_sql` for `pkos_evidence` (`read`), for the
+    readers that select evidence rows directly instead of through the
+    evidence endpoints (meeting prep, the `knowledge.get_entity` tool,
+    retrieval). Behind `ECC_PERSONAL_DATA_ISOLATION`: flag off returns
+    `("TRUE", {})`, so those readers behave exactly as before the flag
+    existed. `param_prefix` keeps its bind params distinct from any other
+    visibility fragment the same query embeds (e.g. the `pkos_nodes` one)."""
+    if not personal_data_isolation_enabled():
+        return "TRUE", {}
+    return visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="pkos_evidence",
+        action="read",
+        table_alias=table_alias,
+        param_prefix=param_prefix,
+    )
+
+
+def cited_evidence_readable(session: Session, auth: AuthContext, evidence_id: UUID) -> bool:
+    """Whether the caller may cite `evidence_id` (a claim/relationship
+    source, a risk-review or commitment evidence reference). Flag on: the
+    caller needs `read` on that evidence row, and callers report a `False`
+    exactly as they report an unknown evidence id, so a row the caller
+    cannot read is indistinguishable from one that does not exist. Flag
+    off: always `True` (today's behaviour; existence is still checked by
+    the caller)."""
+    if not personal_data_isolation_enabled():
+        return True
+    return authorize(
+        session, auth, resource_type="pkos_evidence", resource_id=evidence_id, action="read"
     )
