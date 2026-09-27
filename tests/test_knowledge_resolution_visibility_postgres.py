@@ -21,9 +21,7 @@ the fix itself, both covered here:
    it. The candidate's own filter call passes
    `resource_type="resolution_candidates"`; the two entity filter calls
    pass `resource_type="pkos_nodes"`. Reusing only the candidate's own
-   params dict for all three fragments (as `relationships.py`'s
-   `list_relationships` correctly does when every call shares one
-   `resource_type`) silently bound `'resolution_candidates'` into the
+   params dict for all three fragments silently bound `'resolution_candidates'` into the
    entity fragments' `resource_grants` subquery too -- an entity visible
    to the caller only via an explicit `pkos_nodes` grant (not ownership)
    was incorrectly hidden, because the grant subquery checked the wrong
