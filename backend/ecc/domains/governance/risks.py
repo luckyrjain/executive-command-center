@@ -160,6 +160,9 @@ def insert_risk(
     payload: RiskCreate,
     request: Request,
     now: datetime,
+    *,
+    owner_id: UUID | None = None,
+    visibility: Literal["private", "workspace"] = "workspace",
 ) -> RiskResponse:
     """The actual row-write + audit/outbox emission behind `POST /api/v1/risks`,
     split out so `ecc.domains.governance.recommendation_targets.execute_target`'s
@@ -168,6 +171,10 @@ def insert_risk(
     Deliberately excludes `session.begin()`/idempotency-key locking/replay
     (both callers already run inside their own already-open transaction and
     idempotency scheme; nesting a second `session.begin()` here would raise).
+
+    `owner_id`/`visibility` default to the actor / `workspace` (the column
+    default). Only a confirmed personal-data recommendation passes others
+    (`connector_security.personal_derived_row_scope`, Spec A plan note N23).
     """
     risk_id = uuid4()
     row = (
@@ -177,11 +184,11 @@ def insert_risk(
                 INSERT INTO risks (
                     id, workspace_id, description, probability, impact, status,
                     owner_id, mitigation, trigger, review_at, project_id, pinned,
-                    created_by, updated_by, created_at, updated_at, version
+                    created_by, updated_by, created_at, updated_at, version, visibility
                 ) VALUES (
                     :id, :workspace_id, :description, :probability, :impact, :status,
                     :owner_id, :mitigation, :trigger, :review_at, :project_id, :pinned,
-                    :actor_id, :actor_id, :now, :now, 1
+                    :actor_id, :actor_id, :now, :now, 1, :visibility
                 )
                 RETURNING {_RISK_FIELDS}
                 """
@@ -193,7 +200,8 @@ def insert_risk(
                 "probability": payload.probability,
                 "impact": payload.impact,
                 "status": payload.status,
-                "owner_id": auth.user_id,
+                "owner_id": owner_id if owner_id is not None else auth.user_id,
+                "visibility": visibility,
                 "mitigation": payload.mitigation,
                 "trigger": payload.trigger,
                 "review_at": payload.review_at,
