@@ -78,10 +78,16 @@ from ecc.domains.engineering.connector_accounts import (
     _to_response,
     get_connector_account,
 )
-from ecc.domains.engineering.connectors import AdapterAuthorizationError, ConnectorAccountContext
+from ecc.domains.engineering.connectors import (
+    AdapterAuthorizationError,
+    ConnectorAccountContext,
+    ConnectorAuthorization,
+)
 from ecc.domains.engineering.crypto import decrypt_credential, encrypt_credential
 from ecc.domains.personal.gmail_adapter import GmailAdapter
+from ecc.domains.personal.gmail_shared import normalize_email
 from ecc.observability import (
+    EnrollmentRefusedReason,
     RevokeSite,
     queue_lifecycle_event,
     record_connector_enrollment_refused,
@@ -93,8 +99,11 @@ from ecc.platform.connector_security import (
     integrity_error_log_fields,
     is_unique_violation,
     personal_content_scope,
+    record_revoke_skipped_unsafe,
     require_active_members_locked,
     revoke_if_safe,
+    revoke_is_safe,
+    revoke_scope_for,
     write_refusal_audit,
 )
 
@@ -215,6 +224,10 @@ def gmail_oauth_callback_endpoint(
     authz.require_role_action(session, auth, "write")
     if not _verify_state(auth, state):
         raise HTTPException(status_code=403, detail="GMAIL_OAUTH_STATE_INVALID")
+    # Spec A S1.1: read on `session` before it is closed below (flag read
+    # once, so both halves of the check see the same value).
+    require_identity_match = get_settings().gmail_require_identity_match
+    caller_email = _caller_email(session, auth) if require_identity_match else None
     # Release `session`'s pooled connection before the slow, sequential
     # outbound HTTPS calls inside `handle_oauth_callback` (Google's token
     # endpoint, then its profile endpoint -- up to ~20s combined) --
@@ -228,7 +241,9 @@ def gmail_oauth_callback_endpoint(
     session.close()
 
     try:
-        authorization = _adapter.handle_oauth_callback(code, state)
+        authorization = _adapter.handle_oauth_callback(
+            code, state, revoke_on_reject=_revoke_minted_on_reject
+        )
     except AdapterAuthorizationError as exc:
         raise HTTPException(
             status_code=422,
@@ -238,6 +253,21 @@ def gmail_oauth_callback_endpoint(
 
     now = datetime.now(UTC)
     account_id = uuid4()
+    if require_identity_match and not _identity_matches(
+        authorization.external_account_id, caller_email
+    ):
+        # Spec A S1.1: before any transaction is opened -- nothing to roll
+        # back, no lock taken.
+        _refuse_enrollment(
+            request,
+            auth,
+            _minted_context(auth, account_id, authorization),
+            reason="identity_mismatch",
+            aggregate_type="connector_account_enrollment",
+            aggregate_id=None,
+            status_code=403,
+            detail="GMAIL_ACCOUNT_IDENTITY_MISMATCH",
+        )
     # Round 23 review: every `_adapter.disconnect(...)` call below used to
     # run *inside* `create_session`'s open transaction, several of them
     # (the `active`-row and reactivation branches) while still holding the
@@ -718,51 +748,131 @@ def gmail_oauth_callback_endpoint(
         if committed:
             _drain_pending_revokes(pending_revokes_on_commit)
 
-    minted = ConnectorAccountContext(
-        workspace_id=auth.workspace_id,
-        connector_account_id=account_id,
-        external_account_id=authorization.external_account_id,
-        credential=authorization.credential,
-    )
+    minted = _minted_context(auth, account_id, authorization)
     if membership_inactive:
-        _refuse_membership_inactive(request, auth, minted)
-    if owner_refusal is not None:
-        _refuse_owned_by_another_member(
+        # Spec A S1.11: the caller was removed from the workspace while the
+        # OAuth round trip was in flight; nothing was written.
+        _refuse_enrollment(
             request,
             auth,
-            owner_refusal,
             minted,
+            reason="membership_inactive",
+            aggregate_type="connector_account_enrollment",
+            aggregate_id=None,
+            status_code=403,
+            detail="MEMBERSHIP_INACTIVE",
+        )
+    if owner_refusal is not None:
+        # Spec A S1.2: under the default `global` scope the minted grant is
+        # never revoked here (the other member's row is live); under `none`
+        # only the minted token is. No data about that row is returned.
+        _refuse_enrollment(
+            request,
+            auth,
+            minted,
+            reason="owned_by_another_member",
+            aggregate_type="connector_account",
+            aggregate_id=owner_refusal.connector_account_id,
+            status_code=409,
+            detail="CONNECTOR_OWNED_BY_ANOTHER_MEMBER",
         )
 
     assert response is not None
     return response
 
 
-def _refuse_owned_by_another_member(
+def _minted_context(
+    auth: AuthContext, account_id: UUID, authorization: ConnectorAuthorization
+) -> ConnectorAccountContext:
+    """The just-minted, never-persisted grant, as a revoke context."""
+    assert authorization.credential is not None  # handle_oauth_callback always sets it
+    return ConnectorAccountContext(
+        workspace_id=auth.workspace_id,
+        connector_account_id=account_id,
+        external_account_id=authorization.external_account_id,
+        credential=authorization.credential,
+    )
+
+
+def _identity_matches(google_email: str, caller_email: str | None) -> bool:
+    """Spec A S1.1: the authorized Google account is the caller's own ECC
+    account email (both normalized). An unknown caller email never matches
+    (fail closed)."""
+    if caller_email is None:
+        return False
+    return normalize_email(google_email) == normalize_email(caller_email)
+
+
+def _revoke_minted_on_reject(email: str | None) -> bool:
+    """Spec A S1.10 hook for `GmailAdapter.handle_oauth_callback`: may the
+    grant minted by a REJECTED callback (scope unticked, allowlist, profile
+    error, ...) be revoked? Only when `revoke_is_safe(minted_unpersisted)`
+    says so: under the default `global` scope a Google grant may be the
+    one another live row (any member, any workspace) still uses, so it is
+    revoked only when no live row uses that account -- and never when the
+    account is unknown (`email` None). Under `none` (D2: per-token) always.
+
+    Runs before the router opens any transaction; the check uses its own
+    short session. Never raises: any failure fails closed (no revoke),
+    logs only the exception class, and counts `skipped_unsafe`, as does a
+    "not safe" answer. The adapter counts the revoke's own ok/error.
+    Note for metrics docs: a safety-check DB failure counts as
+    `skipped_unsafe` here (plan B-T06-02), whereas `revoke_if_safe` counts
+    the same failure as `error`.
+    """
+    try:
+        scope = revoke_scope_for("gmail")
+        if scope == "none":
+            return True
+        with SessionFactory() as check_session:
+            safe = revoke_is_safe(
+                check_session,
+                provider="gmail",
+                external_account_id=email,
+                token_kind="minted_unpersisted",
+                exclude_row_id=None,
+                scope=scope,
+            )
+    except Exception as exc:
+        _logger.warning("gmail_revoke_on_reject_check_failed: error_class=%s", type(exc).__name__)
+        safe = False
+    if not safe:
+        record_revoke_skipped_unsafe(provider="gmail", site="adapter_callback")
+    return safe
+
+
+def _refuse_enrollment(
     request: Request,
     auth: AuthContext,
-    refusal: _OwnerRefusal,
     minted: ConnectorAccountContext,
+    *,
+    reason: EnrollmentRefusedReason,
+    aggregate_type: str,
+    aggregate_id: UUID | None,
+    status_code: int,
+    detail: str,
 ) -> NoReturn:
-    """Spec A S1.2 refusal tail, run only after the business transaction
-    rolled back: refusal audit (own txn, `denied`, no email) + metric ->
-    minted grant revoked iff `revoke_is_safe(minted_unpersisted)` (under
-    the default `global` scope never, since the other member's row is
-    live; under `none` -- D2 proved revoke per-token -- the minted token
-    alone is revoked, leaving the other member's grant intact) -> `409`
-    with the bare code and no data about the other member's row.
+    """Shared refusal tail for the callback (Spec A S1.1 identity mismatch,
+    S1.2 owner conflict, S1.11 membership inactive), run only when no
+    business transaction is open (it never started, or rolled back):
+    refusal audit (own txn, `denied`, payload `{reason, provider}` -- no
+    email; `aggregate_id=None` -> fresh id) + metric -> the minted grant
+    revoked iff `revoke_is_safe(minted_unpersisted)` (under `global`: only
+    when no live row anywhere uses that Google account, so another
+    member's live grant is never revoked) -> `HTTPException` with the bare
+    code, never either email or another row's data.
     """
     write_refusal_audit(
         auth,
         request,
         event_type="connector_account.enrollment_refused",
-        aggregate_type="connector_account",
-        aggregate_id=refusal.connector_account_id,
-        reason="owned_by_another_member",
+        aggregate_type=aggregate_type,
+        aggregate_id=aggregate_id,
+        reason=reason,
         provider_or_type="gmail",
     )
-    record_connector_enrollment_refused("gmail", "owned_by_another_member")
-    _logger.warning("gmail_oauth_callback_refused: reason=owned_by_another_member")
+    record_connector_enrollment_refused("gmail", reason)
+    _logger.warning("gmail_oauth_callback_refused: reason=%s", reason)
     revoke_if_safe(
         _adapter,
         minted,
@@ -772,42 +882,7 @@ def _refuse_owned_by_another_member(
         exclude_row_id=None,
         site="callback_failure",
     )
-    raise HTTPException(status_code=409, detail="CONNECTOR_OWNED_BY_ANOTHER_MEMBER")
-
-
-def _refuse_membership_inactive(
-    request: Request, auth: AuthContext, minted: ConnectorAccountContext
-) -> NoReturn:
-    """Spec A S1.11 refusal tail, run only after the business transaction
-    rolled back (nothing was written): the caller was removed from the
-    workspace while the OAuth round trip was in flight. Refusal audit (own
-    txn, `denied`, no row -> fresh aggregate id, no email) + metric ->
-    minted grant revoked iff `revoke_is_safe(minted_unpersisted)` (under
-    `global`: only when no live row anywhere uses that Google account, so
-    another member's -- or the connector owner's -- live grant is never
-    revoked) -> `403 MEMBERSHIP_INACTIVE`.
-    """
-    write_refusal_audit(
-        auth,
-        request,
-        event_type="connector_account.enrollment_refused",
-        aggregate_type="connector_account_enrollment",
-        aggregate_id=None,
-        reason="membership_inactive",
-        provider_or_type="gmail",
-    )
-    record_connector_enrollment_refused("gmail", "membership_inactive")
-    _logger.warning("gmail_oauth_callback_refused: reason=membership_inactive")
-    revoke_if_safe(
-        _adapter,
-        minted,
-        provider="gmail",
-        external_account_id=minted.external_account_id,
-        token_kind="minted_unpersisted",
-        exclude_row_id=None,
-        site="callback_failure",
-    )
-    raise HTTPException(status_code=403, detail="MEMBERSHIP_INACTIVE")
+    raise HTTPException(status_code=status_code, detail=detail)
 
 
 def _raise_persist_failed(exc: IntegrityError) -> NoReturn:

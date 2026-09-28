@@ -28,6 +28,13 @@ they read as decisions, not oversights):
   is a ``users`` row and ``pkos_nodes`` (what meeting participants link to)
   has no resolvable link to ``users`` anywhere in this codebase, so a
   participant-scoped risk filter isn't queryable today.
+- Visibility (FX1): a pack is stored once per meeting (``visibility =
+  'workspace'``) and served to every reader of the meeting, so the stored
+  snapshot -- and the fingerprint and AI enrichment computed from it -- is
+  built only from ``workspace``-visible participants and rows. Each
+  caller's response adds, per request and never stored, the private or
+  explicitly-shared rows that caller may read (``_caller_view``). Not
+  flag-gated: such rows exist without ``ECC_PERSONAL_DATA_ISOLATION``.
 - AI enrichment (Phase 4-consuming wiring, this change): a bounded,
   fail-open ``meeting.prep_summary`` run (``ai_runtime/runtime.py``),
   gated on ``config.py``'s ``meeting_prep_ai_enrichment_enabled`` (still
@@ -44,11 +51,12 @@ they read as decisions, not oversights):
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from json import dumps
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Protocol
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
@@ -65,6 +73,7 @@ from ecc.domains.ai_runtime.runtime import execute_run, get_ollama_adapter
 from ecc.domains.calendar.events import get_calendar_event_summary
 from ecc.observability import queue_lifecycle_event
 from ecc.platform import audit_outbox, authz
+from ecc.platform.connector_security import personal_data_isolation_enabled
 from ecc.platform.idempotency import (
     held_idempotency_lock,
     load_cached,
@@ -518,9 +527,45 @@ def _meeting_input(session: Session, auth: AuthContext, row: dict[str, Any]) -> 
     )
 
 
-def _fetch_participants(
-    session: Session, auth: AuthContext, meeting_id: UUID
-) -> list[ParticipantRow]:
+class _ReadFilters:
+    """One request's ``authz.visible_resource_filter_sql`` (``read``, for the
+    caller) fragments, memoized per resource type. Each helper call costs a
+    role and an account lookup, and one prep request needs the same
+    fragments twice -- for the shared snapshot and for the caller's own
+    rows (``_caller_view``). Create one per transaction; never share one
+    across callers."""
+
+    def __init__(self, session: Session, auth: AuthContext) -> None:
+        self._session = session
+        self._auth = auth
+        self._cache: dict[tuple[str, str], tuple[str, dict[str, object]]] = {}
+
+    def fragment(self, resource_type: str, table_alias: str) -> tuple[str, dict[str, object]]:
+        key = (resource_type, table_alias)
+        cached = self._cache.get(key)
+        if cached is None:
+            cached = authz.visible_resource_filter_sql(
+                self._session,
+                self._auth,
+                resource_type=resource_type,
+                action="read",
+                table_alias=table_alias,
+                param_prefix=f"{resource_type}_",
+            )
+            self._cache[key] = cached
+        return cached
+
+
+def _fetch_participant_rows(
+    session: Session,
+    auth: AuthContext,
+    meeting_id: UUID,
+    *,
+    filters: _ReadFilters | None = None,
+) -> list[tuple[ParticipantRow, bool]]:
+    """Every participant whose person node the caller may read, each paired
+    with whether that node is ``workspace``-visible (so may enter the shared
+    snapshot -- see ``generate_pack``)."""
     # Found in the fourth whole-phase review: this used to join `pkos_
     # nodes` for `canonical_name` with no visibility filter on it at all --
     # `add_participant`'s own write-time authz check (see that endpoint's
@@ -530,14 +575,14 @@ def _fetch_participants(
     # leaking regardless. Filtering the live `pkos_nodes` row here, the
     # same "check the live source at read time" pattern `retrieval.py`'s
     # own search fix already established, closes both cases at once.
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
-        session, auth, resource_type="pkos_nodes", action="read", table_alias="n"
+    visibility_sql, visibility_params = (filters or _ReadFilters(session, auth)).fragment(
+        "pkos_nodes", "n"
     )
     rows = (
         session.execute(
             text(
                 f"""
-                SELECT mp.id, mp.entity_id, mp.role, n.canonical_name
+                SELECT mp.id, mp.entity_id, mp.role, n.canonical_name, n.visibility
                 FROM meeting_participants mp
                 JOIN pkos_nodes n ON n.workspace_id = mp.workspace_id AND n.id = mp.entity_id
                 WHERE mp.workspace_id = :workspace_id AND mp.meeting_id = :meeting_id
@@ -551,11 +596,23 @@ def _fetch_participants(
         .all()
     )
     return [
-        ParticipantRow(
-            id=r["id"], entity_id=r["entity_id"], entity_name=r["canonical_name"], role=r["role"]
+        (
+            ParticipantRow(
+                id=r["id"],
+                entity_id=r["entity_id"],
+                entity_name=r["canonical_name"],
+                role=r["role"],
+            ),
+            r["visibility"] == "workspace",
         )
         for r in rows
     ]
+
+
+def _fetch_participants(
+    session: Session, auth: AuthContext, meeting_id: UUID
+) -> list[ParticipantRow]:
+    return [p for p, _shared in _fetch_participant_rows(session, auth, meeting_id)]
 
 
 def _participant_already_linked(
@@ -585,26 +642,116 @@ def _participant_already_linked(
     )
 
 
+# Which slice of the caller-readable rows a fetcher returns (FX1). A pack is
+# stored once per meeting and served to every reader of it, so the stored
+# snapshot ("shared") holds only rows every such reader may read:
+# `workspace`-visible rows (every active member reads those -- authz step 5)
+# keyed to the snapshot's own `workspace`-visible participants. "private"
+# is the exact complement within what *this* caller may read -- their own
+# private rows, rows explicitly shared with them, and anything keyed to a
+# participant node only they can see -- computed per request by
+# `_caller_view` and never stored. Both slices sit on top of
+# `authz.visible_resource_filter_sql` for the caller, and neither is
+# flag-gated: private and `shared_explicitly` rows exist without
+# ECC_PERSONAL_DATA_ISOLATION (grants with `narrow_visibility`, delegations,
+# planning).
+_Scope = Literal["shared", "private"]
+
+
+def _scoped_visibility_sql(
+    filters: _ReadFilters,
+    *,
+    resource_type: str,
+    table_alias: str,
+    scope: _Scope,
+    shared_entity_ids: list[UUID] | None = None,
+    shared_key_column: str | None = None,
+) -> tuple[str, dict[str, object]]:
+    """The caller's ``authz.visible_resource_filter_sql`` (read) fragment
+    narrowed to one ``_Scope``. For a participant-keyed fetcher in the
+    "private" scope, ``shared_key_column``/``shared_entity_ids`` name the
+    snapshot's own participants: a ``workspace`` row keyed to a participant
+    that is *not* in the snapshot (a node only the caller can see) belongs
+    to the caller's slice. (In the "shared" scope the fetcher is already
+    given only the snapshot's participants.) Bind names are prefixed per
+    resource type, so fragments never collide with each other or with the
+    fetcher's own params."""
+    visible_sql, params = filters.fragment(resource_type, table_alias)
+    return _scope_clause(
+        visible_sql,
+        params,
+        table_alias=table_alias,
+        scope=scope,
+        param_prefix=f"{resource_type}_",
+        shared_entity_ids=shared_entity_ids,
+        shared_key_column=shared_key_column,
+    )
+
+
+def _scope_clause(
+    visible_sql: str,
+    params: dict[str, object],
+    *,
+    table_alias: str,
+    scope: _Scope,
+    param_prefix: str,
+    shared_entity_ids: list[UUID] | None,
+    shared_key_column: str | None,
+) -> tuple[str, dict[str, object]]:
+    """AND a caller's visibility fragment with one ``_Scope``'s split. The
+    "private" clause is written as the exact logical complement of the
+    "shared" one with ``IS DISTINCT FROM`` / ``<> ALL``, so a row can never
+    fall out of both slices (every ``visibility`` and key column involved
+    is ``NOT NULL`` today; this keeps the split total if one ever is not)."""
+    if scope == "shared":
+        return f"({visible_sql}) AND {table_alias}.visibility = 'workspace'", params
+    not_in_snapshot = f"{table_alias}.visibility IS DISTINCT FROM 'workspace'"
+    if shared_key_column is not None:
+        shared_ids = f"{param_prefix}shared_entity_ids"
+        not_in_snapshot = (
+            f"({not_in_snapshot} OR {table_alias}.{shared_key_column} IS NULL "
+            f"OR {table_alias}.{shared_key_column} <> ALL(CAST(:{shared_ids} AS uuid[])))"
+        )
+        params = {**params, shared_ids: shared_entity_ids or []}
+    return f"({visible_sql}) AND {not_in_snapshot}", params
+
+
 def _fetch_timeline(
-    session: Session, auth: AuthContext, entity_ids: list[UUID]
+    session: Session,
+    auth: AuthContext,
+    entity_ids: list[UUID],
+    *,
+    scope: _Scope = "shared",
+    shared_entity_ids: list[UUID] | None = None,
+    filters: _ReadFilters | None = None,
 ) -> list[TimelineRow]:
     if not entity_ids:
         return []
+    scope_sql, scope_params = _scoped_visibility_sql(
+        filters or _ReadFilters(session, auth),
+        resource_type="timeline_entries",
+        table_alias="t",
+        scope=scope,
+        shared_entity_ids=shared_entity_ids,
+        shared_key_column="entity_id",
+    )
     rows = (
         session.execute(
             text(
-                """
-                SELECT id, entity_id, effective_at, event_type, summary
-                FROM timeline_entries
-                WHERE workspace_id = :workspace_id AND entity_id = ANY(:entity_ids)
-                ORDER BY effective_at DESC, id DESC
+                f"""
+                SELECT t.id, t.entity_id, t.effective_at, t.event_type, t.summary
+                FROM timeline_entries t
+                WHERE t.workspace_id = :workspace_id AND t.entity_id = ANY(:entity_ids)
+                  AND {scope_sql}
+                ORDER BY t.effective_at DESC, t.id DESC
                 LIMIT :limit
-                """
+                """  # noqa: S608 -- authz visibility fragment; values bound
             ),
             {
                 "workspace_id": auth.workspace_id,
                 "entity_ids": entity_ids,
                 "limit": _MAX_TIMELINE_ENTRIES,
+                **scope_params,
             },
         )
         .mappings()
@@ -623,28 +770,44 @@ def _fetch_timeline(
 
 
 def _fetch_commitments(
-    session: Session, auth: AuthContext, participant_entity_ids: list[UUID]
+    session: Session,
+    auth: AuthContext,
+    participant_entity_ids: list[UUID],
+    *,
+    scope: _Scope = "shared",
+    shared_entity_ids: list[UUID] | None = None,
+    filters: _ReadFilters | None = None,
 ) -> list[CommitmentRow]:
     if not participant_entity_ids:
         return []
+    scope_sql, scope_params = _scoped_visibility_sql(
+        filters or _ReadFilters(session, auth),
+        resource_type="commitments",
+        table_alias="c",
+        scope=scope,
+        shared_entity_ids=shared_entity_ids,
+        shared_key_column="counterparty_person_id",
+    )
     rows = (
         session.execute(
             text(
-                """
-                SELECT id, direction, summary, status, due_at, counterparty_name
-                FROM commitments
-                WHERE workspace_id = :workspace_id
-                  AND counterparty_person_id = ANY(:entity_ids)
-                  AND status IN ('confirmed', 'active')
-                  AND archived_at IS NULL
-                ORDER BY due_at NULLS LAST, id
+                f"""
+                SELECT c.id, c.direction, c.summary, c.status, c.due_at, c.counterparty_name
+                FROM commitments c
+                WHERE c.workspace_id = :workspace_id
+                  AND c.counterparty_person_id = ANY(:entity_ids)
+                  AND c.status IN ('confirmed', 'active')
+                  AND c.archived_at IS NULL
+                  AND {scope_sql}
+                ORDER BY c.due_at NULLS LAST, c.id
                 LIMIT :limit
-                """
+                """  # noqa: S608 -- authz visibility fragment; values bound
             ),
             {
                 "workspace_id": auth.workspace_id,
                 "entity_ids": participant_entity_ids,
                 "limit": _MAX_COMMITMENTS,
+                **scope_params,
             },
         )
         .mappings()
@@ -663,7 +826,14 @@ def _fetch_commitments(
     ]
 
 
-def _fetch_notes(session: Session, auth: AuthContext, meeting_id: UUID) -> list[NoteRow]:
+def _fetch_notes(
+    session: Session,
+    auth: AuthContext,
+    meeting_id: UUID,
+    *,
+    scope: _Scope = "shared",
+    filters: _ReadFilters | None = None,
+) -> list[NoteRow]:
     # Restricted notes are excluded here, in the SQL WHERE clause, *before*
     # LIMIT is applied -- not filtered out afterward in Python (build_pack's
     # filter stays as a defense-in-depth belt-and-suspenders check, but
@@ -671,20 +841,30 @@ def _fetch_notes(session: Session, auth: AuthContext, meeting_id: UUID) -> list[
     # let LIMIT :limit count restricted rows against the cap, so a meeting
     # with _MAX_NOTES-or-more restricted notes could return fewer than
     # _MAX_NOTES visible notes even when more visible ones existed beyond
-    # the truncated window (finding #8).
+    # the truncated window (finding #8). The visibility scope sits in the
+    # same WHERE clause for the same reason.
+    scope_sql, scope_params = _scoped_visibility_sql(
+        filters or _ReadFilters(session, auth), resource_type="notes", table_alias="nt", scope=scope
+    )
     rows = (
         session.execute(
             text(
-                """
-                SELECT id, title, body, note_type, restricted, created_at
-                FROM notes
-                WHERE workspace_id = :workspace_id AND meeting_id = :meeting_id
-                  AND archived_at IS NULL AND restricted = false
-                ORDER BY created_at DESC, id
+                f"""
+                SELECT nt.id, nt.title, nt.body, nt.note_type, nt.restricted, nt.created_at
+                FROM notes nt
+                WHERE nt.workspace_id = :workspace_id AND nt.meeting_id = :meeting_id
+                  AND nt.archived_at IS NULL AND nt.restricted = false
+                  AND {scope_sql}
+                ORDER BY nt.created_at DESC, nt.id
                 LIMIT :limit
-                """
+                """  # noqa: S608 -- authz visibility fragment; values bound
             ),
-            {"workspace_id": auth.workspace_id, "meeting_id": meeting_id, "limit": _MAX_NOTES},
+            {
+                "workspace_id": auth.workspace_id,
+                "meeting_id": meeting_id,
+                "limit": _MAX_NOTES,
+                **scope_params,
+            },
         )
         .mappings()
         .all()
@@ -702,20 +882,31 @@ def _fetch_notes(session: Session, auth: AuthContext, meeting_id: UUID) -> list[
     ]
 
 
-def _fetch_risks(session: Session, auth: AuthContext) -> list[RiskRow]:
+def _fetch_risks(
+    session: Session,
+    auth: AuthContext,
+    *,
+    scope: _Scope = "shared",
+    filters: _ReadFilters | None = None,
+) -> list[RiskRow]:
     # Workspace-wide, not participant-scoped -- see module docstring.
+    scope_sql, scope_params = _scoped_visibility_sql(
+        filters or _ReadFilters(session, auth), resource_type="risks", table_alias="r", scope=scope
+    )
     rows = (
         session.execute(
             text(
-                """
-                SELECT id, description, status, probability, impact, review_at
-                FROM risks
-                WHERE workspace_id = :workspace_id AND status <> 'closed' AND archived_at IS NULL
-                ORDER BY review_at NULLS LAST, id
+                f"""
+                SELECT r.id, r.description, r.status, r.probability, r.impact, r.review_at
+                FROM risks r
+                WHERE r.workspace_id = :workspace_id AND r.status <> 'closed'
+                  AND r.archived_at IS NULL
+                  AND {scope_sql}
+                ORDER BY r.review_at NULLS LAST, r.id
                 LIMIT :limit
-                """
+                """  # noqa: S608 -- authz visibility fragment; values bound
             ),
-            {"workspace_id": auth.workspace_id, "limit": _MAX_RISKS},
+            {"workspace_id": auth.workspace_id, "limit": _MAX_RISKS, **scope_params},
         )
         .mappings()
         .all()
@@ -734,27 +925,43 @@ def _fetch_risks(session: Session, auth: AuthContext) -> list[RiskRow]:
 
 
 def _fetch_dependencies(
-    session: Session, auth: AuthContext, participant_entity_ids: list[UUID]
+    session: Session,
+    auth: AuthContext,
+    participant_entity_ids: list[UUID],
+    *,
+    scope: _Scope = "shared",
+    shared_entity_ids: list[UUID] | None = None,
+    filters: _ReadFilters | None = None,
 ) -> list[DependencyRow]:
     if not participant_entity_ids:
         return []
+    scope_sql, scope_params = _scoped_visibility_sql(
+        filters or _ReadFilters(session, auth),
+        resource_type="waiting_links",
+        table_alias="w",
+        scope=scope,
+        shared_entity_ids=shared_entity_ids,
+        shared_key_column="counterparty_entity_id",
+    )
     rows = (
         session.execute(
             text(
-                """
-                SELECT id, direction, note, expected_at
-                FROM waiting_links
-                WHERE workspace_id = :workspace_id
-                  AND status = 'open'
-                  AND counterparty_entity_id = ANY(:entity_ids)
-                ORDER BY expected_at NULLS LAST, id
+                f"""
+                SELECT w.id, w.direction, w.note, w.expected_at
+                FROM waiting_links w
+                WHERE w.workspace_id = :workspace_id
+                  AND w.status = 'open'
+                  AND w.counterparty_entity_id = ANY(:entity_ids)
+                  AND {scope_sql}
+                ORDER BY w.expected_at NULLS LAST, w.id
                 LIMIT :limit
-                """
+                """  # noqa: S608 -- authz visibility fragment; values bound
             ),
             {
                 "workspace_id": auth.workspace_id,
                 "entity_ids": participant_entity_ids,
                 "limit": _MAX_DEPENDENCIES,
+                **scope_params,
             },
         )
         .mappings()
@@ -768,14 +975,38 @@ def _fetch_dependencies(
     ]
 
 
-def _fetch_evidence(session: Session, auth: AuthContext, node_ids: list[UUID]) -> list[EvidenceRow]:
+def _fetch_evidence(
+    session: Session,
+    auth: AuthContext,
+    node_ids: list[UUID],
+    *,
+    scope: _Scope = "shared",
+    shared_entity_ids: list[UUID] | None = None,
+) -> list[EvidenceRow]:
     if not node_ids:
         return []
-    # Spec A S1.14: only evidence the caller may read (flag-gated; off ->
-    # the fragment is `TRUE`).
-    visibility_sql, visibility_params = authz.evidence_visibility_filter_sql(
-        session, auth, table_alias="pkos_evidence"
-    )
+    # Spec A S1.14: only evidence the caller may read (flag-gated). Flag
+    # on, the shared/private split applies like every other fetcher's, so
+    # the snapshot and its fingerprint are the same for every caller and
+    # no reader's GET can flip the pack stale over their own evidence.
+    # Flag off, evidence rows are unfiltered (pre-flag behaviour) and split
+    # only by participant: every row on a snapshot participant is shared;
+    # the "private" slice is every row on a participant node only the
+    # caller can see (so its owner still gets its gaps, as before FX1).
+    if personal_data_isolation_enabled():
+        visibility_sql, visibility_params = _scope_clause(
+            *authz.evidence_visibility_filter_sql(session, auth, table_alias="pkos_evidence"),
+            table_alias="pkos_evidence",
+            scope=scope,
+            param_prefix="evidence_",
+            shared_entity_ids=shared_entity_ids,
+            shared_key_column="node_id",
+        )
+    elif scope == "private":
+        visibility_sql = "pkos_evidence.node_id <> ALL(CAST(:evidence_shared_entity_ids AS uuid[]))"
+        visibility_params = {"evidence_shared_entity_ids": shared_entity_ids or []}
+    else:
+        visibility_sql, visibility_params = "TRUE", {}
     rows = (
         session.execute(
             text(
@@ -786,7 +1017,7 @@ def _fetch_evidence(session: Session, auth: AuthContext, node_ids: list[UUID]) -
                   AND ({visibility_sql})
                 ORDER BY id
                 LIMIT :limit
-                """
+                """  # noqa: S608 -- authz visibility fragment; values bound
             ),
             {
                 "workspace_id": auth.workspace_id,
@@ -890,16 +1121,37 @@ class _GeneratedPack:
 
 
 def generate_pack(
-    session: Session, auth: AuthContext, meeting_id: UUID, meeting_row: dict[str, Any]
+    session: Session,
+    auth: AuthContext,
+    meeting_id: UUID,
+    meeting_row: dict[str, Any],
+    *,
+    filters: _ReadFilters | None = None,
 ) -> _GeneratedPack:
+    """The shared snapshot: what gets stored in ``meeting_packs`` and is
+    served to every reader of the meeting, fingerprinted for staleness and
+    handed to the ``meeting.prep_summary`` enrichment run. Built only from
+    ``workspace``-visible participants and rows (``_Scope`` "shared"), so it
+    never depends on who generated it and never copies anyone's private or
+    explicitly-shared rows (FX1). Each caller's own extra rows are added
+    per request by ``_caller_view``, never stored.
+
+    Evidence follows the same split, but only with the Spec A flag on
+    (T21's evidence filter is flag-gated; flag off, every evidence row is
+    shared exactly as before)."""
     meeting = _meeting_input(session, auth, meeting_row)
-    participants = _fetch_participants(session, auth, meeting_id)
+    filters = filters or _ReadFilters(session, auth)
+    participants = [
+        p
+        for p, shared in _fetch_participant_rows(session, auth, meeting_id, filters=filters)
+        if shared
+    ]
     participant_entity_ids = [p.entity_id for p in participants]
-    timeline = _fetch_timeline(session, auth, participant_entity_ids)
-    commitments = _fetch_commitments(session, auth, participant_entity_ids)
-    notes = _fetch_notes(session, auth, meeting_id)
-    risks = _fetch_risks(session, auth)
-    dependencies = _fetch_dependencies(session, auth, participant_entity_ids)
+    timeline = _fetch_timeline(session, auth, participant_entity_ids, filters=filters)
+    commitments = _fetch_commitments(session, auth, participant_entity_ids, filters=filters)
+    notes = _fetch_notes(session, auth, meeting_id, filters=filters)
+    risks = _fetch_risks(session, auth, filters=filters)
+    dependencies = _fetch_dependencies(session, auth, participant_entity_ids, filters=filters)
     evidence = _fetch_evidence(session, auth, participant_entity_ids)
     content = build_pack(
         meeting, participants, timeline, commitments, notes, risks, dependencies, evidence
@@ -908,6 +1160,163 @@ def generate_pack(
         meeting, participants, timeline, commitments, notes, risks, dependencies, evidence
     )
     return _GeneratedPack(content=content, fingerprint=fingerprint)
+
+
+_LATEST = datetime.max.replace(tzinfo=UTC)
+
+
+class _HasId(Protocol):
+    @property
+    def id(self) -> UUID: ...
+
+
+def _merge_rows[T: _HasId](
+    base: list[T], extra: list[T], *, key: Callable[[T], Any], limit: int, reverse: bool = False
+) -> list[T]:
+    """``base`` plus ``extra`` in the fetcher's own SQL order, capped at its
+    own limit: the top-N of two top-N lists is the top-N of their union, so
+    the result equals one caller-filtered query. An id in both keeps the
+    live (``extra``) row."""
+    if not extra:
+        return base
+    extra_ids = {row.id for row in extra}
+    merged = [row for row in base if row.id not in extra_ids] + extra
+    return sorted(merged, key=key, reverse=reverse)[:limit]
+
+
+def _caller_view(
+    session: Session,
+    auth: AuthContext,
+    meeting_id: UUID,
+    snapshot: PackContentSnapshot,
+    *,
+    filters: _ReadFilters | None = None,
+) -> PackContentSnapshot:
+    """The stored shared snapshot plus the rows only *this* caller may read
+    (``_Scope`` "private": their own private rows, rows explicitly shared
+    with them, and rows about participant nodes only they can see).
+    Computed per request and returned, never persisted and never part of
+    the fingerprint -- so one member's private rows neither reach another
+    member nor flip the shared pack's stale flag. With no such rows (every
+    workspace-only pack) the snapshot is returned unchanged."""
+    filters = filters or _ReadFilters(session, auth)
+    participant_rows = _fetch_participant_rows(session, auth, meeting_id, filters=filters)
+    shared_ids = [p.entity_id for p, shared in participant_rows if shared]
+    private_participants = [p for p, shared in participant_rows if not shared]
+    all_ids = [p.entity_id for p, _shared in participant_rows]
+    timeline = _fetch_timeline(
+        session, auth, all_ids, scope="private", shared_entity_ids=shared_ids, filters=filters
+    )
+    commitments = _fetch_commitments(
+        session, auth, all_ids, scope="private", shared_entity_ids=shared_ids, filters=filters
+    )
+    notes = _fetch_notes(session, auth, meeting_id, scope="private", filters=filters)
+    risks = _fetch_risks(session, auth, scope="private", filters=filters)
+    dependencies = _fetch_dependencies(
+        session, auth, all_ids, scope="private", shared_entity_ids=shared_ids, filters=filters
+    )
+    evidence = _fetch_evidence(
+        session, auth, all_ids, scope="private", shared_entity_ids=shared_ids
+    )
+    if not (
+        private_participants or timeline or commitments or notes or risks or dependencies
+    ) and all(e.evidence_state == "available" for e in evidence):
+        return snapshot
+
+    meeting = MeetingInput(
+        id=meeting_id,
+        title=snapshot.objective,
+        agenda=None,
+        starts_at=snapshot.starts_at,
+        ends_at=snapshot.ends_at,
+        timezone=snapshot.timezone,
+    )
+    extra = _content_to_snapshot(
+        build_pack(
+            meeting,
+            private_participants,
+            timeline,
+            commitments,
+            notes,
+            risks,
+            dependencies,
+            evidence,
+        ),
+        snapshot.enrichment,
+    )
+
+    extra_participant_ids = {p.id for p in extra.participants}
+    participant_order = {p.id: index for index, (p, _shared) in enumerate(participant_rows)}
+
+    def _nullable_last(value: datetime | None) -> tuple[bool, datetime]:
+        return (value is None, value or _LATEST)
+
+    # Notes share one fetch (and one limit) across decisions and general
+    # notes: `created_at DESC, id` -- id ascending within a timestamp, so
+    # sort by id first and then (stably) by created_at descending.
+    decisions, general_notes = snapshot.decisions, snapshot.notes
+    if extra.decisions or extra.notes:
+        by_id = _merge_rows(
+            [*snapshot.decisions, *snapshot.notes],
+            [*extra.decisions, *extra.notes],
+            key=lambda n: n.id,
+            limit=2 * _MAX_NOTES,  # both inputs are already capped at _MAX_NOTES
+        )
+        all_notes = sorted(by_id, key=lambda n: n.created_at, reverse=True)[:_MAX_NOTES]
+        decisions = [n for n in all_notes if n.note_type == "decision"]
+        general_notes = [n for n in all_notes if n.note_type != "decision"]
+    return snapshot.model_copy(
+        update={
+            # One list in the fetch's own `mp.created_at, mp.id` order --
+            # `participant_rows` is exactly that order; a snapshot
+            # participant since unlinked (absent from it) keeps its place
+            # at the end.
+            "participants": sorted(
+                [
+                    *(p for p in snapshot.participants if p.id not in extra_participant_ids),
+                    *extra.participants,
+                ],
+                key=lambda p: participant_order.get(p.id, len(participant_order)),
+            ),
+            "timeline": _merge_rows(
+                snapshot.timeline,
+                extra.timeline,
+                key=lambda t: (t.effective_at, t.id),
+                limit=_MAX_TIMELINE_ENTRIES,
+                reverse=True,
+            ),
+            "commitments": _merge_rows(
+                snapshot.commitments,
+                extra.commitments,
+                key=lambda c: (*_nullable_last(c.due_at), c.id),
+                limit=_MAX_COMMITMENTS,
+            ),
+            "decisions": decisions,
+            "notes": general_notes,
+            "risks": _merge_rows(
+                snapshot.risks,
+                extra.risks,
+                key=lambda r: (*_nullable_last(r.review_at), r.id),
+                limit=_MAX_RISKS,
+            ),
+            "dependencies": _merge_rows(
+                snapshot.dependencies,
+                extra.dependencies,
+                key=lambda d: (*_nullable_last(d.expected_at), d.id),
+                limit=_MAX_DEPENDENCIES,
+            ),
+            # Accepted approximation: each slice caps *evidence rows* at
+            # _MAX_EVIDENCE before non-available ones become gaps, so near
+            # that cap this merge can show more gaps than one capped query
+            # would. It only ever shows rows the caller may read.
+            "evidence_gaps": _merge_rows(
+                snapshot.evidence_gaps,
+                extra.evidence_gaps,
+                key=lambda e: e.id,
+                limit=_MAX_EVIDENCE,
+            ),
+        }
+    )
 
 
 def _content_to_snapshot(content: PackContent, enrichment: EnrichmentOut) -> PackContentSnapshot:
@@ -1016,10 +1425,12 @@ def _is_stale(
     pack_row: dict[str, Any],
     meeting_row: dict[str, Any],
     now: datetime,
+    *,
+    filters: _ReadFilters | None = None,
 ) -> bool:
     if now >= pack_row["stale_at"]:
         return True
-    generated = generate_pack(session, auth, meeting_id, meeting_row)
+    generated = generate_pack(session, auth, meeting_id, meeting_row, filters=filters)
     return generated.fingerprint != dict(pack_row["source_versions"])
 
 
@@ -1251,7 +1662,11 @@ def create_prep(
     now = datetime.now(UTC)
     pack_id = uuid4()
 
-    def _insert_pack(generated: _GeneratedPack, enrichment: EnrichmentOut) -> MeetingPack:
+    def _insert_pack(
+        generated: _GeneratedPack,
+        enrichment: EnrichmentOut,
+        filters: _ReadFilters | None = None,
+    ) -> MeetingPack:
         snapshot = _content_to_snapshot(generated.content, enrichment)
         insert_params = {
             "id": pack_id,
@@ -1299,7 +1714,11 @@ def create_prep(
             if _violated_constraint(exc) != "uq_meeting_packs_active_per_meeting":
                 raise
             raise HTTPException(status_code=409, detail="MEETING_PACK_EXISTS") from exc
-        response = _pack_row_to_response(dict(row), snapshot)
+        # The stored row holds only the shared snapshot; the response (and
+        # the actor-scoped idempotency replay below) is this caller's view.
+        response = _pack_row_to_response(
+            dict(row), _caller_view(session, auth, meeting_id, snapshot, filters=filters)
+        )
         audit_outbox.write_audit_and_outbox(
             session,
             auth,
@@ -1344,9 +1763,10 @@ def create_prep(
                     raise HTTPException(status_code=409, detail="STALE_MEETING_PACK")
                 raise HTTPException(status_code=409, detail="MEETING_PACK_EXISTS")
 
-            generated = generate_pack(session, auth, meeting_id, meeting_row)
+            filters = _ReadFilters(session, auth)
+            generated = generate_pack(session, auth, meeting_id, meeting_row, filters=filters)
             enrichment = EnrichmentOut(available=False, summary=None, error_code="feature_disabled")
-            return _insert_pack(generated, enrichment)
+            return _insert_pack(generated, enrichment, filters)
 
     with held_idempotency_lock(auth, idempotency_key):
         with session.begin():
@@ -1393,8 +1813,9 @@ def get_prep(meeting_id: UUID, auth: AuthDep, session: SessionDep) -> MeetingPac
         # the pack exactly as it was generated (finding #6): the caller
         # sees `status: "stale"` as a signal to call .../prep/refresh, not
         # silently-updated content.
+        filters = _ReadFilters(session, auth)
         if pack_row["status"] == "fresh" and _is_stale(
-            session, auth, meeting_id, pack_row, meeting_row, now
+            session, auth, meeting_id, pack_row, meeting_row, now, filters=filters
         ):
             updated_row = (
                 session.execute(
@@ -1418,7 +1839,9 @@ def get_prep(meeting_id: UUID, auth: AuthDep, session: SessionDep) -> MeetingPac
             )
             pack_row = dict(updated_row)
         snapshot = PackContentSnapshot.model_validate(pack_row["content"])
-        return _pack_row_to_response(pack_row, snapshot)
+        return _pack_row_to_response(
+            pack_row, _caller_view(session, auth, meeting_id, snapshot, filters=filters)
+        )
 
 
 @router.post(
@@ -1477,7 +1900,10 @@ def refresh_prep(
     new_pack_id = uuid4()
 
     def _retire_and_insert(
-        old_id: UUID, generated: _GeneratedPack, enrichment: EnrichmentOut
+        old_id: UUID,
+        generated: _GeneratedPack,
+        enrichment: EnrichmentOut,
+        filters: _ReadFilters | None = None,
     ) -> MeetingPack:
         # Retire the old pack *before* inserting the new one, both in this
         # one transaction: uq_meeting_packs_active_per_meeting (migration
@@ -1531,7 +1957,9 @@ def refresh_prep(
             .mappings()
             .one()
         )
-        response = _pack_row_to_response(dict(row), snapshot)
+        response = _pack_row_to_response(
+            dict(row), _caller_view(session, auth, meeting_id, snapshot, filters=filters)
+        )
         audit_outbox.write_audit_and_outbox(
             session,
             auth,
@@ -1577,11 +2005,12 @@ def refresh_prep(
                 if old is None:
                     raise HTTPException(status_code=404, detail="MEETING_PACK_NOT_FOUND")
 
-                generated = generate_pack(session, auth, meeting_id, meeting_row)
+                filters = _ReadFilters(session, auth)
+                generated = generate_pack(session, auth, meeting_id, meeting_row, filters=filters)
                 enrichment = EnrichmentOut(
                     available=False, summary=None, error_code="feature_disabled"
                 )
-                return _retire_and_insert(old["id"], generated, enrichment)
+                return _retire_and_insert(old["id"], generated, enrichment, filters)
         except IntegrityError as exc:
             if _violated_constraint(exc) != "uq_meeting_packs_active_per_meeting":
                 raise
