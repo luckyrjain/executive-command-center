@@ -72,6 +72,16 @@ def get_prep_pack_tool(
     if meeting_row is None:
         return ToolNotFound(tool="meeting.get_prep_pack")
 
+    # Deliberately the SHARED snapshot (`generate_pack`), never the calling
+    # member's own view (`meeting_prep._caller_view`): this tool's only
+    # consumer is the `meeting.prep_summary` run (its sole `eligible_tools`
+    # entry; `POST /ai/runs` accepts only `attention.explain_item`), and
+    # every such run's output is shared -- `meeting_prep._compute_
+    # enrichment` stores the summary in the pack every meeting reader gets,
+    # and the run itself (summary, cited ids) is a `workspace`-visible
+    # `ai_runs` row. Giving it the caller's private rows would copy them
+    # into both (FX1). A per-member AI view would need its own run type
+    # stored private to that member, not this tool.
     try:
         generated = generate_pack(session, auth, meeting_id, meeting_row)
     except HTTPException:
