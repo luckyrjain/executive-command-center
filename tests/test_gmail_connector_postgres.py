@@ -689,9 +689,14 @@ def test_handle_oauth_callback_revoke_on_reject_hook(
         assert revoked_tokens == (["refresh-1"] if expect_revoke else [])
         assert seen == ([] if hook_mode == "none" else [expected_email])
         if hook_mode == "raises":
-            records = [r for r in caplog.records if r.msg == "gmail_revoke_on_reject_hook_failed"]
+            records = [
+                r
+                for r in caplog.records
+                if r.getMessage().startswith("gmail_revoke_on_reject_hook_failed")
+            ]
             assert len(records) == 1
-            assert records[0].__dict__["error_class"] == "_HookError"
+            # In the rendered message (`JsonFormatter` drops `extra`).
+            assert "error_class=_HookError" in JsonFormatter().format(records[0])
             assert _ALLOWED_EMAIL not in caplog.text
     finally:
         get_settings.cache_clear()
@@ -2207,7 +2212,9 @@ def test_oauth_complete_redirects_with_a_generic_error_when_callback_raises_a_no
     get_settings.cache_clear()
 
     class _BrokenAdapter(GmailAdapter):
-        def handle_oauth_callback(self, code: str, state: str) -> object:
+        def handle_oauth_callback(
+            self, code: str, state: str, *, revoke_on_reject: object = None
+        ) -> object:
             raise RuntimeError("simulated transient failure")
 
     monkeypatch.setattr(
@@ -2251,7 +2258,9 @@ def test_oauth_complete_failure_log_carries_only_a_code_and_exception_class(
     oauth_code = "sensitive-oauth-code-4f1c"
 
     class _LeakyAdapter(GmailAdapter):
-        def handle_oauth_callback(self, code: str, state: str) -> object:
+        def handle_oauth_callback(
+            self, code: str, state: str, *, revoke_on_reject: object = None
+        ) -> object:
             raise RuntimeError(
                 f"Key (external_account_id)=({_ALLOWED_EMAIL}) code={code} state={state}"
             )

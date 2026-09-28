@@ -9,10 +9,10 @@ ownership transfer and delegation create/accept; member removal --
 `identity/membership_removal.py` and `authz.owned_resource_summary` --
 uses the lock key, personal-data predicates and revoke-safety helpers;
 the removal-race writers (S1.11) take the lock key's shared side and
-re-check membership (`require_active_members_locked`); Gmail callback
-identity binding is adopted by a later task. Keeping the
-definitions in one
-place is the point -- the personal-data predicates, the revoke-safety rule
+re-check membership (`require_active_members_locked`); the Gmail
+callback's identity-binding refusal (S1.1) and its adapter reject hook
+(S1.10) use the refusal audit and revoke-safety helpers. Keeping the
+definitions in one place is the point -- the personal-data predicates, the revoke-safety rule
 and the membership-mutation lock key must not drift between call sites.
 
 Logging discipline (Spec A T7): nothing here ever logs or labels an email
