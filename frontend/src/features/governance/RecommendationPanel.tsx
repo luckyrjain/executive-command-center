@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ApiError, apiRequest } from '../../api/client'
 import { apiErrorMessage } from '../../api/errorMessage'
 import type { EvidenceItem } from '../knowledge/types'
+import { EMAIL_CONSENT_NOT_ACTIVE_MESSAGE } from '../personal/errors'
 
 type RecommendationStatus =
   | 'proposed'
@@ -134,6 +135,9 @@ export function recommendationErrorMessage(error: unknown): string {
   return apiErrorMessage(error, {
     VERSION_CONFLICT: 'This recommendation changed while you were reviewing it. The latest version has been reloaded.',
     TARGET_VERSION_CONFLICT: 'This recommendation changed while you were reviewing it. The latest version has been reloaded.',
+    // Confirming an email-derived recommendation re-checks the mailbox
+    // owner's email consent (403 when it was withdrawn).
+    EMAIL_CONSENT_NOT_ACTIVE: `${EMAIL_CONSENT_NOT_ACTIVE_MESSAGE} This recommendation came from email, so it cannot be confirmed until email consent is granted again.`,
   })
 }
 

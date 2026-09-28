@@ -384,6 +384,7 @@ from ecc.domains.personal.gmail_adapter import (
     _GmailHistoryCursor,
 )
 from ecc.domains.personal.gmail_shared import pack_credential
+from ecc.platform.connector_security import EmailConsentInactiveError
 
 settings = get_settings()
 pytestmark = pytest.mark.skipif(
@@ -1034,7 +1035,7 @@ def test_backfill_raises_when_consent_was_never_active(
         raise AssertionError(f"no Gmail call should happen: {request.url}")
 
     adapter = GmailAdapter(transport=httpx.MockTransport(handler))
-    with pytest.raises(RuntimeError, match="consent is not active"):
+    with pytest.raises(EmailConsentInactiveError):
         adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
 
 
@@ -1045,18 +1046,13 @@ def test_backfill_halts_when_consent_is_revoked_mid_window(
     consent as a side effect of fetching the *first* message's metadata --
     the second message must never be fetched or written.
 
-    `next_cursor is None` -- round 11 review: this partial branch is the
-    second of the three sites (in call order: `list_response is None`,
-    then this mid-loop consent-revocation check, then `get_response is
-    None`) that previously handed out an unsafe `next_cursor` computed
-    from `msg-1`'s own `historyId`, which a still-unprocessed `msg-2`
-    could easily have a *lower* `historyId` than (see
-    `test_backfill_partial_next_cursor_does_not_skip_a_lower_
-    history_id_message`'s own docstring for the full mechanism); this
-    test's own scenario doesn't control `msg-2`'s `historyId` at all
-    (it's never fetched), so `next_cursor is None` is the only value this
-    assertion can safely require, but it's exactly the value the round 11
-    fix guarantees regardless of what that unseen `historyId` might be.
+    FX5: the revocation lands after `msg-1`'s unlocked pre-fetch consent
+    check, so `msg-1`'s own write transaction re-checks consent under the
+    connector row lock and refuses: nothing of `msg-1` is written either,
+    and the call stops with `EmailConsentInactiveError` (which
+    `_run_connector_sync` turns into a 403 `EMAIL_CONSENT_NOT_ACTIVE` skip)
+    instead of reporting a partial outcome that includes a message written
+    after consent was withdrawn.
     """
     context, owner_id = seeded_gmail_account
     now_ms = int(datetime.now(UTC).timestamp() * 1000)
@@ -1088,15 +1084,10 @@ def test_backfill_halts_when_consent_is_revoked_mid_window(
 
     adapter._request_with_rate_limit_retry = instrumented  # type: ignore[method-assign]
 
-    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
-    assert outcome.status == "partial"
-    assert outcome.error_summary is not None and "revoked" in outcome.error_summary
-    assert outcome.items_processed == 1
-    assert outcome.next_cursor is None
+    with pytest.raises(EmailConsentInactiveError):
+        adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
 
-    rows = _threads_and_messages(context.workspace_id)
-    assert len(rows) == 1
-    assert rows[0]["external_message_id"] == "msg-1"
+    assert _threads_and_messages(context.workspace_id) == []
 
 
 # --- rate limiting ------------------------------------------------------------
@@ -1662,7 +1653,7 @@ def test_incremental_sync_raises_when_consent_was_never_active(
         raise AssertionError(f"no Gmail call should happen: {request.url}")
 
     adapter = GmailAdapter(transport=httpx.MockTransport(handler))
-    with pytest.raises(RuntimeError, match="consent is not active"):
+    with pytest.raises(EmailConsentInactiveError):
         adapter.incremental_sync(context, "message", "100")
 
 

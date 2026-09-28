@@ -136,6 +136,7 @@ from ecc.observability import (
     record_gmail_refresh_rejected,
 )
 from ecc.platform.connector_security import (
+    EmailConsentInactiveError,
     MembershipInactiveError,
     lock_membership_shared,
     member_is_active,
@@ -150,6 +151,7 @@ from .gmail_shared import (
     email_consent_active,
     normalize_email,
     pack_credential,
+    require_email_consent_locked,
     unpack_credential,
 )
 
@@ -813,6 +815,7 @@ def resolve_or_create_person(
     display_name: str,
     source_ref: str,
     now: datetime,
+    connector_account_id: UUID | None,
 ) -> UUID:
     """Entity-resolution match hierarchy level 3 (`docs/phases/phase-002/
     ENTITY-RESOLUTION-CONTRACT.md`: "Exact normalized workspace-scoped
@@ -834,10 +837,23 @@ def resolve_or_create_person(
     owns the node/alias and the evidence) is still an active member;
     raises `MembershipInactiveError` if not, writing nothing. Sync callers
     let it propagate so the whole sync stops.
+
+    FX5: then, in the same transaction, the owner's `email` consent and a
+    live `gmail` connector under the connector row lock
+    (`require_email_consent_locked`); withdrawn -> `EmailConsentInactiveError`,
+    nothing written, propagated like `MembershipInactiveError`.
+    `connector_account_id` (required: the mailbox's connector) narrows that
+    lock to its row; `None` means owner-wide and must be an explicit choice.
     """
     normalized = normalize_email(email)
     with SessionFactory() as session, session.begin():
         require_active_members_locked(session, workspace_id=workspace_id, users_ids=[owner_id])
+        require_email_consent_locked(
+            session,
+            workspace_id=workspace_id,
+            owner_id=owner_id,
+            connector_account_id=connector_account_id,
+        )
         existing = session.execute(
             text(
                 "SELECT entity_id FROM entity_aliases WHERE workspace_id = :workspace_id "
@@ -1909,7 +1925,10 @@ class GmailAdapter:
             raise RuntimeError("Gmail connector account has no owner_id on record")
         with SessionFactory() as session, session.begin():
             if not email_consent_active(session, account.workspace_id, owner_id):
-                raise RuntimeError("email domain consent is not active")
+                # FX5: one contract for "consent withdrawn" -- the sync is
+                # skipped (403 `EMAIL_CONSENT_NOT_ACTIVE`, run failed, no
+                # outcome writes), never a failed or partial outcome.
+                raise EmailConsentInactiveError
 
         headers = bearer_headers(account.credential)
         now = datetime.now(UTC)
@@ -2017,15 +2036,12 @@ class GmailAdapter:
                 # user to revoke consent mid-call; this bounds how much
                 # further syncing happens after that, to one message's
                 # worth of lag rather than the whole remaining call.
+                # FX5: raises, like the locked re-check in each write -- a
+                # withdrawal mid-sync always ends as the 403 skip, never a
+                # `partial` outcome whose cursor/audit writes would land.
                 with SessionFactory() as session, session.begin():
                     if not email_consent_active(session, account.workspace_id, owner_id):
-                        return SyncOutcome(
-                            resource_type="message",
-                            items_processed=items_processed,
-                            status="partial",
-                            next_cursor=None,
-                            error_summary="email domain consent was revoked mid-sync",
-                        )
+                        raise EmailConsentInactiveError
 
                 get_response = self._request_with_rate_limit_retry(
                     "GET",
@@ -2254,7 +2270,8 @@ class GmailAdapter:
             raise RuntimeError("Gmail connector account has no owner_id on record")
         with SessionFactory() as session, session.begin():
             if not email_consent_active(session, account.workspace_id, owner_id):
-                raise RuntimeError("email domain consent is not active")
+                # FX5: see `_sync_messages`' identical check.
+                raise EmailConsentInactiveError
 
         # Round 13 review: `start_history_id` (this method's own `cursor`
         # argument) may be a plain historyId or a `_GmailHistoryCursor`-
@@ -2465,17 +2482,10 @@ class GmailAdapter:
                         break
                     calls_made += 1
 
+                    # FX5: raises -- see `_sync_messages`' identical check.
                     with SessionFactory() as session, session.begin():
                         if not email_consent_active(session, account.workspace_id, owner_id):
-                            return SyncOutcome(
-                                resource_type="message",
-                                items_processed=items_processed,
-                                status="partial",
-                                next_cursor=str(
-                                    cursor.with_progress(record_history_id, record_stuck_offset)
-                                ),
-                                error_summary="email domain consent was revoked mid-sync",
-                            )
+                            raise EmailConsentInactiveError
 
                     get_response = self._request_with_rate_limit_retry(
                         "GET",
@@ -2786,6 +2796,17 @@ class GmailAdapter:
             # owned by the removed mailbox owner (raises
             # `MembershipInactiveError`, which ends the sync call).
             require_active_members_locked(session, workspace_id=workspace_id, users_ids=[owner_id])
+            # FX5: likewise a consent withdrawal / disconnect that committed
+            # since this call's unlocked per-message pre-check -- re-checked
+            # under the connector row lock the revocation cascade takes
+            # `FOR UPDATE` (raises `EmailConsentInactiveError`, ending the
+            # sync call with nothing written here).
+            require_email_consent_locked(
+                session,
+                workspace_id=workspace_id,
+                owner_id=owner_id,
+                connector_account_id=connector_account_id,
+            )
             thread_id = _upsert_thread(
                 session,
                 workspace_id=workspace_id,
@@ -2864,10 +2885,12 @@ class GmailAdapter:
                         display_name=participant_name,
                         source_ref=source_ref,
                         now=now,
+                        connector_account_id=connector_account_id,
                     )
-                except MembershipInactiveError:
+                except (MembershipInactiveError, EmailConsentInactiveError):
                     # Not a per-participant failure: the mailbox owner was
-                    # removed mid-sync -- stop the whole call (S1.11). Any
+                    # removed mid-sync (S1.11), or their `email` consent
+                    # was withdrawn (FX5) -- stop the whole call. Any
                     # other error (incl. a membership-lock wait hitting the
                     # statement timeout, which wrote nothing) still skips
                     # only this participant below: the message row is
@@ -3259,16 +3282,36 @@ class GmailAdapter:
             # the body was fetched -- shared membership lock first, then the
             # owner's active membership; inactive -> nothing stored.
             lock_membership_shared(session, workspace_id)
-            message_owner_id = session.execute(
+            message_row = session.execute(
                 text(
-                    "SELECT owner_id FROM email_messages "
-                    "WHERE id = :id AND workspace_id = :workspace_id"
+                    "SELECT m.owner_id, t.connector_account_id FROM email_messages m "
+                    "JOIN email_threads t ON t.id = m.thread_id "
+                    "AND t.workspace_id = m.workspace_id "
+                    "WHERE m.id = :id AND m.workspace_id = :workspace_id"
                 ),
                 {"id": message_id, "workspace_id": workspace_id},
-            ).scalar_one_or_none()
-            if message_owner_id is None or not member_is_active(
-                session, workspace_id=workspace_id, users_id=message_owner_id
+            ).one_or_none()
+            message_owner_id = message_row[0] if message_row is not None else None
+            if (
+                message_row is None
+                or message_owner_id is None
+                or not member_is_active(
+                    session, workspace_id=workspace_id, users_id=message_owner_id
+                )
             ):
+                return None
+            # FX5: and the owner's `email` consent may have been withdrawn
+            # while the body was fetched -- re-checked under the connector
+            # row lock the revocation cascade takes; withdrawn -> nothing
+            # stored (the cascade purges the message row itself).
+            try:
+                require_email_consent_locked(
+                    session,
+                    workspace_id=workspace_id,
+                    owner_id=message_owner_id,
+                    connector_account_id=message_row[1],
+                )
+            except EmailConsentInactiveError:
                 return None
             # `AND body IS NULL`: lost a race against another call already
             # fetching this same message's body (e.g. an overlapping

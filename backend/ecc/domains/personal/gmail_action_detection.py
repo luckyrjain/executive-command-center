@@ -36,6 +36,7 @@ from ecc.config import get_settings
 from ecc.database import SessionFactory
 from ecc.domains.engineering.connectors import ConnectorAccountContext
 from ecc.platform.connector_security import (
+    EmailConsentInactiveError,
     MembershipInactiveError,
     member_is_active,
     personal_content_scope,
@@ -66,7 +67,7 @@ from ecc.domains.governance.recommendation_mutations import create_recommendatio
 # `gmail_shared.py`, not `gmail_adapter.py` -- see that module's own
 # docstring.
 from .gmail_adapter import GmailAdapter, owner_id_for_account, resolve_or_create_person
-from .gmail_shared import bearer_headers, email_consent_active
+from .gmail_shared import bearer_headers, email_consent_active, require_email_consent_locked
 
 # Task 5's own, much smaller bound -- deliberately not `_MAX_MESSAGES_PER_
 # CALL`. `connector_accounts.py`'s own module docstring justifies its
@@ -313,6 +314,7 @@ def detect_actions_since(
                 adapter,
                 workspace_id=context.workspace_id,
                 owner_id=owner_id,
+                connector_account_id=context.connector_account_id,
                 message_id=row["id"],
                 thread_id=row["thread_id"],
                 external_message_id=row["external_message_id"],
@@ -320,9 +322,10 @@ def detect_actions_since(
                 headers=headers,
                 ollama_adapter=ollama_adapter,
             )
-        except MembershipInactiveError:
-            # The mailbox owner was removed mid-batch (Spec A S1.11): stop
-            # the whole batch, not just this message.
+        except (MembershipInactiveError, EmailConsentInactiveError):
+            # The mailbox owner was removed mid-batch (Spec A S1.11), or
+            # their `email` consent was withdrawn (FX5): stop the whole
+            # batch, not just this message.
             return
         except Exception:  # noqa: BLE001 -- one message's failure never stops the batch
             continue
@@ -333,6 +336,7 @@ def _detect_action_for_message(
     *,
     workspace_id: UUID,
     owner_id: UUID,
+    connector_account_id: UUID,
     message_id: UUID,
     thread_id: UUID,
     external_message_id: str,
@@ -357,12 +361,21 @@ def _detect_action_for_message(
         display_name=sender,
         source_ref=f"gmail:{external_message_id}",
         now=now,
+        connector_account_id=connector_account_id,
     )
     with SessionFactory() as session, session.begin():
         # Spec A S1.11: shared membership lock + the owner's active
         # membership before the evidence write (raises
         # `MembershipInactiveError`, ending the batch).
         require_active_members_locked(session, workspace_id=workspace_id, users_ids=[owner_id])
+        # FX5: then consent + a live connector under the connector row lock
+        # (raises `EmailConsentInactiveError`, ending the batch).
+        require_email_consent_locked(
+            session,
+            workspace_id=workspace_id,
+            owner_id=owner_id,
+            connector_account_id=connector_account_id,
+        )
         evidence_id = _register_message_evidence(
             session,
             workspace_id=workspace_id,
@@ -389,6 +402,18 @@ def _detect_action_for_message(
         if not member_is_active(session, workspace_id=workspace_id, users_id=owner_id):
             raise MembershipInactiveError
 
+    def consent_guard(locked_session: Session) -> None:
+        # FX5: the run persist and the recommendation insert happen after
+        # the model call -- a consent withdrawal that committed during it
+        # must stop both. Runs inside each of their write transactions,
+        # after the membership (and idempotency) locks, before any write.
+        require_email_consent_locked(
+            locked_session,
+            workspace_id=workspace_id,
+            owner_id=owner_id,
+            connector_account_id=connector_account_id,
+        )
+
     with SessionFactory() as session:
         run = execute_run(
             "email.detect_action",
@@ -403,6 +428,7 @@ def _detect_action_for_message(
             auth=auth,
             ollama_adapter=ollama_adapter,
             require_active_actor=True,
+            write_guard=consent_guard,
         )
         if run.status != "completed" or run.output is None:
             return
@@ -448,4 +474,5 @@ def _detect_action_for_message(
             f"email-detect-action:{external_message_id}",
             visibility=personal_content_scope(owner_id).visibility,
             require_active_actor=True,
+            write_guard=consent_guard,
         )

@@ -868,6 +868,7 @@ def _persist_terminal(
     steps: list[dict[str, Any]],
     input_ref: dict[str, Any],
     require_active_actor: bool = False,
+    write_guard: Callable[[Session], None] | None = None,
 ) -> AiRun:
     completed_at = datetime.now(UTC)
     # Spec A S1.8(a) (`ECC_PERSONAL_DATA_ISOLATION`): an `EMAIL_TASK_TYPES`
@@ -904,6 +905,12 @@ def _persist_terminal(
         require_active_members_locked(
             session, workspace_id=auth.workspace_id, users_ids=[auth.user_id]
         )
+    if write_guard is not None:
+        # FX5 (opt-in; the Gmail action-detection hook's consent re-check):
+        # after the membership lock, before the first write of this
+        # transaction. Raising leaves nothing persisted, like the
+        # membership re-check above.
+        write_guard(session)
     session.execute(
         text(
             """
@@ -1717,11 +1724,15 @@ def execute_run(
     ollama_adapter: OllamaAdapter | None = None,
     cancellation_token: CancellationToken | None = None,
     require_active_actor: bool = False,
+    write_guard: Callable[[Session], None] | None = None,
 ) -> AiRun:
     """`require_active_actor` (Spec A S1.11, default off): the terminal
     persist re-checks the actor's active membership under the shared
     membership lock and raises `MembershipInactiveError` instead of
-    writing -- see `_persist_terminal`."""
+    writing -- see `_persist_terminal`. `write_guard` (FX5, default none):
+    called with the session inside that persist transaction, after the
+    membership lock and before any write; whatever it raises propagates
+    and nothing is persisted."""
     started_at = datetime.now(UTC)
     run_id = uuid4()
 
@@ -1760,6 +1771,7 @@ def execute_run(
             steps=steps or [],
             input_ref=input,
             require_active_actor=require_active_actor,
+            write_guard=write_guard,
         )
 
     port = TASK_PORTS.get(task_type)
@@ -2161,6 +2173,7 @@ def execute_run(
         steps=steps,
         input_ref=input,
         require_active_actor=require_active_actor,
+        write_guard=write_guard,
     )
 
 

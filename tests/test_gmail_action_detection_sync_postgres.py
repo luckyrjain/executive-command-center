@@ -957,7 +957,9 @@ def test_batch_halts_when_consent_is_revoked_mid_batch(
     a call stops further writes -- applies to this write path exactly like
     it already does to `_sync_messages`/`_sync_history`. Revokes consent as
     a side effect of fetching the *first* message's body; a second message
-    must never be fetched afterward.
+    must never be fetched afterward. FX5: the revocation lands between that
+    fetch and its body UPDATE, whose transaction re-checks consent under
+    the connector row lock -- so that body is not stored either.
     """
     monkeypatch.setenv("ECC_EMAIL_ACTION_DETECTION_ENABLED", "true")
     get_settings.cache_clear()
@@ -997,8 +999,8 @@ def test_batch_halts_when_consent_is_revoked_mid_batch(
             f"got {len(fetched_external_ids)} fetches: {fetched_external_ids}"
         )
         fetched = _fetched_message_ids(workspace_id, message_ids)
-        assert len(fetched) == 1, (
-            f"only one message's body may be stored after consent is revoked, got {len(fetched)}"
+        assert fetched == set(), (
+            f"no body may be stored after consent is revoked, got {len(fetched)}"
         )
     finally:
         get_settings.cache_clear()

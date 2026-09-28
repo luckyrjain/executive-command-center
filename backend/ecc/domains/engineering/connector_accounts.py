@@ -166,6 +166,7 @@ from ecc.observability import (
 from ecc.platform import audit_outbox, authz
 from ecc.platform.connector_security import (
     PERSONAL_PROVIDERS,
+    EmailConsentInactiveError,
     MembershipInactiveError,
     integrity_error_log_fields,
     is_unique_violation,
@@ -1404,6 +1405,7 @@ def _save_sync_cursor(
 
 
 _MEMBERSHIP_INACTIVE_RUN_SUMMARY = "sync stopped: workspace membership is no longer active"
+_EMAIL_CONSENT_INACTIVE_RUN_SUMMARY = "sync stopped: email consent is no longer active"
 
 
 def _sync_members(account: ConnectorAccount | None, actor_id: UUID) -> list[UUID]:
@@ -1442,25 +1444,60 @@ def _skip_run_if_membership_inactive(
     lands for them; only the run this sync reserved in phase 1 is closed as
     `failed` (so it does not sit `running` until reaped, blocking the next
     sync), then `SyncSkipped("MEMBERSHIP_INACTIVE", 403)`.
+
+    FX5 round 3: likewise `EmailConsentInactiveError` from phase 3's own
+    locked consent re-check (a Gmail consent withdrawn / connector
+    disconnected after the adapter returned) -> the same skip as a phase-2
+    refusal: run closed `failed`, `SyncSkipped("EMAIL_CONSENT_NOT_ACTIVE",
+    403)`, no outcome/cursor/account/audit write.
     """
     try:
         yield
     except MembershipInactiveError:
-        with SessionFactory() as run_session, run_session.begin():
-            run_session.execute(
-                text(
-                    "UPDATE sync_runs SET status = 'failed', error_summary = :error, "
-                    "completed_at = :now WHERE workspace_id = :workspace_id AND id = :id "
-                    "AND status = 'running'"
-                ),
-                {
-                    "error": _MEMBERSHIP_INACTIVE_RUN_SUMMARY,
-                    "now": datetime.now(UTC),
-                    "workspace_id": workspace_id,
-                    "id": run_id,
-                },
-            )
+        _close_skipped_run(workspace_id, run_id, _MEMBERSHIP_INACTIVE_RUN_SUMMARY)
         raise _membership_inactive_skip(account_id, 3) from None
+    except EmailConsentInactiveError:
+        raise _email_consent_inactive_skip(workspace_id, account_id, run_id, phase=3) from None
+
+
+def _close_skipped_run(workspace_id: UUID, run_id: UUID, summary: str) -> None:
+    """Closes the run a skipped sync reserved in phase 1 as `failed` (so it
+    does not sit `running` until reaped, blocking the next sync) -- the
+    only write a phase-2/3 skip makes."""
+    with SessionFactory() as run_session, run_session.begin():
+        run_session.execute(
+            text(
+                "UPDATE sync_runs SET status = 'failed', error_summary = :error, "
+                "completed_at = :now WHERE workspace_id = :workspace_id AND id = :id "
+                "AND status = 'running'"
+            ),
+            {
+                "error": summary,
+                "now": datetime.now(UTC),
+                "workspace_id": workspace_id,
+                "id": run_id,
+            },
+        )
+
+
+def _email_consent_inactive_skip(
+    workspace_id: UUID, account_id: UUID, run_id: UUID, *, phase: int = 2
+) -> SyncSkipped:
+    """FX5: the adapter's own locked consent re-check refused a phase-2
+    write (`EmailConsentInactiveError`: the mailbox owner's `email` consent
+    was withdrawn, or the connector disconnected, while the sync ran). Like
+    the phase-3 `MEMBERSHIP_INACTIVE` skip: no outcome, cursor, account or
+    audit write and no action detection -- only the reserved run is closed
+    as `failed` -- then `SyncSkipped("EMAIL_CONSENT_NOT_ACTIVE", 403)`
+    (the code `gmail_threads.py` already returns for the same condition)."""
+    _close_skipped_run(workspace_id, run_id, _EMAIL_CONSENT_INACTIVE_RUN_SUMMARY)
+    _logger.info(
+        "connector sync skipped account_id=%s phase=%s code=%s",
+        account_id,
+        phase,
+        EmailConsentInactiveError.code,
+    )
+    return SyncSkipped(EmailConsentInactiveError.code, 403)
 
 
 def _run_connector_sync(
@@ -1543,6 +1580,15 @@ def _run_connector_sync(
         # workspace (callback, syncs, Gmail writes, transfers) queues
         # behind that waiting removal meanwhile. Moving the refresh out of
         # the locked section is Spec B's phase restructuring.
+        #
+        # FX5 known limitation, same root cause: the `FOR UPDATE` on this
+        # connector row (`get_connector_account` below) is also held across
+        # that refresh, and every Gmail write for this connector takes `FOR
+        # KEY SHARE` on the same row (`gmail_shared.require_email_consent_
+        # locked`), which conflicts with it -- a concurrent writer for the
+        # same connector (e.g. an on-demand thread body fetch) waits and can
+        # hit the 5s statement timeout (its write is then refused, nothing
+        # written; retryable). Also resolved by Spec B's restructuring.
         try:
             require_active_members_locked(
                 session, workspace_id=auth.workspace_id, users_ids=[auth.user_id]
@@ -1736,6 +1782,7 @@ def _run_connector_sync(
         credential=credential,
     )
     adapter_failed = False
+    consent_withdrawn = False
     outcome: SyncOutcome | None = None
     failure_summary: str | None = None
     if credential_refresh_error is not None:
@@ -1755,9 +1802,14 @@ def _run_connector_sync(
                 )
             else:
                 outcome = adapter.incremental_sync(context, resource_type, prior_cursor)
+        except EmailConsentInactiveError:
+            consent_withdrawn = True
         except Exception as exc:  # noqa: BLE001 -- classified as a failed sync run, not a crash
             adapter_failed = True
             failure_summary = _sanitize_adapter_error(str(exc))
+
+    if consent_withdrawn:
+        raise _email_consent_inactive_skip(auth.workspace_id, account_id, run_id)
 
     # --- Phase 3: record the outcome, on a fresh connection ---------------
     completed_at = datetime.now(UTC)
@@ -1775,6 +1827,24 @@ def _run_connector_sync(
             workspace_id=auth.workspace_id,
             users_ids=_sync_members(account, auth.user_id),
         )
+        if account.provider == "gmail" and account.owner_id is not None:
+            # FX5 round 3: the outcome, cursor, account and audit writes
+            # below are the Gmail sync's too -- a consent withdrawal /
+            # disconnect that committed after the adapter returned (or
+            # during this transaction) must stop them. Same locked re-check
+            # as every Gmail write, for this connector's row only, after
+            # the membership lock (raises `EmailConsentInactiveError` ->
+            # `_skip_run_if_membership_inactive`'s consent skip). Deferred
+            # import: engineering stays free of a module-level dependency
+            # on the personal domain (see the detection hook below).
+            from ecc.domains.personal.gmail_shared import require_email_consent_locked
+
+            require_email_consent_locked(
+                outcome_session,
+                workspace_id=auth.workspace_id,
+                owner_id=account.owner_id,
+                connector_account_id=account_id,
+            )
         if adapter_failed:
             # `AND status = 'running'`: see the success-path UPDATE's
             # identical comment below -- must not silently overwrite a

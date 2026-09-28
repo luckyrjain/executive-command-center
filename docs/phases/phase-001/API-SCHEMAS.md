@@ -2,8 +2,9 @@
 id: PHASE-001-API-SCHEMAS
 title: Phase 1 API Schemas
 status: Approved for Implementation
-version: 1.0.4
+version: 1.1.0
 owner: Lucky Jain
+updated: 2026-09-28
 ---
 
 # Phase 1 API Schemas
@@ -77,6 +78,7 @@ Standalone meetings require all three API fields. Linked Meeting responses expos
 - Confirming an `operation="create"` recommendation that is personal data (an `email_action_detected` one) with `ECC_PERSONAL_DATA_ISOLATION` on creates its task/commitment/risk owned by the recommendation's owner and `private`; otherwise the created row is the actor's and workspace-visible, as a direct create is. So, with isolation on, a confirmer who is not the recommendation's owner (possible only for a personal recommendation still `workspace`-visible from before the flag) may be unable to read the row they just created, although the confirm response still returns its `target_id`.
 - `POST /recommendations/{id}/publish` requires `expected_version`, is valid only from `proposed`, transitions to `pending_confirmation`, and returns the current recommendation.
 - `POST /recommendations/{id}/confirm` includes expected_recommendation_version and target expected_version. It is valid only from `pending_confirmation`; it atomically transitions to accepted, mutates the local target, transitions to executed, writes audit records and outbox events, then commits.
+- For an `email_action_detected` recommendation only, confirm first re-checks the recommendation owner's `email` domain consent and that they still have a non-disconnected Gmail connector, under the same row locks the Gmail consent-revocation cascade takes (Security Remediation FX5). If consent was withdrawn it returns `403 EMAIL_CONSENT_NOT_ACTIVE` with nothing written (no status change, no target created). A confirm that commits first is redacted by a revocation that follows it. Known limitation: while a Gmail sync of that owner is refreshing its OAuth token (up to 10s), this check can wait past the 5s statement timeout and return a generic `500` with nothing written -- retry after a few seconds.
 - Rejected, expired and superseded recommendations cannot execute.
 - Failures roll back the target and successful state transitions; a separate failed-attempt record may then be written.
 
@@ -94,3 +96,9 @@ Every searched entity type is filtered by the standard read visibility (`authz.v
 Every entity contains id, timestamps, version, archived_at and links.audit. Evidence summaries contain id, source_type, label, captured_at, optional excerpt and access status `available|missing|permission_denied|deleted`.
 
 Status codes: 200 query/update/lifecycle action, 201 create, 400 malformed, 401 unauthenticated, 403 forbidden capability, 404 absent or cross-workspace, 409 version/idempotency/state conflict, 422 validation, 429 throttled and 503 dependency unavailable with fallback metadata where available.
+
+## Changelog
+
+| Version | Date | Summary | Author |
+|---|---|---|---|
+| 1.1.0 | 2026-09-28 | Security Remediation FX5: `POST /recommendations/{id}/confirm` of an `email_action_detected` recommendation re-checks the owner's email consent (`403 EMAIL_CONSENT_NOT_ACTIVE`, nothing written); documented the token-refresh lock-wait limitation (generic `500`, retry after a few seconds) | Lucky Jain |

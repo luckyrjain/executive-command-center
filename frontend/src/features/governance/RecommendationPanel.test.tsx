@@ -94,6 +94,13 @@ describe('recommendation presentation', () => {
     expect(recommendationErrorMessage(conflict)).toContain('latest version has been reloaded')
     expect(recommendationErrorMessage(new Error('Network unavailable'))).toBe('Network unavailable')
   })
+
+  it('explains a confirm refused because email consent was withdrawn', () => {
+    const refused = new ApiError(403, 'EMAIL_CONSENT_NOT_ACTIVE', 'Email Consent Not Active')
+    const message = recommendationErrorMessage(refused)
+    expect(message).toMatch(/^Email consent is not active\./)
+    expect(message).toContain('cannot be confirmed until email consent is granted again')
+  })
 })
 
 const riskRecommendation = {

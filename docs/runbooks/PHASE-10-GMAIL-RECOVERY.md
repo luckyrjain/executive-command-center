@@ -2,9 +2,9 @@
 id: PHASE-10-GMAIL-RECOVERY
 title: Phase 10 Gmail Recovery Runbook
 status: Active
-version: 2.0.0
+version: 2.1.0
 owner: Lucky Jain
-updated: 2026-08-11
+updated: 2026-09-28
 ---
 
 # Phase 10 Gmail Recovery Runbook
@@ -21,12 +21,20 @@ This runbook reflects Phase 10's full engineering scope, Tasks 1-8 (`docs/phases
 
 ## Consent or sync failure
 
-An absent or mid-sync revoked email consent stops further fetch/write work immediately; the sync run records `status: "partial"` with a safe error summary, and existing data is left untouched. `GmailPanel`'s AI-runtime action-detection sync hook (Task 5) re-checks consent per message, not only once at the start of a batch, so a mid-batch revocation cannot process messages after the revocation lands.
+An absent or mid-sync revoked email consent (or a disconnected Gmail connector) stops further fetch/write work immediately: the sync returns `403 EMAIL_CONSENT_NOT_ACTIVE`, the reserved sync run is recorded `status: "failed"` with `error_summary` "sync stopped: email consent is no longer active", the cursor is not advanced, and no outcome, connector-status, or `connector_account.synced`/`sync_failed` audit is written. Every Gmail write (messages, person/evidence resolution, body storage, action-detection evidence, AI run, recommendation, and confirming an `email_action_detected` recommendation) re-checks consent under row locks that the revocation cascade also takes, so no write lands after a revocation commits; a write that committed first is purged by the cascade. `GmailPanel`'s AI-runtime action-detection sync hook (Task 5) re-checks consent per message, not only once at the start of a batch, so a mid-batch revocation cannot process messages after the revocation lands.
 
 For an expired history cursor, rate limit, provider outage, or partial sync, retain the recorded cursor and projections, correct authorization/availability, and retry through the normal manual sync endpoint (`incremental_sync` resumes from the stored cursor; a genuinely expired cursor falls back to a fresh backfill, matching every other connector in this system). A real-account recovery exercise remains **Unsupported — production blocker** (PR-006) until it runs against real GitHub/GitLab/Jira/Datadog/Gmail accounts with revoke verification at each provider. Connector-key rotation/re-encryption is likewise unsupported; see PR-004 (connector credentials) and PR-005 (the personal-data key `email_threads`/`email_messages` bodies are encrypted under).
 
 The consent revocation cascade described above (Supported operator action 5) is fully implemented and covered by extensive automated tests -- including concurrent-revoke races, cross-owner isolation, and idempotency-key replay -- but real-account end-to-end verification (Google-side revocation confirmed, backup-window evidence) remains **Unsupported — production blocker** (PR-008) until that evidence exists. Treat any Gmail data in a deployment as sensitive until PR-008 closes.
 
+Known limitation (FX5): a manual sync holds the Gmail connector row locked while it refreshes an expired OAuth access token (up to 10s). Anything that re-checks consent for that connector or owner in the meantime -- another Gmail write, an on-demand thread body fetch, or confirming an `email_action_detected` recommendation (`POST /api/v1/recommendations/<id>/confirm`) -- waits on that lock and can hit the 5s statement timeout, returning a generic `500` with nothing written. It is safe to retry after a few seconds. Moving the refresh out of the locked section is planned (Spec B).
+
 ## Evidence to retain
 
 Record connector and sync-run IDs, consent state (not consent content), timestamps, safe error code, whether Google-side revocation was verified, thread/message counts without message content, and reviewer. Never retain email addresses, subjects, message IDs, headers, tokens, or OAuth codes in public artifacts.
+
+## Changelog
+
+| Version | Date | Summary | Author |
+|---|---|---|---|
+| 2.1.0 | 2026-09-28 | Security Remediation FX5: a revoked/absent email consent now ends a sync as `403 EMAIL_CONSENT_NOT_ACTIVE` with the run `failed` and the cursor not advanced (was `partial`); every Gmail write, including recommendation confirm, re-checks consent under the cascade's locks; added the token-refresh lock-wait known limitation | Lucky Jain |
