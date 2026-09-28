@@ -476,34 +476,77 @@ def test_sync_run_written_by_another_member_is_reowned_to_connector_owner(
     assert _owner_vis("sync_runs", run_id_by_a) == (world.b.user_id, "private")
 
 
-def test_email_run_not_owned_by_its_mailbox_owner_is_reported_and_left_unchanged(
+def test_unverified_owner_rows_are_made_private_with_their_owner_reported_and_restorable(
     world: GmailSyncWorld,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     run_ids: list[UUID],
 ) -> None:
-    run = world.b.ai_run_ids[0]
-    with engine.begin() as conn:  # simulated: owner is no longer the actor
+    """The three `owner_not_mailbox_owner` guards -- an email run whose owner
+    is not its actor, an email run whose `input_ref` thread is another
+    member's, a recommendation citing Gmail evidence (F1) of another owner:
+    each row becomes private with its CURRENT owner, is reported, and its
+    steps follow it. (`connector_owner_unknown` is unreachable: the personal
+    predicate requires the connector row, whose `owner_id` is NOT NULL.)"""
+    a, b, ws = world.a, world.b, world.workspace_id
+    transferred_run, foreign_thread_run = b.ai_run_ids[0], b.ai_run_ids[1]
+    rec = b.recommendation_ids[0]
+    a_only, _collide = _messages(world, "a")
+    a_evidence = a.evidence_ids_by_source_ref[f"gmail:detect_action:{a_only}"][0]
+    with engine.begin() as conn:  # simulated states, one per guard
         conn.execute(
             text("UPDATE ai_runs SET owner_id = :a WHERE id = :id"),
-            {"a": world.a.user_id, "id": run},
+            {"a": a.user_id, "id": transferred_run},
         )
+        conn.execute(
+            text(
+                "UPDATE ai_runs SET input_ref = jsonb_set(input_ref, '{thread_id}', "
+                "to_jsonb(CAST(:t AS text))) WHERE id = :id"
+            ),
+            {"t": str(a.email_thread_ids[0]), "id": foreign_thread_run},
+        )
+        conn.execute(
+            text(
+                "UPDATE recommendations SET evidence_ids = ARRAY[CAST(:e AS uuid)] WHERE id = :id"
+            ),
+            {"e": a_evidence, "id": rec},
+        )
+    expected = {
+        ("ai_runs", transferred_run): a.user_id,
+        ("ai_runs", foreign_thread_run): b.user_id,
+        ("recommendations", rec): b.user_id,
+    }
+    before = _snapshot(ws)
+    for key, owner in expected.items():
+        assert before[key] == (owner, "workspace")
+
     _flag_on(monkeypatch)
-    code, rows, _err, _ = _run(capsys, run_ids, "--workspace-id", str(world.workspace_id))
-    assert code == backfill.EXIT_UNRESOLVED
-    assert _unresolved(rows)[("ai_runs", run)] == "owner_not_mailbox_owner"
-    assert _owner_vis("ai_runs", run) == (world.a.user_id, "workspace")
-    # Its steps are not re-owned to the unverified parent owner: they stay
-    # as written (the original user, workspace) and are reported too.
+    code, rows, err, run_id = _run(capsys, run_ids, "--workspace-id", str(ws))
+    assert code == backfill.EXIT_UNRESOLVED, err
+    assert run_id is not None
+    unresolved = _unresolved(rows)
+    for key, owner in expected.items():
+        assert _owner_vis(*key) == (owner, "private")
+        assert unresolved[key] == "owner_not_mailbox_owner"
     with engine.begin() as conn:
         steps = conn.execute(
-            text("SELECT id, owner_id, visibility FROM ai_run_steps WHERE run_id = :id"),
-            {"id": run},
+            text(
+                "SELECT id, run_id, owner_id, visibility FROM ai_run_steps WHERE run_id = ANY(:ids)"
+            ),
+            {"ids": [transferred_run, foreign_thread_run]},
         ).all()
-    assert steps
-    assert {(s[1], s[2]) for s in steps} == {(world.bystander_user_id, "workspace")}
-    for step in steps:
-        assert _unresolved(rows)[("ai_run_steps", step[0])] == "owner_not_mailbox_owner"
+    assert {s[1] for s in steps} == {transferred_run, foreign_thread_run}
+    for step_id, parent, owner, visibility in steps:
+        assert (owner, visibility) == (expected[("ai_runs", parent)], "private")
+        assert unresolved[("ai_run_steps", step_id)] == "owner_not_mailbox_owner"
+
+    # Restore's compare-and-set rebuilds the same target: all round-trip.
+    monkeypatch.delenv(_FLAG)
+    get_settings.cache_clear()
+    code, restore_rows, err, _ = _run(capsys, run_ids, "--restore", str(run_id))
+    assert code == backfill.EXIT_CLEAN, err
+    assert _unresolved(restore_rows) == {}
+    assert _snapshot(ws) == before
 
 
 def test_grants_on_unresolved_rows_are_revoked_and_the_rows_otherwise_left_alone(
@@ -541,8 +584,11 @@ def test_grants_on_unresolved_rows_are_revoked_and_the_rows_otherwise_left_alone
     assert unresolved[("recommendations", rec)] == "owner_not_mailbox_owner"
     log = _log_rows(run_id)
     for key, current in before.items():
-        assert _owner_vis(*key) == current  # only the grant went
         assert log[key] == (current[1], current[0], 1)
+    # Evidence (F1 unresolved): only the grant went. Recommendation: made
+    # private, its current owner kept.
+    assert _owner_vis("pkos_evidence", evidence) == before[("pkos_evidence", evidence)]
+    assert _owner_vis("recommendations", rec) == (world.a.user_id, "private")
     assert _counts(rows) == _counts(dry_rows)
 
     code, rows2, _err, run_id2 = _run(capsys, run_ids, "--workspace-id", str(ws))

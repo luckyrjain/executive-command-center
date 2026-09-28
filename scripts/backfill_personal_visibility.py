@@ -21,7 +21,10 @@ Per-table rules (a row is changed only when it is not already
     connector_accounts   owner unchanged, `private`.
     sync_runs,           owner = the personal connector's owner (flag-off
     sync_cursors         rows may be owned by the member who ran the sync),
-                         `private`.
+                         `private`. (If the connector owner could not be
+                         read: `private`, current owner, reported
+                         `connector_owner_unknown` -- unreachable today,
+                         `connector_accounts.owner_id` is NOT NULL.)
     attention_items      (`entity_type='email_thread'`) owner = the thread's
                          `email_threads.owner_id` (the value the attention
                          writer copies; kept as-is if the thread is gone),
@@ -31,16 +34,19 @@ Per-table rules (a row is changed only when it is not already
                          `created_by` (the detect-action hook creates as the
                          mailbox owner), and no cited `gmail_sync` evidence
                          resolves (rule below) to a different owner.
-                         Otherwise unchanged + reported.
+                         Otherwise made `private` with its CURRENT owner and
+                         reported (`owner_not_mailbox_owner`).
     ai_runs              (`email.*` task types) owner unchanged, `private` --
                          only if the owner is the mailbox owner: `actor_id`
                          (email tasks read only the actor's own mailbox), and
                          the `input_ref` thread, when it still exists, is
-                         owned by that actor. Otherwise unchanged + reported.
+                         owned by that actor. Otherwise made `private` with
+                         its CURRENT owner and reported
+                         (`owner_not_mailbox_owner`).
     ai_run_steps         (of an email run) follow the parent run's decision:
-                         owner and visibility of the parent's target; a step
-                         whose parent is unresolved is itself left unchanged
-                         and reported with the parent's reason.
+                         the parent's target owner, `private`; a step of a
+                         reported parent is reported with the parent's
+                         reason too.
     pkos_evidence        (`gmail_sync`) Evidence owner rule (F1): for
                          `source_ref` `gmail:<id>` / `gmail:detect_action:
                          <id>`, the distinct owners of `<id>` across
@@ -87,11 +93,14 @@ Unresolved reasons (CSV `reason`) -- meaning -> operator action:
                                visible, so review is optional.)
     owner_not_mailbox_owner    an email recommendation / ai run (and the
                                run's steps) is owned by someone other than
-                               its mailbox owner (e.g. an ownership transfer)
-                               -> investigate; re-own + make private, or
-                               accept.
-    connector_owner_unknown    a run/cursor whose connector has no owner
-                               (should not happen) -> investigate.
+                               its mailbox owner (e.g. an ownership transfer,
+                               or cited evidence / thread of another owner).
+                               Made private with its current owner -> fix
+                               the owner manually (or accept).
+    connector_owner_unknown    a run/cursor whose connector owner could not
+                               be read (unreachable today). Made private
+                               with its current owner -> fix the owner
+                               manually.
     changed_since_backfill     (restore) the row no longer holds what the
                                backfill set -> expected; no action, or
                                restore manually.
@@ -199,7 +208,8 @@ CLI usage -- from a repository checkout, pointing at the target database:
 
 `ECC_DATABASE_URL` must be set explicitly (no `.env`/default fallback). Output:
 CSV on stdout -- one `count` record per table and one `unresolved` record per
-row left unchanged (ids and code-defined reasons only, never content); the
+reported row -- left unchanged, or made private with an unverified owner (ids
+and code-defined reasons only, never content); the
 run id, target host/port/database name (never credentials) and a summary on
 stderr. Exit codes: 0 done, nothing unresolved; 1 done, unresolved rows
 reported; 2 error (flag/env/argument/workspace errors, or a database error --
@@ -359,6 +369,9 @@ def _batch_sql(table: str, *, lock: bool) -> str:
 class Target:
     owner_id: UUID
     visibility: str
+    # Set when the row is still changed (made private, owner kept) but must
+    # also be reported: its owner could not be verified as the mailbox owner.
+    reason: Reason | None = None
 
 
 @dataclass(frozen=True)
@@ -456,7 +469,7 @@ def _ai_run_decisions(
             mailbox_owner
         )
         if row["owner_id"] != mailbox_owner or contradicted:
-            decisions[row["id"]] = Unresolved("owner_not_mailbox_owner")
+            decisions[row["id"]] = Target(row["owner_id"], "private", "owner_not_mailbox_owner")
         else:
             decisions[row["id"]] = Target(mailbox_owner, "private")
     return decisions
@@ -472,7 +485,9 @@ def _decide(
             r["id"]: (
                 Target(r["mailbox_owner"], "private")
                 if r["mailbox_owner"] is not None
-                else Unresolved("connector_owner_unknown")
+                # Defensive; unreachable today: the personal predicate needs
+                # the connector row, whose `owner_id` is NOT NULL.
+                else Target(r["owner_id"], "private", "connector_owner_unknown")
             )
             for r in rows
         }
@@ -529,7 +544,7 @@ def _recommendation_decisions(
             if isinstance(resolved, UUID) and resolved != mailbox_owner:
                 contradicted = True
         if r["owner_id"] != mailbox_owner or contradicted:
-            decisions[r["id"]] = Unresolved("owner_not_mailbox_owner")
+            decisions[r["id"]] = Target(r["owner_id"], "private", "owner_not_mailbox_owner")
         else:
             decisions[r["id"]] = Target(mailbox_owner, "private")
     return decisions
@@ -718,6 +733,11 @@ def _process_batch(
                 keep = Target(r["owner_id"], r["visibility"])
                 changes.append(_Change(r["id"], r["owner_id"], r["visibility"], keep, n_grants))
             continue
+        if decision.reason is not None:  # made private (owner kept) AND reported
+            stats.unresolved += 1
+            report.unresolved.append(
+                UnresolvedRow(table, workspace_id, r["id"], decision.reason, n_grants)
+            )
         if (r["owner_id"], r["visibility"]) != (decision.owner_id, decision.visibility) or n_grants:
             changes.append(_Change(r["id"], r["owner_id"], r["visibility"], decision, n_grants))
     stats.changed += len(changes)
