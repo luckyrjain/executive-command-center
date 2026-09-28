@@ -132,6 +132,7 @@ from ecc.domains.engineering.connectors import (
 from ecc.observability import (
     GmailRefreshRejectedError,
     GmailRefreshSinceReconnect,
+    record_connector_revoke,
     record_gmail_refresh_rejected,
 )
 from ecc.platform.connector_security import (
@@ -1725,7 +1726,20 @@ class GmailAdapter:
                 raise AdapterAuthorizationError("Gmail account is not on the internal allowlist")
         except Exception:
             if self._should_revoke_on_reject(revoke_on_reject, resolved_email):
-                self._revoke_best_effort(refresh_token or "")
+                revoked = self._revoke_best_effort(refresh_token or "")
+                if revoke_on_reject is not None:
+                    # Counted only on the hooked (router) path: the hook
+                    # itself counts `skipped_unsafe` when it says no. A
+                    # metric failure must never replace the rejection.
+                    try:
+                        record_connector_revoke(
+                            "gmail", "adapter_callback", "ok" if revoked else "error"
+                        )
+                    except Exception as metric_exc:  # noqa: BLE001
+                        _logger.warning(
+                            "gmail_revoke_metric_failed: error_class=%s",
+                            type(metric_exc).__name__,
+                        )
             raise
 
         credential = pack_credential(
@@ -3123,13 +3137,13 @@ class GmailAdapter:
         try:
             return revoke_on_reject(email) is True
         except Exception as exc:
+            # In the message text: `JsonFormatter` drops `extra` keys.
             _logger.warning(
-                "gmail_revoke_on_reject_hook_failed",
-                extra={"error_class": type(exc).__name__},
+                "gmail_revoke_on_reject_hook_failed: error_class=%s", type(exc).__name__
             )
             return False
 
-    def _revoke_best_effort(self, refresh_token: str) -> None:
+    def _revoke_best_effort(self, refresh_token: str) -> bool:
         """Shared by `disconnect` and the single `try/except` guarding
         every post-token-exchange rejection branch inside `handle_oauth_
         callback` (see that method's own comment) -- each obtains a real,
@@ -3144,12 +3158,16 @@ class GmailAdapter:
         rejection branches individually was itself a second review-found
         gap, closed by switching to the single-guard shape instead), not
         the original implementation.
+
+        Returns False only when the `/revoke` request itself failed at the
+        transport level (the revoke-metric `error` result); Google's own
+        reply is not inspected.
         """
         try:
             self._oauth_client.post("/revoke", data={"token": refresh_token})
         except httpx.HTTPError:
-            pass
-        return None
+            return False
+        return True
 
     # -- Task 5: proactive action detection -- not part of either Protocol,
     # same "Gmail-specific, called only from `sync_connector_endpoint`'s
