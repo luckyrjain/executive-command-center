@@ -35,6 +35,12 @@ disappear; C is report-only (superseded by the S1.8(b) backfill). So on a
 re-run, filter by `check` and `row_status`: A/E are remediated when every
 row is `disconnected`; B/D rows are remediated when the connector they name
 is `disconnected` (identity_mismatch=true) or its review is recorded.
+Remediate with `scripts/remediate_connector_ownership.py` (it takes this
+CSV as input): it disconnects A/E rows (and mismatched B/D connectors)
+without purging, and records B/D reviews as
+`connector_ownership.review_recorded` audit events (this audit does not
+read those events; the remediation command's re-run reports them as
+`already_recorded`).
 
 Read-only guarantees: one `REPEATABLE READ, READ ONLY` transaction (a
 consistent snapshot across all five checks) that is always rolled back; no
@@ -382,16 +388,36 @@ def readonly_connection(database_url: str) -> Iterator[Connection]:
         engine.dispose()
 
 
-def run_checks(conn: Connection, *, workspace_id: UUID | None = None) -> list[Finding]:
-    params: dict[str, object] = {
+_CHECK_FUNCTIONS: Final = {
+    "A": _check_a,
+    "B": _check_b,
+    "C": _check_c,
+    "D": _check_d,
+    "E": _check_e,
+}
+
+
+def _params(workspace_id: UUID | None) -> dict[str, object]:
+    return {
         **_personal_data_set()[1],
         "workspace_id": workspace_id,
         "eval_provider": _EVALUATION_PROVIDER,
         "eval_display_name": _EVALUATION_DISPLAY_NAME,
         "eval_prefix": _EVALUATION_EXTERNAL_ID_PREFIX,
     }
+
+
+def run_check(conn: Connection, check: str, *, workspace_id: UUID | None = None) -> list[Finding]:
+    """One check's findings (`check` is a key of `CHECKS`). Also used by
+    `scripts/remediate_connector_ownership.py` to re-verify, under its row
+    lock, that a row it is asked to remediate is still flagged."""
+    return sorted(_CHECK_FUNCTIONS[check](conn, _params(workspace_id)))
+
+
+def run_checks(conn: Connection, *, workspace_id: UUID | None = None) -> list[Finding]:
+    params = _params(workspace_id)
     findings: list[Finding] = []
-    for check in (_check_a, _check_b, _check_c, _check_d, _check_e):
+    for check in _CHECK_FUNCTIONS.values():
         findings.extend(check(conn, params))
     return sorted(findings)
 
