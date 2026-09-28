@@ -56,6 +56,7 @@ from .authz import (
 )
 from .connector_security import (
     is_personal_resource,
+    lock_membership_shared,
     personal_data_isolation_enabled,
     personal_data_share_guard,
     refuse_personal_data_share,
@@ -753,6 +754,14 @@ def create_ownership_transfer_endpoint(
         personal_data_share_guard(auth, request, path="transfer", resource_id=payload.resource_id),
         session.begin(),
     ):
+        # Spec A S1.11 / plan N15(2): shared membership lock before any row
+        # lock (lock order: membership -> rows), so the recipient's (and
+        # the caller's) active-membership checks below cannot be
+        # invalidated by a removal committing before this transfer does --
+        # a removal of the recipient either committed first (-> 404
+        # RECIPIENT_NOT_FOUND below, nothing changed) or waits for this
+        # transaction and then sees the transferred resource as owned.
+        lock_membership_shared(session, auth.workspace_id)
         # Locked FIRST, authorized against the locked value second -- see
         # `_load_resource_for_update`'s own docstring. Two concurrent
         # transfers of the same resource are now fully serialized: the

@@ -40,6 +40,7 @@ from ecc.platform import authz
 from ecc.platform.connector_security import (
     EMAIL_RECOMMENDATION_TYPE,
     personal_derived_row_scope,
+    require_active_members_locked,
 )
 
 router = APIRouter(prefix="/api/v1/recommendations", tags=["recommendations"])
@@ -88,6 +89,7 @@ def create_recommendation(
     idempotency_key: str,
     *,
     visibility: Literal["workspace", "private"] = "workspace",
+    require_active_actor: bool = False,
 ) -> RecommendationResponse:
     """`generate_recommendation`'s full body, factored out so a non-HTTP
     caller can create a recommendation the exact same way `POST /api/v1/
@@ -118,6 +120,15 @@ def create_recommendation(
     validate_action(payload.target_type, payload.proposed_action)
     is_create = payload.proposed_action.get("operation") == "create"
     digest = request_hash(payload, "generate")
+    if require_active_actor:
+        # Spec A S1.11 (opt-in; the Gmail action-detection hook): the role
+        # check above is not locked -- re-check the actor (the mailbox
+        # owner, who owns the row) under the shared membership lock, taken
+        # before `_start`'s idempotency lock (lock order: membership ->
+        # idempotency -> rows). Inactive -> `MembershipInactiveError`.
+        require_active_members_locked(
+            session, workspace_id=auth.workspace_id, users_ids=[auth.user_id]
+        )
     cached = _start(session, auth, idempotency_key, digest)
     if cached is not None:
         return cached

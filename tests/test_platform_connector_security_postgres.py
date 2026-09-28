@@ -1176,25 +1176,32 @@ def test_member_removal_waits_on_the_helper_lock_key() -> None:
             worker = threading.Thread(target=remove)
             worker.start()
             waiting = False
-            deadline = time.monotonic() + 10
-            while time.monotonic() < deadline and not waiting:
-                waiting = bool(
-                    holder.execute(
-                        text(
-                            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' "
-                            "AND NOT granted AND ((classid::bigint << 32) | objid::bigint) "
-                            "= hashtextextended(:k, 0))"
-                        ),
-                        {"k": key},
-                    ).scalar_one()
-                )
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and not waiting:
+                    waiting = bool(
+                        holder.execute(
+                            text(
+                                "SELECT EXISTS (SELECT 1 FROM pg_locks "
+                                "WHERE locktype = 'advisory' AND NOT granted "
+                                "AND ((classid::bigint << 32) | objid::bigint) "
+                                "= hashtextextended(:k, 0))"
+                            ),
+                            {"k": key},
+                        ).scalar_one()
+                    )
+                    holder.commit()
+                    if not waiting:
+                        time.sleep(0.05)
+                assert "response" not in result
+            finally:
+                # Release before the TestClient exits (even when an assert
+                # above failed), so the blocked request can finish and the
+                # worker is always joined.
+                holder.execute(text("SELECT pg_advisory_unlock_all()"))
                 holder.commit()
-                if not waiting:
-                    time.sleep(0.05)
-            assert "response" not in result
-            holder.execute(text("SELECT pg_advisory_unlock(hashtextextended(:k, 0))"), {"k": key})
-            holder.commit()
-            worker.join(timeout=10)
+                worker.join(timeout=15)
+            assert not worker.is_alive()
         assert waiting, "removal never waited on membership_mutation_lock_key's lock"
         assert result["response"].status_code == 404, result["response"].text
     finally:

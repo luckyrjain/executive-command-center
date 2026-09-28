@@ -8,7 +8,9 @@ Gmail revocation cascade) are adopted; the personal-data share refusal
 ownership transfer and delegation create/accept; member removal --
 `identity/membership_removal.py` and `authz.owned_resource_summary` --
 uses the lock key, personal-data predicates and revoke-safety helpers;
-Gmail callback identity binding is adopted by a later task. Keeping the
+the removal-race writers (S1.11) take the lock key's shared side and
+re-check membership (`require_active_members_locked`); Gmail callback
+identity binding is adopted by a later task. Keeping the
 definitions in one
 place is the point -- the personal-data predicates, the revoke-safety rule
 and the membership-mutation lock key must not drift between call sites.
@@ -25,7 +27,7 @@ keys never reach production logs.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -601,6 +603,45 @@ def personal_data_share_guard(
 # ---------------------------------------------------------------------------
 
 
+# Spec A S1.11 (removal race, threat T8). Member removal and role change
+# (`identity/membership_removal.py`) take this key EXCLUSIVELY; every write
+# path that persists rows owned by a member takes it SHARED
+# (`lock_membership_shared`) and then re-checks that member's active
+# membership (`member_is_active`) in the same transaction. A removal that
+# commits first is therefore seen by the re-check; one that starts later
+# waits for the writer to commit, and then sees (and disconnects /
+# re-owns / blocks on) whatever the writer wrote. Holders of the shared
+# lock never make network calls while holding it, with one accepted,
+# documented exception: sync phase 1 holds this workspace-wide shared lock
+# across `ensure_fresh_credential` (an OAuth token-endpoint POST when the
+# access token has expired, up to 10s). A concurrent removal / role change
+# waits on it and can fail with a 500 once the wait exceeds
+# `ecc.database.STATEMENT_TIMEOUT_MS` (5s; retryable), and other
+# shared-lock writers queue behind that waiting exclusive request in the
+# meantime. Moving the refresh out of the locked section is Spec B work.
+#
+# Lock ordering (normative; no path may take these in another order, or
+# removal and a writer can deadlock):
+#
+#   1. membership advisory lock (this key; exclusive in removal/role
+#      change, shared everywhere else)
+#   2. idempotency advisory lock (`platform/idempotency.lock_idempotency`;
+#      sync phase 1 only)
+#   3. row locks (`SELECT ... FOR UPDATE`, UPDATE, unique-index inserts)
+#
+# Adopters, each taking the lock as the FIRST statement of its
+# transaction: removal + role change (exclusive); Gmail OAuth callback
+# write txn (`personal/gmail_oauth.py`); connector sync phases 1 and 3
+# (`engineering/connector_accounts._run_connector_sync`); Gmail sync
+# phase-2 writes (`personal/gmail_adapter._process_message`,
+# `resolve_or_create_person`, `fetch_and_store_body`); action detection's
+# evidence write (`personal/gmail_action_detection`) and, opt-in via
+# `require_active_actor=True`, its `ai_runs`/`ai_run_steps` persist
+# (`ai_runtime/runtime._persist_terminal`) and recommendation insert
+# (`governance/recommendation_mutations.create_recommendation`, before its
+# idempotency lock); ownership transfer (`platform/authz_grants`).
+
+
 def membership_mutation_lock_key(workspace_id: UUID) -> str:
     """The advisory-lock key string `identity/membership_removal.py` uses
     for its exclusive membership-mutation lock (both its role-change and
@@ -609,3 +650,55 @@ def membership_mutation_lock_key(workspace_id: UUID) -> str:
     cannot drift from removal's.
     """
     return f"membership-mutation:{workspace_id}"
+
+
+class MembershipInactiveError(Exception):
+    """A write path re-checked, under the shared membership lock, that the
+    member who would own the rows is no longer an active member of the
+    workspace (removed mid-flight, Spec A S1.11). Carries no identifiers.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("MEMBERSHIP_INACTIVE")
+
+
+def lock_membership_shared(session: Session, workspace_id: UUID) -> None:
+    """Take the SHARED side of the membership-mutation advisory lock for
+    the rest of `session`'s current transaction. Must be the first lock the
+    transaction takes (see the lock-ordering note above)."""
+    session.execute(
+        text("SELECT pg_advisory_xact_lock_shared(hashtextextended(:lock_key, 0))"),
+        {"lock_key": membership_mutation_lock_key(workspace_id)},
+    )
+
+
+def member_is_active(session: Session, *, workspace_id: UUID, users_id: UUID) -> bool:
+    """`users.account_id` -> `workspace_memberships(workspace_id,
+    account_id)` with `status = 'active'` (Spec A S1.11 / delta F7).
+    Read-only; call after `lock_membership_shared` for a race-free answer.
+    """
+    return bool(
+        session.execute(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM users u "
+                "JOIN workspace_memberships wm "
+                "ON wm.workspace_id = u.workspace_id AND wm.account_id = u.account_id "
+                "WHERE u.id = :users_id AND u.workspace_id = :workspace_id "
+                "AND wm.status = 'active')"
+            ),
+            {"users_id": users_id, "workspace_id": workspace_id},
+        ).scalar_one()
+    )
+
+
+def require_active_members_locked(
+    session: Session, *, workspace_id: UUID, users_ids: Iterable[UUID]
+) -> None:
+    """`lock_membership_shared` + `member_is_active` for each of
+    `users_ids`; raises `MembershipInactiveError` if any is inactive. The
+    caller's transaction keeps the shared lock until it ends, so no removal
+    can commit between this check and the caller's writes."""
+    lock_membership_shared(session, workspace_id)
+    for users_id in dict.fromkeys(users_ids):
+        if not member_is_active(session, workspace_id=workspace_id, users_id=users_id):
+            raise MembershipInactiveError

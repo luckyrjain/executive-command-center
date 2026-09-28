@@ -134,7 +134,14 @@ from ecc.observability import (
     GmailRefreshSinceReconnect,
     record_gmail_refresh_rejected,
 )
-from ecc.platform.connector_security import personal_content_scope, personal_knowledge_owner
+from ecc.platform.connector_security import (
+    MembershipInactiveError,
+    lock_membership_shared,
+    member_is_active,
+    personal_content_scope,
+    personal_knowledge_owner,
+    require_active_members_locked,
+)
 
 from .crypto import encrypt_field
 from .gmail_shared import (
@@ -820,9 +827,16 @@ def resolve_or_create_person(
     call, or two concurrent sync calls, naming the same participant for
     the first time) only ever risks re-running *this* function, never
     rolling back an unrelated message write alongside it.
+
+    Spec A S1.11 / plan N15(1): the transaction first takes the shared
+    membership lock and re-checks that `owner_id` (the mailbox owner, who
+    owns the node/alias and the evidence) is still an active member;
+    raises `MembershipInactiveError` if not, writing nothing. Sync callers
+    let it propagate so the whole sync stops.
     """
     normalized = normalize_email(email)
     with SessionFactory() as session, session.begin():
+        require_active_members_locked(session, workspace_id=workspace_id, users_ids=[owner_id])
         existing = session.execute(
             text(
                 "SELECT entity_id FROM entity_aliases WHERE workspace_id = :workspace_id "
@@ -2753,6 +2767,11 @@ class GmailAdapter:
         )
 
         with SessionFactory() as session, session.begin():
+            # Spec A S1.11 / plan N15(1): a removal that committed while
+            # this sync was in phase 2 stops it here, before any write
+            # owned by the removed mailbox owner (raises
+            # `MembershipInactiveError`, which ends the sync call).
+            require_active_members_locked(session, workspace_id=workspace_id, users_ids=[owner_id])
             thread_id = _upsert_thread(
                 session,
                 workspace_id=workspace_id,
@@ -2832,6 +2851,17 @@ class GmailAdapter:
                         source_ref=source_ref,
                         now=now,
                     )
+                except MembershipInactiveError:
+                    # Not a per-participant failure: the mailbox owner was
+                    # removed mid-sync -- stop the whole call (S1.11). Any
+                    # other error (incl. a membership-lock wait hitting the
+                    # statement timeout, which wrote nothing) still skips
+                    # only this participant below: the message row is
+                    # already committed, so aborting here would make a retry
+                    # skip every remaining participant of this message, and
+                    # the next locked write raises this error anyway once a
+                    # removal commits.
+                    raise
                 except Exception:
                     continue
 
@@ -3207,6 +3237,21 @@ class GmailAdapter:
         encrypted_body = encrypt_field(outcome.text)
 
         with SessionFactory() as session, session.begin():
+            # Spec A S1.11: the message's owner may have been removed while
+            # the body was fetched -- shared membership lock first, then the
+            # owner's active membership; inactive -> nothing stored.
+            lock_membership_shared(session, workspace_id)
+            message_owner_id = session.execute(
+                text(
+                    "SELECT owner_id FROM email_messages "
+                    "WHERE id = :id AND workspace_id = :workspace_id"
+                ),
+                {"id": message_id, "workspace_id": workspace_id},
+            ).scalar_one_or_none()
+            if message_owner_id is None or not member_is_active(
+                session, workspace_id=workspace_id, users_id=message_owner_id
+            ):
+                return None
             # `AND body IS NULL`: lost a race against another call already
             # fetching this same message's body (e.g. an overlapping
             # `incremental_sync`, or Task 6's own on-demand fetch racing
