@@ -2636,6 +2636,15 @@ def test_sync_endpoint_reused_as_is_for_a_gmail_account(
     get_settings.cache_clear()
     monkeypatch.setattr(gmail_oauth_module, "_adapter", GmailAdapter(transport=_oauth_transport()))
     try:
+        # FX5 round 3: sync phase 3 re-checks the mailbox owner's `email`
+        # consent for a `gmail` connector (403 EMAIL_CONSENT_NOT_ACTIVE
+        # otherwise), so this route test grants it first, like a real user.
+        enable = client.post(
+            "/api/v1/personal/domains",
+            json={"domain_key": "email"},
+            headers=_headers(token, key=str(uuid4())),
+        )
+        assert enable.status_code == 201, enable.text
         start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
         state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
         callback_response = client.get(

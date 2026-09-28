@@ -1069,6 +1069,29 @@ def _insert_personal_email_domain(workspace_id: UUID, owner_id: UUID) -> None:
         )
 
 
+def _grant_email_consent(workspace_id: UUID, owner_id: UUID) -> None:
+    """Enables the owner's `email` domain AND grants its consent -- FX5: a
+    `gmail`-provider sync re-checks the mailbox owner's active `email`
+    consent under row locks before recording its outcome (phase 3; 403
+    `EMAIL_CONSENT_NOT_ACTIVE` otherwise), exactly as a real connected user
+    has it. The sync tests below register fakes under the real `"gmail"`
+    slug to test cursor/refresh/detection behaviour, not consent, so they
+    seed the consent a real Gmail connection always comes with. Phase 1's
+    credential refresh (and the refresh canary) runs before that check, so
+    the refresh-failure tests still reach it first."""
+    _insert_personal_email_domain(workspace_id, owner_id)
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO domain_consents (id, workspace_id, owner_id, domain_key, "
+                "granted_at, created_at) "
+                "VALUES (:id, :workspace_id, :owner_id, 'email', :now, :now)"
+            ),
+            {"id": uuid4(), "workspace_id": workspace_id, "owner_id": owner_id, "now": now},
+        )
+
+
 def test_create_connector_success_never_returns_credential(
     engineering_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
@@ -2083,6 +2106,7 @@ def test_sync_persists_a_message_resource_type_cursor(
         connector_accounts_module, "connector_registry", _registry_with(_MessageCursorAdapter())
     )
     account_id = _insert_connector_account(workspace_id, user_id, provider="gmail")
+    _grant_email_consent(workspace_id, user_id)
 
     response = client.post(
         f"/api/v1/engineering/connectors/{account_id}/sync",
@@ -2121,6 +2145,7 @@ def test_sync_backfill_passes_since_through_to_adapter(
     adapter = _MessageCursorAdapter()
     monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(adapter))
     account_id = _insert_connector_account(workspace_id, user_id, provider="gmail")
+    _grant_email_consent(workspace_id, user_id)
 
     since = datetime(2026, 1, 1, tzinfo=UTC)
     response = client.post(
@@ -2213,6 +2238,7 @@ def test_sync_refreshes_an_oauth2_credential_before_dispatching(
     account_id = _insert_connector_account(
         workspace_id, user_id, provider="gmail", credential="stale-credential"
     )
+    _grant_email_consent(workspace_id, user_id)
 
     response = client.post(
         f"/api/v1/engineering/connectors/{account_id}/sync",
@@ -2249,6 +2275,7 @@ def test_sync_does_not_refresh_a_credential_that_is_not_near_expiry(
     account_id = _insert_connector_account(
         workspace_id, user_id, provider="gmail", credential="still-fresh-credential"
     )
+    _grant_email_consent(workspace_id, user_id)
 
     response = client.post(
         f"/api/v1/engineering/connectors/{account_id}/sync",
@@ -2283,6 +2310,7 @@ def test_sync_records_a_failed_run_when_oauth2_credential_refresh_is_rejected(
     account_id = _insert_connector_account(
         workspace_id, user_id, provider="gmail", credential="stale-credential"
     )
+    _grant_email_consent(workspace_id, user_id)
 
     response = client.post(
         f"/api/v1/engineering/connectors/{account_id}/sync",
@@ -2394,6 +2422,7 @@ def test_sync_refresh_rejection_feeds_the_refresh_canary(
     account_id = _insert_connector_account(
         workspace_id, user_id, provider="gmail", credential=_EXPIRED_GMAIL_CREDENTIAL
     )
+    _grant_email_consent(workspace_id, user_id)
     now = datetime.now(UTC)
     for event_type, age in audit_rows:
         _insert_connector_audit(workspace_id, user_id, account_id, event_type, now - age)
@@ -2433,6 +2462,7 @@ def test_sync_refresh_canary_lookup_failure_does_not_break_the_sync(
     account_id = _insert_connector_account(
         workspace_id, user_id, provider="gmail", credential=_EXPIRED_GMAIL_CREDENTIAL
     )
+    _grant_email_consent(workspace_id, user_id)
     before = dict(observability.gmail_refresh_rejected_total._values)
 
     response = client.post(
@@ -2457,6 +2487,7 @@ def test_sync_backfill_without_since_passes_none_to_adapter(
     adapter = _MessageCursorAdapter()
     monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(adapter))
     account_id = _insert_connector_account(workspace_id, user_id, provider="gmail")
+    _grant_email_consent(workspace_id, user_id)
 
     response = client.post(
         f"/api/v1/engineering/connectors/{account_id}/sync",
@@ -2497,6 +2528,7 @@ def test_sync_invokes_proactive_action_detection_with_a_valid_call_signature(
         spy = _ActionDetectionSpyAdapter()
         monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(spy))
         account_id = _insert_connector_account(workspace_id, user_id, provider="gmail")
+        _grant_email_consent(workspace_id, user_id)
 
         response = client.post(
             f"/api/v1/engineering/connectors/{account_id}/sync",
@@ -2539,6 +2571,7 @@ def test_sync_invokes_proactive_action_detection_even_when_this_calls_own_items_
         spy = _ActionDetectionSpyAdapter(items_processed=0)
         monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(spy))
         account_id = _insert_connector_account(workspace_id, user_id, provider="gmail")
+        _grant_email_consent(workspace_id, user_id)
 
         response = client.post(
             f"/api/v1/engineering/connectors/{account_id}/sync",

@@ -2,8 +2,9 @@
 id: PHASE-010-API-SCHEMAS
 title: Phase 10 Gmail API Schemas
 status: Approved for Implementation
-version: 1.5.0
+version: 1.6.0
 owner: Lucky Jain
+updated: 2026-09-28
 depends_on:
   - PHASE-010
   - PHASE-006-API-SCHEMAS
@@ -114,6 +115,26 @@ to navigate back to the frontend manually.
 Manual `webhook` sync is not accepted. A second running sync for the same
 account returns `409 CONNECTOR_SYNC_IN_PROGRESS`. Provider errors are
 sanitized before persistence or response.
+
+Sync skips (Spec A S1.11 / FX5), each with nothing but the reserved run
+written:
+
+- `403 MEMBERSHIP_INACTIVE` -- the acting member, or the personal
+  connector's owner, is no longer an active workspace member (checked in
+  phase 1, and again before the outcome is recorded; a run already
+  reserved is closed `failed`, "sync stopped: workspace membership is no
+  longer active").
+- `403 EMAIL_CONSENT_NOT_ACTIVE` -- the mailbox owner's `email` domain
+  consent is not active, or the Gmail connector was disconnected, at the
+  start of or at any point during the sync (including after the adapter
+  returned). The run is closed `failed` with "sync stopped: email consent
+  is no longer active"; the cursor is not advanced; no outcome,
+  connector-status or sync audit is written and action detection does not
+  run. (Previously a never-active consent produced a `201` with a `failed`
+  run, a mid-sync revocation a `201` `partial` run, and a sync of a
+  non-`message` resource type -- which the Gmail adapter treats as a no-op
+  and never consent-checked -- a `201` `succeeded` run even with no email
+  consent at all.)
 
 ## Current thread endpoints (Task 6, list added Task 8)
 
@@ -270,3 +291,4 @@ is now closed out.
 | 1.4.1 | 2026-08-11 | Task 8 Loop 2 round 8 review: "Current (Task 8)" named only two of Task 8's three real backend additions, omitting the `recommendation_type` server-side filter round 5 added to `GET /api/v1/recommendations` -- round 5's own IMPLEMENTATION-STATUS.md evidence had also incorrectly claimed this file was updated for that parameter when it never was; added a cross-reference bullet pointing at `docs/phases/phase-001/API-SCHEMAS.md`, this parameter's own owning doc | Lucky Jain |
 | 1.4.2 | 2026-08-11 | Task 8 Loop 2 round 10 review: the `sync` endpoint row credited `since`'s acceptance to "migration `0069`'s Task 1 Protocol widening" -- migration `0069` is a database schema migration; the `since` parameter is a pure Python `Protocol` signature change with no accompanying migration at all. Corrected to credit Task 1's `connectors.py` widening directly, matching how this same fact is stated correctly elsewhere in this PR | Lucky Jain |
 | 1.5.0 | 2026-08-11 | Later addition: documented `GET /api/v1/personal/gmail/oauth/complete`, the real Google-facing redirect target that closes the "browser stranded on raw backend JSON" gap `/oauth/callback`'s own section already disclosed | Lucky Jain |
+| 1.6.0 | 2026-09-28 | Security Remediation FX5: documented the sync endpoint's `403 MEMBERSHIP_INACTIVE` and `403 EMAIL_CONSENT_NOT_ACTIVE` skips (run closed `failed`, cursor not advanced, no outcome/audit writes), replacing the previous `201` failed/partial/succeeded outcomes | Lucky Jain |

@@ -1,5 +1,10 @@
 import { apiErrorMessage } from '../../api/errorMessage'
 
+/** Lead sentence for `EMAIL_CONSENT_NOT_ACTIVE`, shared with the
+ * recommendation review panel (confirming an email-derived recommendation
+ * re-checks the same consent) so both surfaces describe it identically. */
+export const EMAIL_CONSENT_NOT_ACTIVE_MESSAGE = 'Email consent is not active.'
+
 /** Shared across every panel in this feature -- the same error-code set
  * (`DOMAIN_NOT_FOUND`, `RECORD_NOT_FOUND`, `VERSION_CONFLICT`, ...) can
  * surface from any of the five personal-domain routers, so one mapping
@@ -26,7 +31,7 @@ export function personalErrorMessage(error: unknown): string {
     // `errorMessage` has the identical three) -- kept here rather than
     // duplicated into a second Gmail-only error module, matching this
     // function's own "one mapping function" rationale above.
-    EMAIL_CONSENT_NOT_ACTIVE: 'Email consent is not active. Enable the email domain and grant consent to view Gmail data.',
+    EMAIL_CONSENT_NOT_ACTIVE: `${EMAIL_CONSENT_NOT_ACTIVE_MESSAGE} Enable the email domain and grant consent to view Gmail data.`,
     THREAD_NOT_FOUND: 'This thread no longer exists.',
     GMAIL_ACCOUNT_NOT_ALLOWLISTED: 'This Google account is not on the internal allowlist for Gmail access.',
     GMAIL_OAUTH_NOT_CONFIGURED: 'Gmail OAuth is not configured for this deployment.',

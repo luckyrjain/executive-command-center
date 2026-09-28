@@ -640,6 +640,17 @@ def personal_data_share_guard(
 # (`ai_runtime/runtime._persist_terminal`) and recommendation insert
 # (`governance/recommendation_mutations.create_recommendation`, before its
 # idempotency lock); ownership transfer (`platform/authz_grants`).
+#
+# FX5 (consent race): every Gmail write transaction above additionally
+# re-checks the mailbox owner's `email` consent under row locks, as its
+# first row locks (step 3): the owner's `email` `personal_domains` row, then
+# the writer's own `gmail` `connector_accounts` row (all of the owner's rows
+# by id only when the connector is unknown), both `FOR KEY SHARE`
+# (`personal/gmail_shared.require_email_consent_locked`; inactive ->
+# `EmailConsentInactiveError`). The revocation cascade
+# (`personal/gmail_revocation`) and its callers lock the same rows `FOR
+# UPDATE`, in the same order, before purging; member removal locks the
+# connector rows `FOR UPDATE` after this membership lock.
 
 
 def membership_mutation_lock_key(workspace_id: UUID) -> str:
@@ -660,6 +671,20 @@ class MembershipInactiveError(Exception):
 
     def __init__(self) -> None:
         super().__init__("MEMBERSHIP_INACTIVE")
+
+
+class EmailConsentInactiveError(Exception):
+    """A Gmail write path re-checked, under its lock on the owner's `gmail`
+    `connector_accounts` rows (`gmail_shared.require_email_consent_locked`),
+    that the mailbox owner's `email` consent is no longer active or the
+    connector is `disconnected` (consent withdrawn mid-flight). Nothing was
+    written in that transaction. Carries no identifiers.
+    """
+
+    code = "EMAIL_CONSENT_NOT_ACTIVE"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
 
 
 def lock_membership_shared(session: Session, workspace_id: UUID) -> None:

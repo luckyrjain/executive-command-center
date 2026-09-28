@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from datetime import UTC, datetime
 from json import dumps
 from types import SimpleNamespace
@@ -39,6 +40,7 @@ from ecc.domains.governance.recommendation_targets import (
 from ecc.platform import authz
 from ecc.platform.connector_security import (
     EMAIL_RECOMMENDATION_TYPE,
+    EmailConsentInactiveError,
     personal_derived_row_scope,
     require_active_members_locked,
 )
@@ -90,6 +92,7 @@ def create_recommendation(
     *,
     visibility: Literal["workspace", "private"] = "workspace",
     require_active_actor: bool = False,
+    write_guard: Callable[[Session], None] | None = None,
 ) -> RecommendationResponse:
     """`generate_recommendation`'s full body, factored out so a non-HTTP
     caller can create a recommendation the exact same way `POST /api/v1/
@@ -115,6 +118,9 @@ def create_recommendation(
     cannot make a private row owned by someone other than the actor it
     authenticated as (the detection hook builds `auth` from the connector
     account's own owner, i.e. the mailbox owner).
+
+    `write_guard` (FX5): called with `session` after the idempotency lock
+    and before any row lock or write; whatever it raises propagates.
     """
     authz.require_role_action(session, auth, "write")
     validate_action(payload.target_type, payload.proposed_action)
@@ -132,6 +138,12 @@ def create_recommendation(
     cached = _start(session, auth, idempotency_key, digest)
     if cached is not None:
         return cached
+    if write_guard is not None:
+        # FX5 (opt-in; the Gmail action-detection hook's consent re-check):
+        # after the membership and idempotency locks (lock order:
+        # membership -> idempotency -> rows), before any row lock or
+        # write. Raising leaves nothing written.
+        write_guard(session)
     if not is_create:
         # `operation="create"` proposes a brand-new row -- there is no
         # existing target to serialize concurrent generation against or
@@ -492,6 +504,69 @@ def pin_recommendation(
     )
 
 
+def _require_email_consent_for_confirm(
+    session: Session, auth: AuthContext, recommendation_id: UUID
+) -> None:
+    """FX5 round 3: confirming an `email_action_detected` recommendation
+    copies its Gmail-derived content into a new task and marks it
+    `executed` -- a row the revocation cascade only redacts. So its owner's
+    `email` consent is re-checked under the same locks every Gmail write
+    takes (`gmail_shared.require_email_consent_locked`): the owner's `email`
+    domain row, then their Gmail connector row(s), `FOR KEY SHARE`.
+
+    Called after the idempotency lock and BEFORE the recommendation row's
+    `FOR UPDATE`, keeping the cascade's order (domain row -> connector rows
+    -> recommendation rows); taking it after the row lock would create a
+    deadlock cycle with the cascade. A cascade that committed first is seen
+    (403 `EMAIL_CONSENT_NOT_ACTIVE`, nothing written -- the caller's
+    session rolls back); one that starts later waits for this confirm to
+    commit and then redacts the `executed` row.
+
+    Owner-wide connector form (`connector_account_id=None`), a deliberate
+    choice: a recommendation does not record which connector produced it,
+    so every one of the owner's Gmail rows is locked. Side effect: this
+    confirm can wait on a sync's phase-1 `FOR UPDATE` held across a token
+    refresh (known limitation, see `connector_accounts._run_connector_sync`):
+    the wait can exceed the 5s statement timeout, giving a generic 500 with
+    nothing written; the caller retries after a few seconds.
+
+    The type/owner read here is unlocked. `recommendation_type` never
+    changes. `owner_id` can change only through an ownership transfer, which
+    `ECC_PERSONAL_DATA_ISOLATION` refuses for personal data; with the flag
+    off an email-derived recommendation can be transferred, and this then
+    checks the NEW owner's consent. That is not a widening: the cascade
+    purges by the owner at purge time (`recommendations.owner_id`), so a
+    transferred row is outside the old mailbox owner's cascade either way,
+    and the check can only refuse more, never allow a write the cascade
+    would otherwise have to clean up. A transfer racing this unlocked read
+    at worst checks the previous owner. No refusal audit: none of this
+    endpoint's other 4xx refusals write one either.
+    """
+    # Deferred import: `personal` already imports this module (the
+    # detection hook calls `create_recommendation`), so importing it back at
+    # module level would be a cycle-prone domain back-reference.
+    from ecc.domains.personal.gmail_shared import require_email_consent_locked
+
+    target = session.execute(
+        text(
+            "SELECT recommendation_type, owner_id FROM recommendations "
+            "WHERE workspace_id = :workspace_id AND id = :recommendation_id"
+        ),
+        {"workspace_id": auth.workspace_id, "recommendation_id": recommendation_id},
+    ).one_or_none()
+    if target is None or target[0] != EMAIL_RECOMMENDATION_TYPE or target[1] is None:
+        return
+    try:
+        require_email_consent_locked(
+            session,
+            workspace_id=auth.workspace_id,
+            owner_id=target[1],
+            connector_account_id=None,
+        )
+    except EmailConsentInactiveError:
+        raise HTTPException(status_code=403, detail=EmailConsentInactiveError.code) from None
+
+
 @router.post("/{recommendation_id}/confirm", response_model=RecommendationResponse)
 def confirm_recommendation(
     recommendation_id: UUID,
@@ -518,6 +593,7 @@ def confirm_recommendation(
         action="write",
     ):
         raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+    _require_email_consent_for_confirm(session, auth, recommendation_id)
     row = expire_if_needed(
         session,
         auth,

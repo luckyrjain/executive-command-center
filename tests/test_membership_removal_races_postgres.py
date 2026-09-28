@@ -624,6 +624,8 @@ def test_resolve_or_create_person_refuses_a_removed_owner(world: RaceWorld) -> N
             display_name="Someone",
             source_ref="gmail:t09",
             now=datetime.now(UTC),
+            # No connector in this world; the membership re-check refuses first.
+            connector_account_id=None,
         )
     assert _count("pkos_nodes", world.ws) == 0
     assert _count("entity_aliases", world.ws) == 0

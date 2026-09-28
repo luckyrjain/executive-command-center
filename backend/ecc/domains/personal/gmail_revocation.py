@@ -182,6 +182,49 @@ PendingGmailRevoke = tuple[GmailAdapter, ConnectorAccountContext]
 _REDACTED_RATIONALE = "Source email no longer available -- email consent was revoked."
 
 
+def _lock_owner_gmail_connectors(
+    session: Session, *, workspace_id: UUID, owner_id: UUID
+) -> list[tuple[UUID, str, str]]:
+    """FX5: the cascade's FIRST locks, before it purges anything -- the
+    owner's `email` `personal_domains` row, then EVERY `gmail`
+    `connector_accounts` row of theirs (`ORDER BY id`), both `FOR UPDATE`.
+    Every Gmail write transaction key-share locks the same rows in the same
+    order and re-checks consent under them (`gmail_shared.
+    require_email_consent_locked`), so the two serialize: a write that
+    committed first is visible to (and purged by) every statement below; a
+    write that starts later waits for this transaction and then sees the
+    withdrawal. The domain row is normally already locked by the caller
+    (`_disable_domain`/`delete_domain_endpoint`: `get_domain(...,
+    for_update=True)`); re-locking it here is a no-op for them and keeps
+    the order for any other caller.
+
+    All of the owner's rows, not only non-`disconnected` ones: a status
+    filter is evaluated against the statement's snapshot, so a row that a
+    concurrent OAuth reconnect flips back to `active` could be skipped
+    unlocked. Returns `(id, external_account_id, status)` read under the
+    lock (the latest committed version).
+    """
+    params = {"workspace_id": workspace_id, "owner_id": owner_id}
+    session.execute(
+        text(
+            "SELECT id FROM personal_domains WHERE workspace_id = :workspace_id "
+            "AND owner_id = :owner_id AND domain_key = 'email' FOR UPDATE"
+        ),
+        params,
+    ).all()
+    return [
+        (row[0], row[1], row[2])
+        for row in session.execute(
+            text(
+                "SELECT id, external_account_id, status FROM connector_accounts "
+                "WHERE workspace_id = :workspace_id AND provider = 'gmail' "
+                "AND owner_id = :owner_id ORDER BY id FOR UPDATE"
+            ),
+            params,
+        )
+    ]
+
+
 def cascade_email_revocation(
     session: Session,
     auth: AuthContext,
@@ -207,6 +250,10 @@ def cascade_email_revocation(
     """
     target = target_owner_id or auth.user_id
     params = {"workspace_id": auth.workspace_id, "owner_id": target}
+    # FX5: lock before the first purge -- see `_lock_owner_gmail_connectors`.
+    locked_accounts = _lock_owner_gmail_connectors(
+        session, workspace_id=auth.workspace_id, owner_id=target
+    )
 
     # `attention_items.owner_id` (migration `0063`'s Phase 8 authz
     # widening) is explicitly set at write time from the underlying
@@ -231,6 +278,25 @@ def cascade_email_revocation(
     # (`created_by = created_at actor = the email's owner`), so `owner_id`
     # here is reliable too. See module docstring for why `executed` rows
     # are redacted in place rather than deleted.
+    #
+    # DELETE first, then the redact UPDATE (FX5 round 3): a concurrent
+    # `confirm_recommendation` can hold a `pending_confirmation` row `FOR
+    # UPDATE` and commit it as `executed`. The DELETE waits on that lock and
+    # its READ COMMITTED re-check then skips the now-`executed` row; the
+    # UPDATE, a later statement with a fresh snapshot, sees it as `executed`
+    # and redacts it. In the opposite order the UPDATE ran first, skipped the
+    # row as still pending, and the DELETE then skipped it too -- leaving an
+    # unredacted `executed` row. (`confirm_recommendation` also re-checks
+    # consent under the domain/connector locks for this type, so today it
+    # cannot interleave this way; the order keeps the cascade safe anyway.)
+    session.execute(
+        text(
+            "DELETE FROM recommendations WHERE workspace_id = :workspace_id "
+            "AND owner_id = :owner_id AND recommendation_type = 'email_action_detected' "
+            "AND status != 'executed'"
+        ),
+        params,
+    )
     session.execute(
         text(
             "UPDATE recommendations SET rationale = :redacted, "
@@ -239,14 +305,6 @@ def cascade_email_revocation(
             "AND recommendation_type = 'email_action_detected' AND status = 'executed'"
         ),
         {"redacted": _REDACTED_RATIONALE, **params},
-    )
-    session.execute(
-        text(
-            "DELETE FROM recommendations WHERE workspace_id = :workspace_id "
-            "AND owner_id = :owner_id AND recommendation_type = 'email_action_detected' "
-            "AND status != 'executed'"
-        ),
-        params,
     )
 
     # `pkos_evidence` gained an `owner_id` column from the same migration
@@ -462,38 +520,20 @@ def cascade_email_revocation(
     # `connector_accounts.owner_id` (migration `0063`) is set explicitly
     # at write time by `gmail_oauth.py`'s own OAuth-callback `INSERT`
     # (the connecting user), so it is reliable here too; scoped by `target`.
-    # `FOR UPDATE`: mirrors `connector_accounts.py:get_connector_account
-    # (..., for_update=True)`'s own established reason exactly (serializes
-    # a concurrent mutator of the same account -- e.g. a racing generic
-    # `disable_connector_endpoint` call, or another concurrent revocation
-    # request) -- Loop 2 round 1 review flagged this SELECT as an
-    # unacknowledged deviation from the pattern the module docstring says
-    # it matches "exactly". No matching rows is the common case (every
-    # domain-level disable/delete after the first already left the
-    # connector `disconnected`), not an error.
-    #
-    # `.all()`, not `.one_or_none()`: see module docstring's own "Loop 2
-    # round 1 review -- an owner can hold more than one `gmail` connector
-    # account" paragraph for why more than one matching row here is a real,
-    # expected case rather than a data-integrity error (Loop 2 round 8
-    # review: this paragraph used to restate that same narrative in full a
-    # second time here rather than cross-referencing it).
-    # `ORDER BY id`: Loop 2 round 2 review -- a multi-row `FOR UPDATE`
-    # with no deterministic order risks a classic lock-order deadlock
-    # against a second concurrent cascade for the same owner (e.g. a
-    # racing `disable_domain_endpoint` and `revoke_consent_endpoint` call)
-    # if Postgres ever visited the matching rows in different orders for
-    # the two transactions. Ordering by `id` guarantees every concurrent
-    # caller acquires these locks in the same sequence.
-    account_rows = session.execute(
-        text(
-            "SELECT id, external_account_id FROM connector_accounts "
-            "WHERE workspace_id = :workspace_id AND provider = 'gmail' "
-            "AND owner_id = :owner_id AND status != 'disconnected' "
-            "ORDER BY id FOR UPDATE"
-        ),
-        params,
-    ).all()
+    # The rows were locked `FOR UPDATE` (`ORDER BY id`, so two concurrent
+    # cascades for the same owner cannot deadlock) at the top of this
+    # function, before any purge (FX5; see `_lock_owner_gmail_connectors`)
+    # -- that lock also serializes a concurrent mutator of the same
+    # account, e.g. another revocation request. No live row is the common
+    # case (every domain-level disable/delete after the first already left
+    # the connector `disconnected`), not an error. More than one live row is
+    # a real, expected case too -- see the module docstring's "an owner can
+    # hold more than one `gmail` connector account" paragraph.
+    account_rows = [
+        (account_id, external_account_id)
+        for account_id, external_account_id, status in locked_accounts
+        if status != "disconnected"
+    ]
     pending_revokes: list[PendingGmailRevoke] = []
     for account_id, external_account_id in account_rows:
         # Matches `connector_accounts.py:disable_connector_endpoint`'s
