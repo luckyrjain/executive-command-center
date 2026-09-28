@@ -88,10 +88,12 @@ from ecc.observability import (
 )
 from ecc.platform import audit_outbox, authz
 from ecc.platform.connector_security import (
+    MembershipInactiveError,
     RevokeTokenKind,
     integrity_error_log_fields,
     is_unique_violation,
     personal_content_scope,
+    require_active_members_locked,
     revoke_if_safe,
     write_refusal_audit,
 )
@@ -321,8 +323,39 @@ def gmail_oauth_callback_endpoint(
     visibility = personal_content_scope(auth.user_id).visibility
     committed = False
     owner_refusal: _OwnerRefusal | None = None
+    membership_inactive = False
     try:
         with SessionFactory() as create_session, create_session.begin():
+            # Spec A S1.11: the caller may have been removed from the
+            # workspace while Google's consent screen / token exchange ran.
+            # Shared membership lock FIRST (before any row lock -- see the
+            # lock-ordering note in `connector_security`), then re-check the
+            # caller's active membership: a removal that already committed
+            # is seen here (-> 403 below, nothing written); one that has not
+            # yet started waits for this transaction, then disconnects the
+            # row it wrote. A refusal is not queued for the unconditional
+            # drain (the refusal tail below decides the minted grant); any
+            # other failure here is, like every failure further down.
+            try:
+                require_active_members_locked(
+                    create_session, workspace_id=auth.workspace_id, users_ids=[auth.user_id]
+                )
+            except MembershipInactiveError:
+                raise
+            except Exception:
+                pending_revokes.append(
+                    (
+                        ConnectorAccountContext(
+                            workspace_id=auth.workspace_id,
+                            connector_account_id=account_id,
+                            external_account_id=authorization.external_account_id,
+                            credential=authorization.credential,
+                        ),
+                        "minted_unpersisted",
+                        "callback_failure",
+                    )
+                )
+                raise
             try:
                 with create_session.begin_nested():
                     create_session.execute(
@@ -666,6 +699,10 @@ def gmail_oauth_callback_endpoint(
         # `create_session` (row lock released); nothing was queued in
         # `pending_revokes` for this path. Handled below, after `finally`.
         owner_refusal = refusal
+    except MembershipInactiveError:
+        # Same shape as `_OwnerRefusal`: rolled back before any write,
+        # nothing queued; handled below, after `finally`.
+        membership_inactive = True
     finally:
         # `create_session` is fully closed by this point (the `with` block
         # above has already exited) -- no pooled connection or row lock is
@@ -681,17 +718,20 @@ def gmail_oauth_callback_endpoint(
         if committed:
             _drain_pending_revokes(pending_revokes_on_commit)
 
+    minted = ConnectorAccountContext(
+        workspace_id=auth.workspace_id,
+        connector_account_id=account_id,
+        external_account_id=authorization.external_account_id,
+        credential=authorization.credential,
+    )
+    if membership_inactive:
+        _refuse_membership_inactive(request, auth, minted)
     if owner_refusal is not None:
         _refuse_owned_by_another_member(
             request,
             auth,
             owner_refusal,
-            ConnectorAccountContext(
-                workspace_id=auth.workspace_id,
-                connector_account_id=account_id,
-                external_account_id=authorization.external_account_id,
-                credential=authorization.credential,
-            ),
+            minted,
         )
 
     assert response is not None
@@ -733,6 +773,41 @@ def _refuse_owned_by_another_member(
         site="callback_failure",
     )
     raise HTTPException(status_code=409, detail="CONNECTOR_OWNED_BY_ANOTHER_MEMBER")
+
+
+def _refuse_membership_inactive(
+    request: Request, auth: AuthContext, minted: ConnectorAccountContext
+) -> NoReturn:
+    """Spec A S1.11 refusal tail, run only after the business transaction
+    rolled back (nothing was written): the caller was removed from the
+    workspace while the OAuth round trip was in flight. Refusal audit (own
+    txn, `denied`, no row -> fresh aggregate id, no email) + metric ->
+    minted grant revoked iff `revoke_is_safe(minted_unpersisted)` (under
+    `global`: only when no live row anywhere uses that Google account, so
+    another member's -- or the connector owner's -- live grant is never
+    revoked) -> `403 MEMBERSHIP_INACTIVE`.
+    """
+    write_refusal_audit(
+        auth,
+        request,
+        event_type="connector_account.enrollment_refused",
+        aggregate_type="connector_account_enrollment",
+        aggregate_id=None,
+        reason="membership_inactive",
+        provider_or_type="gmail",
+    )
+    record_connector_enrollment_refused("gmail", "membership_inactive")
+    _logger.warning("gmail_oauth_callback_refused: reason=membership_inactive")
+    revoke_if_safe(
+        _adapter,
+        minted,
+        provider="gmail",
+        external_account_id=minted.external_account_id,
+        token_kind="minted_unpersisted",
+        exclude_row_id=None,
+        site="callback_failure",
+    )
+    raise HTTPException(status_code=403, detail="MEMBERSHIP_INACTIVE")
 
 
 def _raise_persist_failed(exc: IntegrityError) -> NoReturn:

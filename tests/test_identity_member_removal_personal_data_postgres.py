@@ -700,6 +700,7 @@ def test_concurrent_non_gmail_evidence_insert_during_reown_blocks_removal(
     racing, other = world.b_gmail_only_nodes()
     nodes_before = _node_versions([racing, other])
     result: dict[str, httpx.Response] = {}
+    worker: threading.Thread | None = None
     inserter = engine.connect()
     try:
         evidence_id = uuid4()
@@ -746,8 +747,12 @@ def test_concurrent_non_gmail_evidence_insert_during_reown_blocks_removal(
         worker.join(timeout=15)
         assert not worker.is_alive()
     finally:
+        # Unblock the removal (even when an assert above failed) before
+        # joining it, so the world's teardown never races a live request.
         inserter.rollback()
         inserter.close()
+        if worker is not None:
+            worker.join(timeout=15)
 
     response = result["response"]
     assert response.status_code == 409, response.text
