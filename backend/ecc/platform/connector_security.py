@@ -145,8 +145,10 @@ PERSONAL_ROW_PREDICATES: Final[Mapping[str, str]] = MappingProxyType(
 # one) is needed, and rows confirmed while the flag was off are recognised
 # too. Those flag-off-era rows are still `workspace`-visible until the FX2
 # backfill rule makes them private (plan note N40): with the flag on they are
-# share-refused and no longer block removal, so FX3 must ship with or after
-# that backfill rule (rollout runbook). `operation = 'create'` matters: a
+# share-refused and no longer block removal, so ECC_PERSONAL_DATA_ISOLATION
+# must not be enabled until that backfill rule has shipped and the backfill
+# has run (rollout runbook). With the flag off (the default) nothing here
+# changes behaviour. `operation = 'create'` matters: a
 # non-create email recommendation records the pre-existing row it changed as
 # `target_id`. The type is a literal, not `:recommendation_type`, so the
 # partial index `ix_recommendations_email_derived_target` is provably usable
