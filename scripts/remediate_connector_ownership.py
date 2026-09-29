@@ -45,8 +45,8 @@ Runbook:
     already disconnected is never re-revoked) -- have the mailbox owner
     revoke the app's access in their Google account instead.
     `skipped_unsafe` is expected while another live row uses that account.
-    `revoke=ok` means Google confirmed the grant is gone (a 2xx, or its
-    `invalid_token` reply for an already-revoked token); a Google refusal,
+    `revoke=ok` means Google accepted the revoke (a 2xx) or said the stored
+    token is already revoked, expired or unknown (`invalid_token`); a Google refusal,
     a transport error or an unusable stored credential is `error` (FX6).
  5. Re-run the audit: A/E rows (and mismatched B/D connectors) now show
     `row_status=disconnected`. Re-running this command reports every
