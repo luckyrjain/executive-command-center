@@ -41,9 +41,9 @@ multi-round adversarial review found and required real coverage for:
 8. The 422 not-configured path, both at `GmailAdapter` (missing OAuth
    client id/secret) and at `POST /oauth/start`/`GET /oauth/callback`
    router level.
-9. `disconnect`'s malformed-credential case (returns `None` rather than
-   raising), its real provider-side revocation call, and the network-error
-   case (never raises).
+9. `disconnect`'s malformed-credential case and the network-error case
+   (both raise `GmailRevokeFailed` so `revoke_guarded` counts `error`;
+   FX6), and its real provider-side revocation call.
 10. Revoke-on-rejection: every post-token-exchange rejection branch in
     `handle_oauth_callback` (see item 3's list) revokes the just-obtained,
     never-to-be-persisted Google grant via `/revoke` before raising --
@@ -301,7 +301,7 @@ from ecc.config import get_settings
 from ecc.database import STATEMENT_TIMEOUT_MS, engine
 from ecc.domains.engineering.connectors import AdapterAuthorizationError, ConnectorAccountContext
 from ecc.domains.engineering.crypto import decrypt_credential
-from ecc.domains.personal.gmail_adapter import REQUIRED_SCOPES, GmailAdapter
+from ecc.domains.personal.gmail_adapter import REQUIRED_SCOPES, GmailAdapter, GmailRevokeFailed
 from ecc.logging import JsonFormatter
 from ecc.main import app
 
@@ -519,9 +519,9 @@ def test_handle_oauth_callback_rejects_missing_refresh_token(
 ) -> None:
     """No real `refresh_token` came back, so `_revoke_best_effort` is still
     called (the revoke-on-reject guard covers this branch too -- see
-    `handle_oauth_callback`'s own comment) but with an empty string, a
-    harmless no-op at Google's end -- there is nothing to revoke, and
-    nothing crashes trying.
+    `handle_oauth_callback`'s own comment) but with an empty string: FX6
+    sends nothing to Google (there is nothing to revoke) and reports the
+    revoke as failed; nothing crashes trying.
     """
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
@@ -536,7 +536,7 @@ def test_handle_oauth_callback_rejects_missing_refresh_token(
         )
         with pytest.raises(AdapterAuthorizationError):
             adapter.handle_oauth_callback("auth-code", "state-value")
-        assert revoked_tokens == [""]
+        assert revoked_tokens == []
     finally:
         get_settings.cache_clear()
 
@@ -973,10 +973,10 @@ def test_handle_oauth_callback_rejects_empty_refresh_token(
         adapter = GmailAdapter(transport=httpx.MockTransport(handler))
         with pytest.raises(AdapterAuthorizationError):
             adapter.handle_oauth_callback("auth-code", "state-value")
-        # An empty refresh_token means there was never anything real to
-        # revoke -- the same harmless-no-op contract already asserted for
-        # `..._rejects_missing_refresh_token` (`refresh_token=None`).
-        assert revoked_tokens == [""]
+        # An empty refresh_token is never sent to Google (FX6) -- the same
+        # contract already asserted for `..._rejects_missing_refresh_token`
+        # (`refresh_token=None`).
+        assert revoked_tokens == []
     finally:
         get_settings.cache_clear()
 
@@ -1874,21 +1874,27 @@ def test_ensure_fresh_credential_raises_on_non_object_response() -> None:
         adapter.ensure_fresh_credential(credential)
 
 
-def test_disconnect_returns_none_for_malformed_credential() -> None:
+def test_disconnect_raises_revoke_failed_for_malformed_credential() -> None:
+    """FX6: the grant cannot be revoked, so `revoke_guarded` must see a
+    failure (it never lets the raise reach its own callers)."""
     adapter = GmailAdapter()
-    assert adapter.disconnect(_account_context("not-json")) is None
+    with pytest.raises(GmailRevokeFailed) as excinfo:
+        adapter.disconnect(_account_context("not-json"))
+    assert excinfo.value.reason == "bad_credential"
 
 
-def test_disconnect_returns_none_for_non_object_credential() -> None:
+def test_disconnect_raises_revoke_failed_for_non_object_credential() -> None:
     """Companion to `test_refresh_permissions_permission_lost_on_non_object_
     credential` -- same round-5 `unpack_credential` `TypeError` branch,
     reached through `disconnect` instead.
     """
     adapter = GmailAdapter()
-    assert adapter.disconnect(_account_context("[1, 2, 3]")) is None
+    with pytest.raises(GmailRevokeFailed) as excinfo:
+        adapter.disconnect(_account_context("[1, 2, 3]"))
+    assert excinfo.value.reason == "bad_credential"
 
 
-def test_disconnect_never_raises_on_network_error() -> None:
+def test_disconnect_raises_revoke_failed_on_network_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("boom", request=request)
 
@@ -1896,12 +1902,15 @@ def test_disconnect_never_raises_on_network_error() -> None:
     credential = dumps(
         {"access_token": "a", "refresh_token": "r", "expires_at": "2020-01-01T00:00:00+00:00"}
     )
-    assert adapter.disconnect(_account_context(credential)) is None
+    with pytest.raises(GmailRevokeFailed) as excinfo:
+        adapter.disconnect(_account_context(credential))
+    assert excinfo.value.reason == "transport_error"
 
 
 def test_disconnect_revokes_the_stored_refresh_token() -> None:
-    """The success path `test_disconnect_returns_none_for_malformed_credential`/
-    `test_disconnect_never_raises_on_network_error` don't cover -- a
+    """The success path `test_disconnect_raises_revoke_failed_for_malformed_
+    credential`/`test_disconnect_raises_revoke_failed_on_network_error` don't
+    cover -- a
     well-formed credential's `refresh_token` must be the one extracted and
     POSTed to `/revoke`, not, say, the access token or an empty string.
     """

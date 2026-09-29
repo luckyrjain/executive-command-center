@@ -701,6 +701,10 @@ RevokeSite = Literal[
     "adapter_callback",
     "remediation",
 ]
+# `ok`: the provider confirmed the grant is gone (or its `disconnect()` is a
+# documented no-op); `error`: the grant may still be live -- for Gmail a
+# Google refusal, a transport error or an unusable stored credential (FX6);
+# `skipped_unsafe`: deliberately not attempted (`revoke_is_safe` said no).
 RevokeResult = Literal["ok", "error", "skipped_unsafe"]
 ConnectorAccessDeniedRoute = Literal["sync", "disable"]
 GmailRefreshRejectedError = Literal["invalid_grant", "other"]

@@ -289,10 +289,11 @@ def gmail_oauth_callback_endpoint(
     # which credential needs revoking (`pending_revokes`), and the actual
     # network calls happen in the `finally` block after `create_session`
     # has fully closed (releasing both the connection and the lock) --
-    # `_adapter.disconnect()` is best-effort and never raises, and never
-    # was consulted for what to persist, so deferring it changes nothing
-    # about correctness, only when the network call happens relative to
-    # the transaction.
+    # `_adapter.disconnect()` is best-effort (it may raise
+    # `GmailRevokeFailed`, but only ever through `revoke_if_safe`, which
+    # never raises), and never was consulted for what to persist, so
+    # deferring it changes nothing about correctness, only when the
+    # network call happens relative to the transaction.
     #
     # Round 26 review: **not every queued credential is safe to revoke
     # unconditionally on rollback.** `pending_revokes` below is for a
@@ -474,9 +475,12 @@ def gmail_oauth_callback_endpoint(
                 # here. A redundant queued revoke (e.g. the `active`/
                 # reactivate branches' own queue entries, followed by this
                 # same credential queued again if something later in the
-                # same branch then fails) is a harmless no-op per
-                # `_revoke_best_effort`'s own contract, not a correctness
-                # concern.
+                # same branch then fails) is not a correctness concern:
+                # `_drain_pending_revokes` attempts (and counts) each
+                # credential once, and even a repeat revoke through
+                # `revoke_if_safe` -> `disconnect` of an already-revoked
+                # token gets Google's 400 `invalid_token`, which counts as
+                # `ok` (FX6).
                 try:
                     if not is_unique_violation(
                         integrity_error, _UNIQUE_EXTERNAL_ACCOUNT_CONSTRAINT
