@@ -35,6 +35,7 @@ from ecc.main import app
 from ecc.platform import authz, connector_security
 from ecc.platform.connector_security import (
     EMAIL_TASK_TYPES,
+    PERSONAL_DERIVED_PREDICATES,
     PERSONAL_PROVIDERS,
     PERSONAL_RESOURCE_TYPES,
     PERSONAL_ROW_PREDICATES,
@@ -626,11 +627,21 @@ def test_ai_run_steps_predicate_probes_parent_by_primary_key() -> None:
 
 def test_removal_exclusions_are_exactly_the_personal_data_set() -> None:
     """`authz`'s member-removal exclusions are derived from the one
-    personal-data definition (review B-NB-1): same tables, same SQL, and
-    `pkos_nodes` is never excluded (Gmail-only nodes are re-owned first;
-    any node still owned blocks)."""
-    assert dict(authz._PERSONAL_ROWS_NOT_BLOCKING_REMOVAL) == dict(PERSONAL_ROW_PREDICATES)
-    assert set(authz._PERSONAL_ROWS_NOT_BLOCKING_REMOVAL) == PERSONAL_RESOURCE_TYPES
+    personal-data definition (review B-NB-1) plus the rows derived from it
+    (plan task FX3): same tables, same SQL, and `pkos_nodes` is never
+    excluded (Gmail-only nodes are re-owned first; any node still owned
+    blocks)."""
+    assert dict(authz._PERSONAL_ROWS_NOT_BLOCKING_REMOVAL) == {
+        **PERSONAL_ROW_PREDICATES,
+        **PERSONAL_DERIVED_PREDICATES,
+    }
+    assert set(authz._PERSONAL_ROWS_NOT_BLOCKING_REMOVAL) == PERSONAL_RESOURCE_TYPES | {
+        "tasks",
+        "commitments",
+        "risks",
+        "recommendation_feedback",
+        "attention_feedback",
+    }
     assert "pkos_nodes" not in authz._PERSONAL_ROWS_NOT_BLOCKING_REMOVAL
 
 
