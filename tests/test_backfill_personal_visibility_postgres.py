@@ -549,7 +549,7 @@ def test_unverified_owner_rows_are_made_private_with_their_owner_reported_and_re
     assert _snapshot(ws) == before
 
 
-def test_grants_on_unresolved_rows_are_revoked_and_the_rows_otherwise_left_alone(
+def test_grants_on_unresolved_and_unverified_owner_rows_are_revoked(
     world: GmailSyncWorld,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

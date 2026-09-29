@@ -2,7 +2,7 @@
 id: PHASE-2-DEPLOYMENT
 title: Phase 2 Deployment Runbook
 status: Active
-version: 1.1.0
+version: 1.2.0
 owner: Lucky Jain
 ---
 
@@ -53,7 +53,11 @@ assumes it.
   # Rebuild timeline_entries and retrieval_documents for every workspace,
   # deterministically, from the authoritative tables they're derived from
   # (audit_events, pkos_nodes, knowledge_claims). Safe to re-run any time —
-  # both projections are declared rebuildable in phase-002/DATA-MODEL.md.
+  # both projections are declared rebuildable in phase-002/DATA-MODEL.md —
+  # as long as the isolation flag matches the application's (see
+  # "Personal-data isolation" below: with isolation on, after a backfill, or
+  # when private or narrowed Gmail evidence exists, prefix
+  # ECC_PERSONAL_DATA_ISOLATION=true, or the command refuses with exit 2).
   uv run python scripts/rebuild_knowledge_projections.py
 
   # Or scope it to one workspace:
@@ -66,6 +70,45 @@ assumes it.
   exists for recovery (e.g. after a restore that predates a mutation, or to
   regenerate after a manual data fix) and for the backup/restore isolation
   checks in `scripts/verify_restore.sh`, not as a routine deployment step.
+
+  **Personal-data isolation (security remediation Spec A).** With the flag
+  off, the rebuild refuses to run (exit 2, unless given
+  `--allow-without-isolation`) when any of these holds (the evidence
+  checks are scoped to the `--workspace-id` workspace, else every
+  workspace; the backfill-log check is always global):
+
+  - `personal_visibility_backfill_log` has rows
+    (`scripts/backfill_personal_visibility.py` has run);
+  - a `pkos_evidence` row is `private` (only written with the flag on,
+    e.g. Gmail evidence synced while isolation was enabled);
+  - Gmail-sourced (`gmail_sync`) evidence has been narrowed to specific
+    people (`shared_explicitly`).
+
+  In those cases run it with `ECC_PERSONAL_DATA_ISOLATION=true` in its own
+  environment: without the flag it writes claims backed by that evidence
+  into shared search text. Ordinary narrowed grants on non-personal
+  evidence do not trigger the refusal (a flag-off application already puts
+  that evidence in shared search text). Order:
+
+  1. Enable `ECC_PERSONAL_DATA_ISOLATION` on the application and restart
+     every process.
+  2. Run the backfill (`--dry-run` first). It refuses to run without the
+     flag.
+  3. Rebuild, one workspace at a time, with the flag:
+
+     ```bash
+     ECC_PERSONAL_DATA_ISOLATION=true \
+         uv run python scripts/rebuild_knowledge_projections.py --workspace-id <UUID>
+     ```
+
+  Rollback: turn the flag off on the application, then restore EVERY
+  backfill run id, newest first
+  (`SELECT run_id, min(at) FROM personal_visibility_backfill_log GROUP BY 1
+  ORDER BY 2 DESC;`, then `--restore <run_id>` for each). Only after that,
+  rebuild with the flag off and `--allow-without-isolation`. Note that this
+  rebuild puts evidence written while the flag was on (for example Gmail
+  evidence synced as `private`) back into shared search text: `--restore`
+  only reverts rows the backfill logged.
 
 ## Optional: enabling embeddings and hybrid retrieval (Task 7)
 

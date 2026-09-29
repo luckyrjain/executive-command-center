@@ -8,7 +8,13 @@ or the member who ran a sync). This command makes every row of Spec A's
 personal data set (`ecc.platform.connector_security.PERSONAL_ROW_PREDICATES`,
 the single source of truth) private to its mailbox owner, revokes the active
 `resource_grants` on those rows, and fixes the owner of Gmail-derived
-`entity_aliases` (which stay workspace knowledge, DS3 (a')).
+`entity_aliases` (which stay workspace knowledge, DS3 (a')). It also covers
+the rows DERIVED from that set (`connector_security.PERSONAL_DERIVED_
+PREDICATES`, same single source): it makes private the tasks / commitments /
+risks created by confirming an email recommendation while the flag was off
+(plan note N23's write-time rule, applied to the rows written before it
+existed), and revokes the active grants on feedback given on email
+recommendations / attention items.
 
 When to run: rollout step R5 -- after `ECC_PERSONAL_DATA_ISOLATION` has been
 enabled on the application (and restarted) -- and again after any re-enable
@@ -54,13 +60,66 @@ Per-table rules (a row is changed only when it is not already
                          `email_message_id_purge_log` (same workspace).
                          Exactly one -> that owner, `private`. Zero or
                          several (or an unrecognised `source_ref`) -> the
-                         row is left UNCHANGED and reported. Never assigned
-                         to the fallback earliest user.
+                         row's owner and visibility are left UNCHANGED and
+                         it is reported (its active grants are still
+                         revoked, see below). Never assigned to the
+                         fallback earliest user.
     entity_aliases       whose `source_id` is `gmail_sync` evidence: owner =
                          that evidence's owner by the same rule; visibility
                          unchanged (workspace knowledge). Unresolved ->
                          unchanged + reported. Grants are not revoked (not
                          personal data).
+    tasks, commitments,  rows derived from an email recommendation
+    risks                (`PERSONAL_DERIVED_PREDICATES`, the rows FX3
+                         share-refuses and does not count against member
+                         removal): the row is the `execution_result.
+                         target_id` (with the matching `target_type`) of an
+                         `email_action_detected` recommendation with an
+                         `execution_result` whose `operation` is `create`
+                         (only the confirm writes `execution_result`).
+                         Owner = that recommendation's owner (after the
+                         recommendation rule above -- which never changes
+                         it), `private`, active grants revoked (the row
+                         copies email-derived content; with the flag on the
+                         confirm writes it exactly so, plan note N23).
+                         Only when the row's owner is still the one the
+                         confirm wrote -- the recommendation's owner or the
+                         row's `created_by` (the confirming member, the
+                         flag-off owner) -- is the owner changed. A row
+                         re-owned since (an ownership transfer, or member
+                         removal moving it away) is made `private` with
+                         its CURRENT owner and reported
+                         (`derived_owner_changed`): the transfer may have
+                         been the mailbox owner's own decision, and the
+                         previous owner may no longer be a member. A row of
+                         a reported recommendation (`owner_not_mailbox_
+                         owner`) is made `private` with its CURRENT owner
+                         and reported with that reason. Removed-owner rule
+                         (DS2, as FX3 treats these rows on removal): when
+                         the recommendation's owner is no longer an active
+                         member, the row is STILL re-owned to them and made
+                         `private` -- a removed member's personal rows stay
+                         theirs, private; never handed to an admin -- and
+                         reported `owner_inactive` (on the run that re-owns
+                         it; afterwards it is the steady state and is not
+                         reported again). Recommendations of any other
+                         type, other operations, and targets that no longer
+                         exist are not touched (a deleted target exposes
+                         nothing). The batch's source recommendations are
+                         resolved by one set query per batch
+                         (`connector_security.email_derived_sources_sql`,
+                         migration 0083's index).
+    recommendation_      feedback on an email recommendation / on an email
+    feedback,            attention item (`PERSONAL_DERIVED_PREDICATES`):
+    attention_feedback   owner (the member who gave it) and visibility
+                         UNCHANGED, active grants revoked (FX3 share-refuses
+                         them). Not made private: the flag-on writers still
+                         write them `workspace`, owned by the actor
+                         (`recommendation_events.record_feedback`,
+                         `attention.record_attention_feedback`), no read
+                         path serves them, and they hold the actor's own
+                         label/reason, not mailbox content -- the backfill
+                         only brings flag-off rows to the flag-on state.
 
 Alias active-owner rule (`entity_aliases` only): a decision that would CHANGE
 an alias's owner is applied only when the new owner is an `active` member of
@@ -72,7 +131,7 @@ member's messages (DS2), so without this rule a re-run would hand them back to
 the removed member. Every other table is assigned its mailbox / connector /
 F1 / parent owner + `private` even when that member is no longer active --
 the flag-on steady state: a removed member's personal rows stay theirs,
-private (DS2).
+private (DS2) -- for tasks/commitments/risks reported `owner_inactive`.
 
 Unresolved reasons (CSV `reason`) -- meaning -> operator action:
 
@@ -80,7 +139,8 @@ Unresolved reasons (CSV `reason`) -- meaning -> operator action:
     evidence_owner_unknown     ids collide) / none (message and purge-log
     evidence_source_ref_       entry gone) / the `source_ref` is not a Gmail
       unrecognised             message ref. Row stays as written (usually
-                               workspace). -> Manual review: re-own and make
+                               workspace) except that its active grants are
+                               revoked. -> Manual review: re-own and make
                                private via SQL/admin, or accept and document.
                                Reported on every run until handled.
     alias_owner_inactive       an alias (workspace knowledge) resolves to a
@@ -101,6 +161,25 @@ Unresolved reasons (CSV `reason`) -- meaning -> operator action:
                                be read (unreachable today). Made private
                                with its current owner -> fix the owner
                                manually.
+    derived_owner_changed      a task/commitment/risk created from an email
+                               recommendation is owned by neither the
+                               recommendation's owner nor the member who
+                               confirmed it (re-owned since). Made private
+                               with its current owner -> confirm the owner
+                               should keep it, or transfer it back
+                               manually. Reported on every run until the
+                               owner is the recommendation's owner again.
+    (A task/commitment/risk derived from a recommendation reported
+    `owner_not_mailbox_owner` is made private with its current owner and
+    reported with that reason too.)
+    owner_inactive             a task/commitment/risk was re-owned to its
+                               recommendation's owner, who is no longer an
+                               active member (removed or suspended): it is
+                               private to them, like the rest of their
+                               personal data (DS2) -> no action expected;
+                               a suspended member sees it again on
+                               reactivation. Reported only by the run that
+                               re-owns it.
     changed_since_backfill     (restore) the row no longer holds what the
                                backfill set -> expected; no action, or
                                restore manually.
@@ -117,11 +196,12 @@ Every change is logged to `personal_visibility_backfill_log` (previous
 visibility and owner, grants revoked, `run_id`) in the same transaction as the
 change itself; rows with `version` get it bumped. Grants revoked are the
 active (`revoked_at IS NULL`) `resource_grants` on EVERY row of the personal
-data set -- including rows already private and rows left unresolved (for
+data set and of its derived rows -- including rows already private and rows left unresolved (for
 those only the grants go: they are logged with previous = current values and
 their `unresolved` CSV record carries `grants_revoked`). Never on
 `entity_aliases` (workspace knowledge, DS3). `rows_changed` counts logged
-rows, i.e. includes grant-only changes.
+rows, i.e. includes grant-only changes. A row made private AND reported (an
+unverified owner kept) counts in both `rows_changed` and `rows_unresolved`.
 
 Transactions: one short transaction per batch (at most `--batch-size` rows of
 one table in one workspace, keyset-paginated by id), holding the shared side
@@ -142,18 +222,32 @@ back; reports the same counts and unresolved ids, writes nothing.
 row that run logged. **Revoked grants are NOT restored** (re-grant manually if
 needed). It is a compare-and-set: the log stores only the previous values, so
 the value the run set is reconstructed by re-applying this command's own rules
-to the row as it is now; a row is restored only while its current `(owner_id,
-visibility)` still equals that target (and, for aliases, its visibility still
-equals the logged one -- the run never changed it). A row changed since the
-backfill (re-owned, re-shared, reclassified, or no longer resolvable) is left
-alone and reported `changed_since_backfill`. The previous owner must still be
+to the row as it is now: where the rules derive the owner from other rows
+(mailbox, connector, thread, evidence, parent run, source recommendation)
+that owner; where they keep the row's own owner (`connector_accounts`, every
+reported "made private with its current owner" row, feedback, an attention
+item whose thread is gone) the LOGGED previous owner -- which is what the run
+left there -- so an ownership transfer made after the backfill never matches;
+and for aliases and feedback (visibility never changed) the logged previous
+visibility. A row is restored only while its current `(owner_id,
+visibility)` still equals that reconstruction. A row changed since the
+backfill (re-owned or transferred, re-shared, reclassified, or no longer
+resolvable) is left alone and reported `changed_since_backfill`. The previous owner must still be
 an `active` member of the row's workspace, else `previous_owner_inactive`.
 Rows that no longer match the personal predicate (`no_longer_personal`) or no
 longer exist (`deleted`) are itemized too, also under `--workspace-id`.
 Rows already holding their previous values are skipped, so a second restore
-of the same run changes nothing. Restore exit code: 0 only if every logged
-row within scope was restored (or already was; `deleted` rows are always
-listed, even under `--workspace-id`), 1 if any row was reported, 2 on error.
+of the same run changes nothing -- which is also why `restored` can be lower
+than the number of logged rows: grant-only entries (unresolved rows whose
+owner and visibility the run never changed) are skipped. Restore cannot tell
+an operator's manual owner fix from the backfill's own value when the fix
+set the same owner the rules assign (e.g. after a `derived_owner_changed` or
+`owner_not_mailbox_owner` report): such a row is restored to its logged
+previous owner like any other -- re-apply the fix after restoring.
+
+Restore exit code: 0 only if every logged row within scope was restored (or
+already was; `deleted` rows are always listed, even under `--workspace-id`),
+1 if any row was reported, 2 on error.
 
 Rollback runbook: every invocation gets its own run id (printed first on
 stderr), and a re-run after a flag re-enable logs its changes under a new one.
@@ -174,12 +268,20 @@ it.
 After a real run (or a restore) the knowledge projections must be rebuilt:
 `retrieval_documents` / `embedding_projections` built before the backfill may
 still carry content backed by now-private evidence (plan note N29(3)). This
-command does not do it itself (a separate, heavy, non-privacy-critical
-rebuild over every node that may load the embedding model and uses the app's
-own session settings); it prints the command to run:
+command does not do it itself (a separate, heavy rebuild over every node that
+may load the embedding model and uses the app's own session settings); it
+prints the command to run. The rebuild honours `ECC_PERSONAL_DATA_ISOLATION`
+from ITS OWN environment: run without it, it writes claims backed by private
+evidence back into the shared search text -- so after a backfill it must run
+with the flag on (and it refuses to run with the flag off once this log has
+rows, unless given `--allow-without-isolation`). It rebuilds in one
+transaction per invocation, so run it one workspace at a time:
 
-    PYTHONPATH=backend ECC_DATABASE_URL=<url> \
-        uv run python scripts/rebuild_knowledge_projections.py [--workspace-id <UUID>]
+    PYTHONPATH=backend ECC_DATABASE_URL=<url> ECC_PERSONAL_DATA_ISOLATION=true \
+        uv run python scripts/rebuild_knowledge_projections.py --workspace-id <UUID>
+
+After a rollback (flag off on the application, every run id restored) run it
+with the flag off and `--allow-without-isolation` instead.
 
 Retention of `personal_visibility_backfill_log` (plan notes N8/N9): it holds
 ids only (table name, row id, previous owner user id, visibility, grant
@@ -227,7 +329,7 @@ import sys
 from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Final, Literal
 from uuid import UUID, uuid4
 
@@ -246,9 +348,17 @@ _LOCK_TIMEOUT: Final = "5s"
 DEFAULT_BATCH_SIZE: Final = 500
 _MAX_BATCH_SIZE: Final = 10_000
 
+# The rebuild honours the flag from its own environment: without it, it
+# writes private-evidence-backed claims back into shared search text.
 REBUILD_COMMAND: Final = (
+    "PYTHONPATH=backend ECC_DATABASE_URL=<url> ECC_PERSONAL_DATA_ISOLATION=true "
+    "uv run python scripts/rebuild_knowledge_projections.py --workspace-id <UUID>"
+)
+# After a rollback (flag off on the application, every run id restored).
+REBUILD_AFTER_RESTORE_COMMAND: Final = (
     "PYTHONPATH=backend ECC_DATABASE_URL=<url> "
-    "uv run python scripts/rebuild_knowledge_projections.py [--workspace-id <UUID>]"
+    "uv run python scripts/rebuild_knowledge_projections.py --workspace-id <UUID> "
+    "--allow-without-isolation"
 )
 
 # Processing order matters: `ai_run_steps` follow their parent `ai_runs`.
@@ -264,10 +374,26 @@ TABLES: Final[tuple[str, ...]] = (
     "ai_run_steps",
     "pkos_evidence",
     "entity_aliases",
+    "tasks",
+    "commitments",
+    "risks",
+    "recommendation_feedback",
+    "attention_feedback",
 )
 _VERSIONED: Final[frozenset[str]] = frozenset(
-    {"connector_accounts", "recommendations", "entity_aliases"}
+    {"connector_accounts", "recommendations", "entity_aliases", "tasks", "commitments", "risks"}
 )
+# Rows derived from the personal data set
+# (`connector_security.PERSONAL_DERIVED_PREDICATES`, the single source): the
+# tasks/commitments/risks created by confirming an email recommendation
+# (plan note N23; `connector_security.EMAIL_DERIVED_TARGET_TYPES`) and the
+# feedback rows on an email recommendation / attention item. `main()`
+# refuses to run if that map names a table not listed here.
+_DERIVED_TABLES: Final[tuple[str, ...]] = ("tasks", "commitments", "risks")
+_FEEDBACK_TABLES: Final[tuple[str, ...]] = ("recommendation_feedback", "attention_feedback")
+# Tables whose visibility the backfill never changes (restore's
+# compare-and-set expects the logged previous visibility there).
+_VISIBILITY_KEPT: Final[frozenset[str]] = frozenset({"entity_aliases", *_FEEDBACK_TABLES})
 
 _DETECT_ACTION_PREFIX: Final = "gmail:detect_action:"
 _SYNC_PREFIX: Final = "gmail:"
@@ -279,6 +405,8 @@ Reason = Literal[
     "owner_not_mailbox_owner",
     "connector_owner_unknown",
     "alias_owner_inactive",
+    "derived_owner_changed",
+    "owner_inactive",
     "changed_since_backfill",
     "previous_owner_inactive",
     "no_longer_personal",
@@ -302,6 +430,29 @@ def _personal_data_set() -> tuple[Mapping[str, str], dict[str, object]]:
     return PERSONAL_ROW_PREDICATES, personal_sql_params()
 
 
+def _derived_predicates() -> Mapping[str, str]:
+    from ecc.platform.connector_security import PERSONAL_DERIVED_PREDICATES  # noqa: PLC0415
+
+    return PERSONAL_DERIVED_PREDICATES
+
+
+def _derived_sources_sql(table: str) -> str:
+    from ecc.platform.connector_security import email_derived_sources_sql  # noqa: PLC0415
+
+    return email_derived_sources_sql(table)
+
+
+def _uncovered_tables() -> set[str]:
+    """Tables of the personal data set or of its derived rows this command
+    has no rule for (it refuses to run while any exist)."""
+    from ecc.platform.connector_security import EMAIL_DERIVED_TARGET_TYPES  # noqa: PLC0415
+
+    uncovered = (set(_personal_data_set()[0]) | set(_derived_predicates())) - set(TABLES)
+    if set(EMAIL_DERIVED_TARGET_TYPES) != set(_DERIVED_TABLES):
+        uncovered |= set(EMAIL_DERIVED_TARGET_TYPES) ^ set(_DERIVED_TABLES)
+    return uncovered
+
+
 def _membership_lock_key(workspace_id: UUID) -> str:
     from ecc.platform.connector_security import membership_mutation_lock_key  # noqa: PLC0415
 
@@ -314,6 +465,7 @@ _GMAIL_ALIAS_PREDICATE: Final = (
     "EXISTS (SELECT 1 FROM pkos_evidence ev WHERE ev.workspace_id = entity_aliases.workspace_id "
     "AND ev.id = entity_aliases.source_id AND ev.source_type = :evidence_source_type)"
 )
+
 
 _EXTRA_COLUMNS: Final[Mapping[str, str]] = {
     "connector_accounts": "",
@@ -339,12 +491,20 @@ _EXTRA_COLUMNS: Final[Mapping[str, str]] = {
         ", (SELECT ev.source_ref FROM pkos_evidence ev WHERE ev.id = entity_aliases.source_id "
         "AND ev.workspace_id = entity_aliases.workspace_id) AS source_ref"
     ),
+    # The source recommendation is resolved per batch (`_derived_row_
+    # decisions`), never as a per-row subquery here.
+    **{table: f", {table}.created_by" for table in _DERIVED_TABLES},
+    **{table: "" for table in _FEEDBACK_TABLES},
 }
 
 
 def _row_predicate(table: str) -> str:
     if table == "entity_aliases":
         return _GMAIL_ALIAS_PREDICATE
+    if table in _DERIVED_TABLES or table in _FEEDBACK_TABLES:
+        # One top-level `EXISTS` (planned as a semi-join, index-probed via
+        # migration 0083 for the derived tables), never a per-row SubPlan.
+        return _derived_predicates()[table]
     return _personal_data_set()[0][table]
 
 
@@ -369,9 +529,16 @@ def _batch_sql(table: str, *, lock: bool) -> str:
 class Target:
     owner_id: UUID
     visibility: str
-    # Set when the row is still changed (made private, owner kept) but must
-    # also be reported: its owner could not be verified as the mailbox owner.
+    # Set when the row is still changed (made private) but must also be
+    # reported: its owner could not be verified as the mailbox owner, or
+    # (`owner_inactive`) it is re-owned to a member who is no longer active.
     reason: Reason | None = None
+    # True when `owner_id` is the row's own current owner by construction
+    # ("owner unchanged"), not an owner the rules derive from other rows.
+    # `--restore`'s compare-and-set then expects the logged previous owner
+    # (what the backfill actually left there), so a transfer made after the
+    # backfill is detected instead of trivially matching.
+    keeps_owner: bool = False
 
 
 @dataclass(frozen=True)
@@ -469,9 +636,11 @@ def _ai_run_decisions(
             mailbox_owner
         )
         if row["owner_id"] != mailbox_owner or contradicted:
-            decisions[row["id"]] = Target(row["owner_id"], "private", "owner_not_mailbox_owner")
+            decisions[row["id"]] = Target(
+                row["owner_id"], "private", "owner_not_mailbox_owner", keeps_owner=True
+            )
         else:
-            decisions[row["id"]] = Target(mailbox_owner, "private")
+            decisions[row["id"]] = Target(mailbox_owner, "private", keeps_owner=True)
     return decisions
 
 
@@ -479,7 +648,12 @@ def _decide(
     conn: Connection, table: str, workspace_id: UUID, rows: Sequence[Mapping[str, Any]]
 ) -> dict[UUID, Decision]:
     if table == "connector_accounts":
-        return {r["id"]: Target(r["owner_id"], "private") for r in rows}
+        return {r["id"]: Target(r["owner_id"], "private", keeps_owner=True) for r in rows}
+    if table in _FEEDBACK_TABLES:
+        # Owner (the member who gave the feedback) and visibility unchanged:
+        # the flag-on writers still write them so (see the module
+        # docstring); only their active grants are revoked.
+        return {r["id"]: Target(r["owner_id"], r["visibility"], keeps_owner=True) for r in rows}
     if table in ("sync_runs", "sync_cursors"):
         return {
             r["id"]: (
@@ -487,18 +661,27 @@ def _decide(
                 if r["mailbox_owner"] is not None
                 # Defensive; unreachable today: the personal predicate needs
                 # the connector row, whose `owner_id` is NOT NULL.
-                else Target(r["owner_id"], "private", "connector_owner_unknown")
+                else Target(r["owner_id"], "private", "connector_owner_unknown", keeps_owner=True)
             )
             for r in rows
         }
     if table == "attention_items":
-        return {r["id"]: Target(r["thread_owner"] or r["owner_id"], "private") for r in rows}
+        return {
+            r["id"]: (
+                Target(r["thread_owner"], "private")
+                if r["thread_owner"] is not None
+                else Target(r["owner_id"], "private", keeps_owner=True)
+            )
+            for r in rows
+        }
     if table == "recommendations":
         return _recommendation_decisions(conn, workspace_id, rows)
     if table == "ai_runs":
         return _ai_run_decisions(conn, workspace_id, rows)
     if table == "ai_run_steps":
         return _step_decisions(conn, workspace_id, rows)
+    if table in _DERIVED_TABLES:
+        return _derived_row_decisions(conn, table, workspace_id, rows)
     if table in ("pkos_evidence", "entity_aliases"):
         owners = _refs_owners(conn, workspace_id, [r["source_ref"] for r in rows])
         decisions: dict[UUID, Decision] = {}
@@ -544,9 +727,11 @@ def _recommendation_decisions(
             if isinstance(resolved, UUID) and resolved != mailbox_owner:
                 contradicted = True
         if r["owner_id"] != mailbox_owner or contradicted:
-            decisions[r["id"]] = Target(r["owner_id"], "private", "owner_not_mailbox_owner")
+            decisions[r["id"]] = Target(
+                r["owner_id"], "private", "owner_not_mailbox_owner", keeps_owner=True
+            )
         else:
-            decisions[r["id"]] = Target(mailbox_owner, "private")
+            decisions[r["id"]] = Target(mailbox_owner, "private", keeps_owner=True)
     return decisions
 
 
@@ -564,10 +749,80 @@ def _step_decisions(
             {"ws": workspace_id, "ids": run_ids},
         ).all()
     ]
-    # A step follows its parent's decision -- including an unresolved one:
-    # never re-own a step to a parent owner the parent rule did not verify.
+    # A step follows its parent's decision -- including a reported one:
+    # private with the parent's current owner, reported with its reason.
+    # That owner is the parent's, not the step's own, so for the step it is
+    # a derived owner (`keeps_owner` False).
     parent_decisions = _ai_run_decisions(conn, workspace_id, parents)
-    return {r["id"]: parent_decisions[r["run_id"]] for r in rows}
+    return {r["id"]: replace(parent_decisions[r["run_id"]], keeps_owner=False) for r in rows}
+
+
+def _derived_row_decisions(
+    conn: Connection, table: str, workspace_id: UUID, rows: Sequence[Mapping[str, Any]]
+) -> dict[UUID, Decision]:
+    """A task/commitment/risk created from an email recommendation takes
+    that recommendation's target owner, `private` -- re-owned only while it
+    still has the owner the confirm wrote (the recommendation's owner, or
+    `created_by`: the flag-off confirm wrote the confirming member) and the
+    recommendation's own owner is verified; otherwise `private` with its
+    current owner, reported. Re-owned to a member who is no longer active:
+    still re-owned (DS2: a removed member's personal rows stay theirs,
+    private -- never handed to an admin), reported `owner_inactive`.
+
+    The source recommendations of the whole batch are resolved by ONE
+    uncorrelated set query (`connector_security.email_derived_sources_sql`,
+    migration 0083's index), never a per-row subquery."""
+    source_of: dict[UUID, UUID] = {}
+    if rows:
+        for rec_id, target_id in conn.execute(
+            text(_derived_sources_sql(table)),
+            {"workspace_id": workspace_id, "target_ids": [str(r["id"]) for r in rows]},
+        ).all():
+            row_id = UUID(target_id)
+            # Several confirms of one target cannot happen (the create
+            # writes a new row); pick the lowest id, deterministically.
+            if row_id not in source_of or rec_id < source_of[row_id]:
+                source_of[row_id] = rec_id
+    sources = [
+        dict(s._mapping)
+        for s in conn.execute(
+            text(
+                "SELECT id, owner_id, visibility, created_by, evidence_ids "
+                "FROM recommendations WHERE workspace_id = :ws AND id = ANY(:ids)"
+            ),
+            {"ws": workspace_id, "ids": sorted(set(source_of.values()))},
+        ).all()
+    ]
+    source_decisions = _recommendation_decisions(conn, workspace_id, sources)
+    decisions: dict[UUID, Decision] = {}
+    reowned: dict[UUID, UUID] = {}
+    for r in rows:
+        rec_id = source_of.get(r["id"])
+        source = source_decisions.get(rec_id) if rec_id is not None else None
+        if source is None:
+            # Unreachable: the batch's predicate matched this row's source in
+            # the same transaction, and executed recommendations are never
+            # deleted (the Gmail cascade redacts them in place). Change
+            # nothing but the grants.
+            decisions[r["id"]] = Target(r["owner_id"], r["visibility"], keeps_owner=True)
+        elif isinstance(source, Unresolved):  # never today: recommendations always get a Target
+            decisions[r["id"]] = source
+        elif source.reason is not None:
+            # Never re-own to an owner the recommendation rule did not verify.
+            decisions[r["id"]] = Target(r["owner_id"], "private", source.reason, keeps_owner=True)
+        elif r["owner_id"] not in (source.owner_id, r["created_by"]):
+            decisions[r["id"]] = Target(
+                r["owner_id"], "private", "derived_owner_changed", keeps_owner=True
+            )
+        else:
+            decisions[r["id"]] = Target(source.owner_id, "private")
+            if source.owner_id != r["owner_id"]:
+                reowned[r["id"]] = source.owner_id
+    active = _active_members(conn, workspace_id, set(reowned.values()))
+    for row_id, owner in reowned.items():
+        if owner not in active:
+            decisions[row_id] = Target(owner, "private", "owner_inactive")
+    return decisions
 
 
 # ---------------------------------------------------------------------------
@@ -948,6 +1203,20 @@ def _restore_select(table: str, *, lock: bool) -> str:
     )
 
 
+def _value_set_by_backfill(
+    table: str, decision: Target, prev_owner: UUID | None, prev_vis: str
+) -> tuple[UUID | None, str]:
+    """The `(owner_id, visibility)` the backfill left on a row, rebuilt from
+    the rules applied to the row as it is now plus the logged previous
+    values: an owner the rules keep (`keeps_owner`) was the previous owner,
+    and a table whose visibility the backfill never changes kept the
+    previous visibility. A row whose owner was transferred since therefore
+    no longer matches, even where the rules would now keep that new owner."""
+    owner = prev_owner if decision.keeps_owner else decision.owner_id
+    visibility = prev_vis if table in _VISIBILITY_KEPT else decision.visibility
+    return owner, visibility
+
+
 def _restore_batch(
     conn: Connection,
     by_table: Mapping[str, list[tuple[UUID, str, UUID | None]]],
@@ -1026,11 +1295,8 @@ def _restore_batch(
             if current == (prev_owner, prev_vis):
                 continue  # already restored (idempotent re-run)
             decision = decisions[row_id]
-            still_backfilled = (
-                isinstance(decision, Target)
-                and current == (decision.owner_id, decision.visibility)
-                # Aliases keep their visibility; the run never changed it.
-                and (table != "entity_aliases" or row["visibility"] == prev_vis)
+            still_backfilled = isinstance(decision, Target) and current == _value_set_by_backfill(
+                table, decision, prev_owner, prev_vis
             )
             reason: Reason | None = None
             if not still_backfilled:
@@ -1182,10 +1448,18 @@ def _summarize(report: Report, *, mode: str, run_id: UUID, target: str) -> None:
     print(f"unresolved rows: {len(report.unresolved)}", file=sys.stderr)
     if mode == "restore":
         print("revoked resource_grants were NOT restored", file=sys.stderr)
-    if mode != "dry-run":
+    if mode == "backfill":
         print(
-            "REMINDER: rebuild retrieval documents and embeddings now "
-            f"(plan note N29(3)): {REBUILD_COMMAND}",
+            "REMINDER: rebuild retrieval documents and embeddings now, one workspace "
+            "at a time and WITH the isolation flag (without it the rebuild writes "
+            f"private-evidence-backed claims back into shared search text): {REBUILD_COMMAND}",
+            file=sys.stderr,
+        )
+    elif mode == "restore":
+        print(
+            "REMINDER: after restoring EVERY run id (flag off on the application), rebuild "
+            "retrieval documents and embeddings, one workspace at a time: "
+            f"{REBUILD_AFTER_RESTORE_COMMAND}",
             file=sys.stderr,
         )
 
@@ -1224,9 +1498,15 @@ def main(argv: list[str] | None = None) -> int:
         target = _describe_target(database_url)
         # Surfaces any ecc import/settings error here, and refuses to run if
         # the personal data set has grown a table this command does not know.
-        uncovered = set(_personal_data_set()[0]) - set(TABLES)
+        uncovered = _uncovered_tables()
         if uncovered:
-            raise RuntimeError("personal data set has tables this backfill does not handle")
+            print(
+                "backfill_personal_visibility: refusing to run: the personal data set "
+                "(or its derived rows) names tables this backfill has no rule for: "
+                + ", ".join(sorted(uncovered)),
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
         engine = create_engine(database_url, poolclass=NullPool, hide_parameters=True)
         try:
             if args.workspace_id is not None and not _workspace_exists(engine, args.workspace_id):
