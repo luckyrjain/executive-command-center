@@ -101,6 +101,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import Any, Literal
 from uuid import UUID
 
@@ -112,6 +113,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext
 from ecc.platform.connector_security import (
+    PERSONAL_DERIVED_PREDICATES,
     PERSONAL_ROW_PREDICATES,
     personal_data_isolation_enabled,
     personal_sql_params,
@@ -396,8 +398,38 @@ _UNOWNABLE_FOR_REMOVAL_PURPOSES: frozenset[str] = frozenset({"audit_events"})
 # deliberately absent: `membership_removal` re-owns Gmail-only person nodes
 # (and the member's Gmail-derived aliases follow their node's owner)
 # *before* this check, so every node or alias the member still owns here
-# blocks.
-_PERSONAL_ROWS_NOT_BLOCKING_REMOVAL: Mapping[str, str] = PERSONAL_ROW_PREDICATES
+# blocks. Plus the rows derived from the personal data set
+# (`PERSONAL_DERIVED_PREDICATES`: tasks/commitments/risks created by
+# confirming an email recommendation; feedback on an email recommendation or
+# email attention item) -- share-refused,
+# so a blocking one could never be transferred away; retained with the
+# member (DS2).
+_PERSONAL_ROWS_NOT_BLOCKING_REMOVAL: Mapping[str, str] = MappingProxyType(
+    {**PERSONAL_ROW_PREDICATES, **PERSONAL_DERIVED_PREDICATES}
+)
+
+
+def _owned_count_sql(resource_type: str, *, exclude_personal_data: bool) -> str:
+    """`owned_resource_summary`'s count for one table (bind `workspace_id`,
+    `users_id`, and `personal_sql_params()` when excluding personal data).
+    `resource_type` must come from `_RESOURCE_TABLES`."""
+    not_blocking = (
+        _PERSONAL_ROWS_NOT_BLOCKING_REMOVAL.get(resource_type) if exclude_personal_data else None
+    )
+    if not not_blocking:
+        extra = ""
+    elif resource_type in PERSONAL_DERIVED_PREDICATES:
+        # A single never-NULL `EXISTS` (see `PERSONAL_DERIVED_PREDICATES`): a
+        # top-level `NOT EXISTS` is planned as one anti-join (index-probed or
+        # hashed once), where the COALESCE wrapper would force a correlated
+        # SubPlan per owned row.
+        extra = f" AND NOT {not_blocking}"
+    else:
+        extra = f" AND NOT COALESCE(({not_blocking}), false)"
+    return (
+        f"SELECT count(*) FROM {resource_type} "  # noqa: S608
+        f"WHERE workspace_id = :workspace_id AND owner_id = :users_id{extra}"
+    )
 
 
 def owned_resource_summary(
@@ -448,17 +480,8 @@ def owned_resource_summary(
     if exclude_personal_data:
         params.update(personal_sql_params())
     for resource_type in sorted(_RESOURCE_TABLES - excluded):
-        not_blocking = (
-            _PERSONAL_ROWS_NOT_BLOCKING_REMOVAL.get(resource_type)
-            if exclude_personal_data
-            else None
-        )
-        extra = f" AND NOT COALESCE(({not_blocking}), false)" if not_blocking else ""
         count = session.execute(
-            text(
-                f"SELECT count(*) FROM {resource_type} "  # noqa: S608
-                f"WHERE workspace_id = :workspace_id AND owner_id = :users_id{extra}"
-            ),
+            text(_owned_count_sql(resource_type, exclude_personal_data=exclude_personal_data)),
             params,
         ).scalar_one()
         if count:

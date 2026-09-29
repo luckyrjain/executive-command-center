@@ -727,6 +727,14 @@ def remove_member_endpoint(
         # every `pkos_nodes` row still owned after the re-own above does --
         # so a node whose evidence changed concurrently is either re-owned
         # or blocks, never silently left owned by a removed member.
+        if isolation:
+            # Defensive: the personal/derived exclusions give these counts
+            # large, badly-estimated plan costs, and JIT compilation (which
+            # starts above `jit_above_cost`) would add fixed overhead to
+            # queries that run in milliseconds -- under the exclusive
+            # membership lock and the 5 s statement timeout. JIT buys nothing
+            # here. Transaction-local.
+            session.execute(text("SET LOCAL jit = off"))
         owned = authz.owned_resource_summary(
             session,
             workspace_id=auth.workspace_id,

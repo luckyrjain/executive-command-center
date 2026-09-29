@@ -113,12 +113,110 @@ PERSONAL_ROW_PREDICATES: Final[Mapping[str, str]] = MappingProxyType(
     }
 )
 
+# Rows DERIVED from the personal data set (deep review F2, plan task FX3):
+# the task/commitment/risk a confirmed `email_action_detected`
+# recommendation created (`recommendation_targets._execute_create`) copies
+# email-derived content (title/summary) and, flag on, is written private to
+# the recommendation's owner (plan note N23); plus the feedback rows on an
+# email recommendation or an email attention item. Same boolean-fragment
+# contract as `PERSONAL_ROW_PREDICATES` (unaliased `<table>` row, bound with
+# `personal_sql_params()` -- these need none), and additionally every
+# fragment is a single `EXISTS (...)`, never NULL: `authz.owned_resource_
+# summary` uses them as a top-level `NOT <fragment>`, which the planner turns
+# into one anti-join (hashed once, or index-probed via migration 0083's
+# `(workspace_id, execution_result ->> 'operation', ->> 'target_type',
+# ->> 'target_id')` index -- partial on `recommendation_type =
+# 'email_action_detected' AND execution_result IS NOT NULL` -- the workspace
+# taken from the outer `workspace_id = :workspace_id`) instead of a
+# correlated SubPlan per row.
+#
+# Share-refused like the personal data set (`is_personal_resource`) and never
+# blocking member removal (`authz._PERSONAL_ROWS_NOT_BLOCKING_REMOVAL`), but
+# deliberately a separate map: the T15 backfill and the T18 audit iterate
+# `PERSONAL_ROW_PREDICATES` with per-table owner rules (the backfill refuses
+# to run when that map names a table outside its `TABLES`), and neither has
+# a rule for derived rows. `personal_derived_row_scope` also stays on the
+# personal data set only (a derived row is not a source of derived rows).
+#
+# Provenance is the executed recommendation itself: only
+# `confirm_recommendation` writes `execution_result`, once, and an executed
+# email recommendation is redacted in place -- never deleted -- by the
+# Gmail revocation cascade, so no provenance column (and no backfill of
+# one) is needed, and rows confirmed while the flag was off are recognised
+# too. Those flag-off-era rows are still `workspace`-visible until the FX2
+# backfill rule makes them private (plan note N40): with the flag on they are
+# share-refused and no longer block removal, so FX3 must ship with or after
+# that backfill rule (rollout runbook). `operation = 'create'` matters: a
+# non-create email recommendation records the pre-existing row it changed as
+# `target_id`. The type is a literal, not `:recommendation_type`, so the
+# partial index `ix_recommendations_email_derived_target` is provably usable
+# by generic (prepared) plans as well.
+_EMAIL_DERIVED_TARGET_OF = (
+    "EXISTS (SELECT 1 FROM recommendations derived_rec "
+    "WHERE derived_rec.workspace_id = {table}.workspace_id "
+    "AND (derived_rec.execution_result ->> 'target_id') = {table}.id::text "
+    "AND derived_rec.recommendation_type = 'email_action_detected' "
+    "AND derived_rec.execution_result IS NOT NULL "
+    "AND derived_rec.execution_result ->> 'operation' = 'create' "
+    "AND derived_rec.execution_result ->> 'target_type' = '{target_type}')"
+)
+PERSONAL_DERIVED_PREDICATES: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        **{
+            table: _EMAIL_DERIVED_TARGET_OF.format(table=table, target_type=target_type)
+            for table, target_type in (
+                ("tasks", "task"),
+                ("commitments", "commitment"),
+                ("risks", "risk"),
+            )
+        },
+        # Accept/dismiss/defer feedback on an email recommendation, owned by
+        # the member who gave it (`actor_id`, migration 0063). Confirming an
+        # email recommendation writes one, so without this every member who
+        # acted on their own email recommendations stayed removal-blocked
+        # (and an admin would have to transfer the feedback to themselves).
+        # Primary-key probe of the parent recommendation.
+        "recommendation_feedback": (
+            "EXISTS (SELECT 1 FROM recommendations derived_rec "
+            "WHERE derived_rec.id = recommendation_feedback.recommendation_id "
+            "AND derived_rec.workspace_id = recommendation_feedback.workspace_id "
+            "AND derived_rec.recommendation_type = 'email_action_detected')"
+        ),
+        # Useful/not-useful feedback on an email attention item (written
+        # `workspace`, owned by the actor: `attention.record_attention_
+        # feedback`) -- same gap. Primary-key probe of the parent item.
+        # Limitation: once the item is deleted -- by the Gmail revocation
+        # cascade, or by the routine attention recompute
+        # (`attention.py`'s regenerate deletes an `email_thread` item whose
+        # thread is no longer eligible) -- its feedback is no longer
+        # recognisable (no FK, no provenance): shareable and removal-
+        # blocking again, i.e. exactly the pre-FX3 baseline, no worse.
+        "attention_feedback": (
+            "EXISTS (SELECT 1 FROM attention_items derived_item "
+            "WHERE attention_feedback.target_type = 'attention_item' "
+            "AND derived_item.id = attention_feedback.target_id "
+            "AND derived_item.workspace_id = attention_feedback.workspace_id "
+            "AND derived_item.entity_type = 'email_thread')"
+        ),
+    }
+)
+
 _PERSONAL_PREDICATES: Final[dict[str, str]] = {
     table: f"SELECT EXISTS (SELECT 1 FROM {table} WHERE {table}.id = :id AND ({fragment}))"  # noqa: S608
     for table, fragment in PERSONAL_ROW_PREDICATES.items()
 }
 
 PERSONAL_RESOURCE_TYPES: Final[frozenset[str]] = frozenset(_PERSONAL_PREDICATES)
+
+# What `is_personal_resource` (every S1.3 share path) checks: the personal
+# data set plus the rows derived from it.
+_SHARE_REFUSED_STATEMENTS: Final[dict[str, str]] = {
+    **_PERSONAL_PREDICATES,
+    **{
+        table: f"SELECT EXISTS (SELECT 1 FROM {table} WHERE {table}.id = :id AND ({fragment}))"  # noqa: S608
+        for table, fragment in PERSONAL_DERIVED_PREDICATES.items()
+    },
+}
 
 # `owner_id` of a personal-data row by id (no row -> not personal data).
 _PERSONAL_OWNER_STATEMENTS: Final[dict[str, str]] = {
@@ -170,12 +268,14 @@ class PersonalDataNotGrantable(Exception):
 
 def is_personal_resource(session: Session, resource_type: str, resource_id: UUID) -> bool:
     """True iff `(resource_type, resource_id)` is a row in Spec A's personal
-    data set. Any resource_type outside that set -> False (no query). A
-    nonexistent id -> False.
+    data set, or a row derived from it (`PERSONAL_DERIVED_PREDICATES`) --
+    i.e. a row no S1.3 share path (grant, preview, transfer, delegation)
+    may share, whoever asks. Any other resource_type -> False (no query).
+    A nonexistent id -> False.
     """
-    # `statement` is a code-defined `_PERSONAL_PREDICATES` value, never
-    # request text; `resource_type` only selects which one.
-    statement = _PERSONAL_PREDICATES.get(resource_type)
+    # `statement` is a code-defined `_SHARE_REFUSED_STATEMENTS` value,
+    # never request text; `resource_type` only selects which one.
+    statement = _SHARE_REFUSED_STATEMENTS.get(resource_type)
     if statement is None:
         return False
     result = session.execute(
