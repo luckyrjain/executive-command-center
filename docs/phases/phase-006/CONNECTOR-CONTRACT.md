@@ -2,8 +2,9 @@
 id: PHASE-006-CONNECTOR
 title: Engineering Connector Contract
 status: Approved for Implementation
-version: 0.14.1
+version: 0.15.0
 owner: Lucky Jain
+updated: 2026-09-29
 ---
 
 # Engineering Connector Contract
@@ -57,6 +58,8 @@ Disconnect and delete are two distinct, separately confirmed operations. Disconn
 ## Accepted limitation (Task 1)
 
 Disconnect's provider-side credential revocation is best-effort: if the adapter's `disconnect()` call itself fails (or the stored credential cannot be decrypted, e.g. after an encryption-key rotation without re-encryption), the connector is still marked `disconnected` and future sync still stops -- a revocation failure must never block a caller from severing the connection. The provider-side credential may remain live until revoked through the provider's own console in that case; this is disclosed here rather than silently assumed away.
+
+**`disconnect()` reports whether the provider grant is gone (Security Remediation FX6).** Returning normally means the provider confirmed the grant is gone, or `disconnect()` is a documented no-op -- because the provider has no revocation API this connector can call (GitHub, Jira, Datadog), or, for GitLab, by the deliberate choice recorded below despite its `DELETE /personal_access_tokens/self` endpoint. These no-op adapters still must not raise. Raising means the grant may still be live: `GmailAdapter.disconnect()` raises `GmailRevokeFailed` for a transport error, a Google 5xx, a Google 4xx other than `invalid_token`, a stored credential that cannot be unpacked, or a missing/empty `refresh_token`. Google's HTTP 400 `{"error": "invalid_token"}` (token already revoked or unknown) counts as success. Callers never call `disconnect()` directly: every site goes through `ecc.platform.connector_security.revoke_guarded` (via `revoke_if_safe` or directly), which never raises, logs only the exception class, and counts `ecc_connector_revoke_total{provider,site,result}` -- `ok` when `disconnect()` returns, `error` when it raises. So `result="error"` means the grant may still be live at the provider, and the operator may need to revoke it there (for Gmail, see `docs/runbooks/PHASE-10-GMAIL-RECOVERY.md`). The disconnect, removal, purge or remediation the user asked for succeeds either way.
 
 ## Task 2 status
 
@@ -172,3 +175,9 @@ No sync/adapter code path ever writes the confirmed `team_entity_id` column itse
 - **Dashboards**: `GET /api/v1/dashboard`'s list response is not confirmed to include a `tags` field at all (only the full single-dashboard `GET` does, which this adapter does not call per-dashboard to avoid an N+1 sync) -- `suggested_team_name` will, in practice, very likely always resolve to `None` for this one resource type. A disclosed limitation, not a broken feature.
 
 **No confirm endpoint exists yet for any of these three tables** -- unlike `repositories`/`engineering_work_items`, `datadog_monitors`/`datadog_service_definitions`/`datadog_dashboards` were deliberately *not* given a `team_assignment_version`/`team_assignment_updated_by` pair in migration `0051`. A version column no endpoint ever bumps would be exactly as unreachable as the fields it would sit next to -- the same reasoning this migration's own docstring uses to justify not repeating that specific mistake. `team_entity_id`/`suggested_team_name` are still surfaced read-only on the three new list endpoints (queryable via a `team_entity_id` filter, matching `list_repositories_endpoint`'s identical filter), but writing a confirmed link for these three tables -- the endpoints, the frontend UI, and the version/audit columns together -- is deliberately deferred to its own follow-up task.
+
+## Changelog
+
+| Version | Date | Summary | Author |
+|---|---|---|---|
+| 0.15.0 | 2026-09-29 | Security Remediation FX6: `disconnect()` raises when a provider grant may still be live (Gmail `GmailRevokeFailed`), so `ecc_connector_revoke_total{result="error"}` is truthful; no-op adapters unchanged | Lucky Jain |

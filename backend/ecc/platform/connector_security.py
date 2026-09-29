@@ -453,6 +453,11 @@ def revoke_is_safe(
 
 
 class _Disconnector[C](Protocol):
+    """`ConnectorAdapter.disconnect`. Returning normally means the grant is
+    gone or the provider has no revoke API (a documented no-op); raising
+    means the provider grant may still be live (e.g. `GmailAdapter`'s
+    `GmailRevokeFailed`). See `CONNECTOR-CONTRACT.md`."""
+
     def disconnect(self, account: C) -> None: ...
 
 
@@ -461,8 +466,11 @@ def revoke_guarded[C](
 ) -> bool:
     """Best-effort provider-side revoke that never raises. Logs only the
     exception class (never its message, the credential, or the account's
-    email) and counts `ecc_connector_revoke_total{provider,site,result}`.
-    Returns True on success.
+    email) and counts `ecc_connector_revoke_total{provider,site,result}`:
+    `ok` when `disconnect` returns, `error` when it raises -- for Gmail
+    that includes a Google refusal, a transport error and an unusable
+    stored credential, so `error` means the grant may still be live at
+    the provider. Returns True on success.
     """
     try:
         adapter.disconnect(context)

@@ -199,6 +199,12 @@ class FakeGoogle:
         # in call order -- a revoke during or after the fixture's lifetime
         # lands here instead of on the network.
         self.revoked_tokens: list[str] = []
+        # `/revoke` reply knobs (FX6): Google's status code and JSON body
+        # (None -> empty body), or a transport error instead of a reply.
+        # The token is recorded either way (it was sent).
+        self.revoke_status_code: int = 200
+        self.revoke_body: dict[str, Any] | None = None
+        self.revoke_transport_error: bool = False
 
     @staticmethod
     def access_token(key: str) -> str:
@@ -248,7 +254,11 @@ class FakeGoogle:
         if path == "/revoke":
             form = {k: v[0] for k, v in parse_qs(request.content.decode()).items()}
             self.revoked_tokens.append(form.get("token", ""))
-            return httpx.Response(200)
+            if self.revoke_transport_error:
+                raise httpx.ConnectError("fake revoke transport error", request=request)
+            if self.revoke_body is None:
+                return httpx.Response(self.revoke_status_code)
+            return _json(self.revoke_body, status_code=self.revoke_status_code)
 
         token = request.headers.get("authorization", "").removeprefix("Bearer ")
         mailbox = self._by_access_token.get(token)

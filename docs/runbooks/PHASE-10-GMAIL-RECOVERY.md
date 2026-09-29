@@ -2,9 +2,9 @@
 id: PHASE-10-GMAIL-RECOVERY
 title: Phase 10 Gmail Recovery Runbook
 status: Active
-version: 2.1.0
+version: 2.2.0
 owner: Lucky Jain
-updated: 2026-09-28
+updated: 2026-09-29
 ---
 
 # Phase 10 Gmail Recovery Runbook
@@ -29,6 +29,10 @@ The consent revocation cascade described above (Supported operator action 5) is 
 
 Known limitation (FX5): a manual sync holds the Gmail connector row locked while it refreshes an expired OAuth access token (up to 10s). Anything that re-checks consent for that connector or owner in the meantime -- another Gmail write, an on-demand thread body fetch, or confirming an `email_action_detected` recommendation (`POST /api/v1/recommendations/<id>/confirm`) -- waits on that lock and can hit the 5s statement timeout, returning a generic `500` with nothing written. It is safe to retry after a few seconds. Moving the refresh out of the locked section is planned (Spec B).
 
+## Google revoke failed (`ecc_connector_revoke_total{provider="gmail",result="error"}`)
+
+Every Gmail revoke -- member removal (`site="removal"`), the consent revocation cascade (`site="cascade"`), connector disable, reconnect and callback clean-up (`disable`, `reconnect_replaced`, `callback_duplicate`, `callback_failure`, `adapter_callback`), and the ownership remediation script (`remediation`) -- now counts what Google actually said (Security Remediation FX6). `result="ok"` means Google accepted the revoke (a 2xx) or answered HTTP 400 `invalid_token`, meaning the stored token is already revoked, expired or unknown to Google. In the rare case of a corrupted or mismatched stored token, `invalid_token` does not prove the account's real grant is gone; if in doubt, ask the mailbox owner to check Google's third-party access list. `result="error"` means the grant **may still be live at Google**: a transport error, a Google 5xx, any other Google 4xx, a stored credential that could not be decrypted or unpacked, or no refresh token to send. The disconnect, removal or purge itself still succeeded -- local data handling does not depend on Google's reply -- and the revoke is not retried (a row already `disconnected` is never re-revoked). Logs carry only `connector_revoke_failed provider=gmail site=<site> error_class=GmailRevokeFailed` and `gmail_revoke_failed: reason=<code> status=<http status>` (reason one of `transport_error`, `provider_5xx`, `provider_4xx`, `provider_unexpected_status`, `bad_credential`, `missing_refresh_token`), never the token or the email. On an `error` count, identify the affected connector from the matching disconnect, removal or purge audit event (the log lines carry no account identifiers) and ask the mailbox owner to remove this app's access at Google themselves (Google Account > Security > Third-party apps with account access), then record that as the Google-side revocation evidence below. `result="skipped_unsafe"` is unchanged: the revoke was deliberately not attempted because another live connection uses the same Google account.
+
 ## Evidence to retain
 
 Record connector and sync-run IDs, consent state (not consent content), timestamps, safe error code, whether Google-side revocation was verified, thread/message counts without message content, and reviewer. Never retain email addresses, subjects, message IDs, headers, tokens, or OAuth codes in public artifacts.
@@ -37,4 +41,5 @@ Record connector and sync-run IDs, consent state (not consent content), timestam
 
 | Version | Date | Summary | Author |
 |---|---|---|---|
+| 2.2.0 | 2026-09-29 | Security Remediation FX6: Gmail revoke failures (Google refusal, transport error, unusable credential) now count `result="error"`; added the "Google revoke failed" section on what that means and the manual revoke at Google | Lucky Jain |
 | 2.1.0 | 2026-09-28 | Security Remediation FX5: a revoked/absent email consent now ends a sync as `403 EMAIL_CONSENT_NOT_ACTIVE` with the run `failed` and the cursor not advanced (was `partial`); every Gmail write, including recommendation confirm, re-checks consent under the cascade's locks; added the token-refresh lock-wait known limitation | Lucky Jain |

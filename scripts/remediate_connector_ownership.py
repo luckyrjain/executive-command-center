@@ -45,11 +45,9 @@ Runbook:
     already disconnected is never re-revoked) -- have the mailbox owner
     revoke the app's access in their Google account instead.
     `skipped_unsafe` is expected while another live row uses that account.
-    Caveat (tracked as FX6): the Gmail adapter's revoke currently reports
-    success even when Google rejects the call or the transport fails, so
-    until FX6 lands `revoke=ok` only means "revoke attempted" -- for A/E
-    rows where it matters, have the mailbox owner confirm in their Google
-    account that the app's access is gone.
+    `revoke=ok` means Google accepted the revoke (a 2xx) or said the stored
+    token is already revoked, expired or unknown (`invalid_token`); a Google refusal,
+    a transport error or an unusable stored credential is `error` (FX6).
  5. Re-run the audit: A/E rows (and mismatched B/D connectors) now show
     `row_status=disconnected`. Re-running this command reports every
     handled row as `already_disconnected` / `already_recorded`.
@@ -125,7 +123,7 @@ ref_ids, outcome, revoke`. Outcomes: disconnected, already_disconnected,
 review_recorded, already_recorded, would_disconnect, would_record,
 not_flagged (unknown id, another workspace, or not flagged by that check --
 deliberately not distinguished), not_confirmed (declined at the prompt).
-Revoke: ok (attempted -- see the FX6 caveat above), error, skipped_unsafe,
+Revoke: ok (Google confirmed -- see step 4 above), error, skipped_unsafe,
 credential_unavailable, interrupted, would_revoke, would_skip_unsafe, or
 empty. `--dry-run` simulates the run: a row flagged by several checks is
 `would_disconnect` once and `already_disconnected` for its other targets.

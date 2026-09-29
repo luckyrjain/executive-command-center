@@ -110,7 +110,7 @@ from email.errors import InvalidHeaderDefect
 from email.headerregistry import HeaderRegistry
 from email.utils import getaddresses, parseaddr
 from hashlib import sha256
-from typing import Any, cast
+from typing import Any, Literal, NoReturn, cast
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
@@ -252,6 +252,57 @@ class _TokenRefreshFailed(AdapterAuthorizationError):
     def __init__(self, message: str, error: GmailRefreshRejectedError = "other") -> None:
         super().__init__(message)
         self.error: GmailRefreshRejectedError = error
+
+
+# Why a Gmail revoke did not end the grant (FX6). Static codes only: they
+# are safe to log and never carry the token, the email or Google's body.
+GmailRevokeFailureReason = Literal[
+    "bad_credential",
+    "missing_refresh_token",
+    "transport_error",
+    "provider_4xx",
+    "provider_5xx",
+    "provider_unexpected_status",
+]
+
+
+class GmailRevokeFailed(Exception):  # noqa: N818 -- mirrors `_TokenRefreshFailed`
+    """`GmailAdapter.disconnect` could not confirm that Google ended the
+    grant, so it may still be live. Raised so `connector_security.
+    revoke_guarded` (the only caller) counts `result="error"`; that guard
+    never lets it reach its own callers. The message is the static
+    `reason` code only -- never the token, the email or Google's reply."""
+
+    def __init__(self, reason: GmailRevokeFailureReason) -> None:
+        super().__init__(reason)
+        self.reason: GmailRevokeFailureReason = reason
+
+
+def _revoke_reply_failure(response: httpx.Response) -> GmailRevokeFailureReason | None:
+    """Interpret Google's `/revoke` reply: None means the grant is gone.
+
+    2xx is success. HTTP 400 `{"error": "invalid_token"}` is Google's
+    reply for a token that is already revoked, expired or unknown -- the
+    grant is gone either way, so it is success too. Any other 4xx, a 5xx
+    or an unexpected status is a failure: the grant may still be live.
+    Never raises (a pathological body counts as "not invalid_token").
+    """
+    status = response.status_code
+    if 200 <= status < 300:
+        return None
+    if status == 400:
+        try:
+            body = response.json()
+            if isinstance(body, dict) and body.get("error") == "invalid_token":
+                return None
+        except Exception:  # noqa: BLE001, S110 -- classification is best-effort
+            pass
+        return "provider_4xx"
+    if 400 <= status < 500:
+        return "provider_4xx"
+    if status >= 500:
+        return "provider_5xx"
+    return "provider_unexpected_status"
 
 
 # Gmail's own quota-error shape (`{"error": {"errors": [{"reason": ...}]}}`)
@@ -1583,12 +1634,10 @@ class GmailAdapter:
         # try/except instead makes revoke-on-reject the rule the code
         # itself enforces, not a per-branch reminder -- no future rejection
         # branch added inside this block can silently skip it. `refresh_
-        # token or ""` below: `_revoke_best_effort` only ever needs a
-        # non-empty token to do anything real: Google's own `/revoke` call
-        # with an empty token is a harmless, swallowed-by-design no-op
-        # (see that method's own docstring), matching the "always safe to
-        # call, only useful when there was something to revoke" contract
-        # this whole guard already relies on.
+        # token or ""` below: `_revoke_best_effort` sends nothing for an
+        # empty token and reports it as a failed revoke (FX6: a grant
+        # may exist that this call could not end), so the guard is always
+        # safe to call and its `adapter_callback` metric stays truthful.
         #
         # `response.json()`/`body.get(...)` are inside this same guard, not
         # ahead of it -- round 6 review found a 200 response whose body
@@ -1604,7 +1653,7 @@ class GmailAdapter:
         # (see that function's own docstring), just one call earlier.
         # `refresh_token` is pre-initialized so the `except` clause below
         # has a value to revoke (empty, if parsing failed before assignment
-        # -- a harmless no-op per the same contract noted above).
+        # -- not sent, and counted as a failed revoke, per the note above).
         refresh_token: str | None = None
         # Set only once `emailAddress` has passed validation below, so the
         # `revoke_on_reject` hook sees None for every earlier rejection
@@ -3133,18 +3182,33 @@ class GmailAdapter:
         """Real provider-side revocation -- unlike every existing PAT-based
         adapter (none of which have a revocation API this connector can
         call on the user's behalf), Google's OAuth2 revoke endpoint really
-        does end the grant. Best-effort: a revoke call Google itself
-        rejects (already-revoked, malformed token) does not raise --
-        `CONNECTOR-CONTRACT.md`'s "must not raise for provider does not
-        support revocation" extends here to "does not raise for revocation
-        that turns out to be a no-op," since the caller's own intent
-        (disconnect) is satisfied either way.
+        does end the grant.
+
+        Raises `GmailRevokeFailed` when the grant may still be live (FX6):
+        a credential that cannot be unpacked, a missing or empty
+        `refresh_token`, a transport error, a Google 5xx, or a Google 4xx
+        other than `invalid_token`. Google's `invalid_token` reply (the
+        token is already revoked or unknown) is success: the grant is gone.
+        `connector_security.revoke_guarded` -- the only caller -- turns the
+        raise into `ecc_connector_revoke_total{result="error"}` and never
+        lets it fail the disconnect/removal/purge the user asked for (see
+        `CONNECTOR-CONTRACT.md`).
         """
         try:
             credential = unpack_credential(account.credential)
         except (ValueError, TypeError):
-            return None
-        self._revoke_best_effort(credential.get("refresh_token", ""))
+            _logger.warning("gmail_revoke_failed: reason=bad_credential status=None")
+            self._raise_revoke_failed("bad_credential")
+        refresh_token = credential.get("refresh_token")
+        failure = self._revoke(refresh_token if isinstance(refresh_token, str) else "")
+        if failure is not None:
+            self._raise_revoke_failed(failure)
+
+    @staticmethod
+    def _raise_revoke_failed(reason: GmailRevokeFailureReason) -> NoReturn:
+        # `from None`: the chained `unpack_credential`/httpx exception's
+        # message is never formatted into a traceback by anything above.
+        raise GmailRevokeFailed(reason) from None
 
     @staticmethod
     def _should_revoke_on_reject(
@@ -3167,30 +3231,56 @@ class GmailAdapter:
             return False
 
     def _revoke_best_effort(self, refresh_token: str) -> bool:
-        """Shared by `disconnect` and the single `try/except` guarding
-        every post-token-exchange rejection branch inside `handle_oauth_
-        callback` (see that method's own comment) -- each obtains a real,
-        live Google grant before discovering the rejection, and none of
-        them ever persists a `connector_accounts` row for it, so
-        `disconnect` (which needs one) can never be reached to clean it up
-        otherwise. Without this, a rejected callback would leave a
-        standing, ECC-unrecorded OAuth grant for `gmail.metadata`/`gmail.
-        readonly` at Google that only the account owner manually visiting
-        Google's own third-party-app permissions page could end -- found
-        by review (an initial fix covering only two of the six actual
-        rejection branches individually was itself a second review-found
-        gap, closed by switching to the single-guard shape instead), not
-        the original implementation.
+        """Used by the single `try/except` guarding every post-token-
+        exchange rejection branch inside `handle_oauth_callback` (see that
+        method's own comment) -- each obtains a real, live Google grant
+        before discovering the rejection, and none of them ever persists a
+        `connector_accounts` row for it, so `disconnect` (which needs one)
+        can never be reached to clean it up otherwise. Without this, a
+        rejected callback would leave a standing, ECC-unrecorded OAuth
+        grant for `gmail.metadata`/`gmail.readonly` at Google that only
+        the account owner manually visiting Google's own third-party-app
+        permissions page could end -- found by review (an initial fix
+        covering only two of the six actual rejection branches
+        individually was itself a second review-found gap, closed by
+        switching to the single-guard shape instead), not the original
+        implementation.
 
-        Returns False only when the `/revoke` request itself failed at the
-        transport level (the revoke-metric `error` result); Google's own
-        reply is not inspected.
+        Never raises. Returns True only when Google confirmed the grant is
+        gone -- the same interpretation as `disconnect` (`_revoke`); False
+        (the revoke-metric `error` result) otherwise, including an empty
+        token (nothing could be revoked).
         """
-        try:
-            self._oauth_client.post("/revoke", data={"token": refresh_token})
-        except httpx.HTTPError:
-            return False
-        return True
+        return self._revoke(refresh_token) is None
+
+    def _revoke(self, refresh_token: str) -> GmailRevokeFailureReason | None:
+        """POST the token to Google's `/revoke` and interpret the reply
+        (`_revoke_reply_failure`). Returns None when the grant is gone,
+        else the failure reason, logged here as a static code plus the
+        HTTP status (never the token, the email or Google's body). An
+        empty token is not sent: there is nothing to revoke, and the grant
+        (if any) stays live. Any exception from the POST itself -- an
+        `httpx.HTTPError` or anything else -- is `transport_error` (its
+        class name logged, never its message). Never raises.
+        """
+        if not refresh_token:
+            failure: GmailRevokeFailureReason | None = "missing_refresh_token"
+            status: int | None = None
+        else:
+            try:
+                response = self._oauth_client.post("/revoke", data={"token": refresh_token})
+            except Exception as exc:  # noqa: BLE001 -- httpx or not, the grant may be live
+                # Any failure to get a reply (an `httpx.HTTPError`, but also
+                # e.g. a closed client) is a transport failure: this must
+                # never raise into `handle_oauth_callback`'s reject guard.
+                _logger.warning("gmail_revoke_post_failed: error_class=%s", type(exc).__name__)
+                failure, status = "transport_error", None
+            else:
+                failure, status = _revoke_reply_failure(response), response.status_code
+        if failure is not None:
+            # In the message text: `JsonFormatter` drops `extra` keys.
+            _logger.warning("gmail_revoke_failed: reason=%s status=%s", failure, status)
+        return failure
 
     # -- Task 5: proactive action detection -- not part of either Protocol,
     # same "Gmail-specific, called only from `sync_connector_endpoint`'s
