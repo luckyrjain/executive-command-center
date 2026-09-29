@@ -54,10 +54,12 @@ assumes it.
   # deterministically, from the authoritative tables they're derived from
   # (audit_events, pkos_nodes, knowledge_claims). Safe to re-run any time —
   # both projections are declared rebuildable in phase-002/DATA-MODEL.md —
-  # as long as the isolation flag matches the application's (see
-  # "Personal-data isolation" below: with isolation on, after a backfill, or
-  # when private or narrowed Gmail evidence exists, prefix
-  # ECC_PERSONAL_DATA_ISOLATION=true, or the command refuses with exit 2).
+  # as long as the isolation flag matches the application's. When the
+  # application runs with ECC_PERSONAL_DATA_ISOLATION on, prefix the same
+  # flag here; the command refuses (exit 2) without it after a backfill or
+  # when private or narrowed Gmail evidence exists (see "Personal-data
+  # isolation" below). Each invocation is one transaction, so on large
+  # deployments prefer one workspace at a time.
   uv run python scripts/rebuild_knowledge_projections.py
 
   # Or scope it to one workspace:

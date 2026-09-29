@@ -176,8 +176,11 @@ Unresolved reasons (CSV `reason`) -- meaning -> operator action:
                                recommendation's owner, who is no longer an
                                active member (removed or suspended): it is
                                private to them, like the rest of their
-                               personal data (DS2) -> no action expected;
-                               a suspended member sees it again on
+                               personal data (DS2). The confirming member
+                               loses sight of it and, with the flag on, the
+                               app cannot transfer it back (share-refused);
+                               see docs/SETUP.md for operator options. A
+                               suspended member sees it again on
                                reactivation. Reported only by the run that
                                re-owns it.
     changed_since_backfill     (restore) the row no longer holds what the
