@@ -747,17 +747,23 @@ def remove_member_endpoint(
                 detail={"code": "OWNED_RESOURCES_BLOCK_REMOVAL", "owned_resources": owned},
             )
 
-        cancel_delegations_for_removed_member(
-            session, workspace_id=auth.workspace_id, account_id=member["account_id"], now=now
-        )
         # Found in the second whole-phase review, mirroring the delegation
-        # cascade immediately above: `worker.py`'s own docstring already
+        # cascade immediately below: `worker.py`'s own docstring already
         # discloses that a run is authorized once, at enqueue, and never
         # re-checks `created_by`'s live membership -- without this, a
         # removed member's still-running (or paused/awaiting-approval)
         # automation kept right on executing real side effects attributed
         # to someone no longer in the workspace.
         cancel_runs_for_removed_member(session, workspace_id=auth.workspace_id, users_id=user_id)
+        # Runs before the delegation cascade, not after: `cancel_run` locks
+        # `workflow_runs` rows (resources) and the delegation cascade updates
+        # `resource_grants` rows. Every path that locks both takes the
+        # resource row first (`revoke_grant_endpoint`, `create_grant_endpoint`),
+        # so updating grants first and then locking a run deadlocks against a
+        # concurrent revoke of an evidence grant on that run.
+        cancel_delegations_for_removed_member(
+            session, workspace_id=auth.workspace_id, account_id=member["account_id"], now=now
+        )
         session.execute(
             text(
                 "UPDATE sessions SET revoked_at = :now "

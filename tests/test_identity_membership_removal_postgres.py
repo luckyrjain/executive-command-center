@@ -41,6 +41,7 @@ from sqlalchemy.engine import Connection
 
 from ecc.config import get_settings
 from ecc.database import engine
+from ecc.domains.identity import membership_removal
 from ecc.main import app
 
 settings = get_settings()
@@ -404,6 +405,39 @@ def test_remove_member_self_removal_allowed(membership_context: _MembershipConte
         headers=_headers(ctx.member_b.token),
     )
     assert response.status_code == 200, response.text
+
+
+def test_remove_member_cancels_runs_before_revoking_delegation_grants(
+    membership_context: _MembershipContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lock order: `cancel_run` locks `workflow_runs` rows (resources) and the
+    delegation cascade updates `resource_grants` rows. Every other path that
+    locks both takes the resource first (grant revoke/create), so removal must
+    cancel runs before it touches grants or it deadlocks against a concurrent
+    revoke of an evidence grant on one of the member's runs."""
+    ctx = membership_context
+    calls: list[str] = []
+    real_runs = membership_removal.cancel_runs_for_removed_member
+    real_delegations = membership_removal.cancel_delegations_for_removed_member
+
+    def runs(*args: Any, **kwargs: Any) -> None:
+        calls.append("runs")
+        real_runs(*args, **kwargs)
+
+    def delegations(*args: Any, **kwargs: Any) -> None:
+        calls.append("delegations")
+        real_delegations(*args, **kwargs)
+
+    monkeypatch.setattr(membership_removal, "cancel_runs_for_removed_member", runs)
+    monkeypatch.setattr(membership_removal, "cancel_delegations_for_removed_member", delegations)
+
+    response = ctx.owner.client.delete(
+        f"/api/v1/identity/workspaces/{ctx.workspace_id}/members/{ctx.member_b.user_id}",
+        headers=_headers(ctx.owner.token),
+    )
+
+    assert response.status_code == 200, response.text
+    assert calls == ["runs", "delegations"]
 
 
 def test_remove_member_forbidden_for_non_owner_admin_non_self(

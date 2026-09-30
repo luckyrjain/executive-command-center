@@ -707,13 +707,16 @@ def test_grantor_revoke_waits_for_in_flight_meeting_write(race_world: RaceWorld)
 def test_revoke_locks_resource_before_grant_so_removal_cannot_deadlock(
     race_world: RaceWorld,
 ) -> None:
-    """Member removal locks the removed member's rows, then revokes their
-    evidence grants. A revoke that locked the grant row first and then waited
-    on the resource deadlocked against that. The holder here plays removal:
-    it locks the resource, lets the revoke queue behind it, then updates the
-    grant. With resource-then-grant ordering the revoke holds no grant lock
-    while it waits, so the holder's update goes through and the revoke then
-    sees the grant already revoked."""
+    """The holder is any transaction that follows the codebase's
+    resource-then-grant order (member removal: the removed member's rows and
+    runs, then their evidence grants; grant creation: resource, then insert).
+    It locks the resource -- a meeting here; the lock mechanics do not depend
+    on the table -- lets the revoke queue behind it, then updates the grant.
+    A revoke that locked the grant row first deadlocked against that. With
+    resource-then-grant ordering the revoke holds no grant lock while it
+    waits, so the holder's update goes through and the revoke then sees the
+    grant already revoked. Removal's own ordering is pinned in
+    test_identity_membership_removal_postgres.py."""
     w = race_world
     grant_id = _seed_write_grant(w)
 
