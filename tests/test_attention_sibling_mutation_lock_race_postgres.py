@@ -240,6 +240,7 @@ class Case:
     path: str  # formatted with the seed's ids
     body: Callable[[dict[str, UUID]], dict[str, Any]]
     not_found: str
+    ok_status: int = 200  # uncontested success, asserted by the control
 
 
 def _v1(_: dict[str, UUID]) -> dict[str, Any]:
@@ -264,6 +265,7 @@ CASES: dict[str, Case] = {
         "/api/v1/risks/{id}/review",
         lambda _: {"expected_version": 1, "outcome": "no_change"},
         "RISK_NOT_FOUND",
+        ok_status=201,
     ),
     "waiting_patch": Case(
         "waiting_links",
@@ -304,7 +306,13 @@ CASES: dict[str, Case] = {
         "plans", _seed_plan, "POST", "/api/v1/plans/{id}/supersede", _v1, "PLAN_NOT_FOUND"
     ),
     "plan_propose": Case(
-        "plans", _seed_plan, "POST", "/api/v1/plans/{id}/propose", _v1, "PLAN_NOT_FOUND"
+        "plans",
+        _seed_plan,
+        "POST",
+        "/api/v1/plans/{id}/propose",
+        _v1,
+        "PLAN_NOT_FOUND",
+        ok_status=201,
     ),
     "plan_block_move": Case(
         "plans",
@@ -325,24 +333,27 @@ CASES: dict[str, Case] = {
 }
 
 
-def _lock_waiters(table: str) -> int:
+def _lock_waiters(table: str, holder_pid: int) -> int:
+    """Backends blocked on `holder_pid` (this test's lock holder, so an
+    unrelated concurrent backend cannot satisfy the wait) in a locking read
+    of `table`."""
     with engine.connect() as probe:
         return int(
             probe.execute(
                 text(
                     "SELECT count(*) FROM pg_stat_activity "
                     "WHERE datname = current_database() AND wait_event_type = 'Lock' "
-                    "AND wait_event IN ('transactionid', 'tuple') "
+                    "AND pg_blocking_pids(pid) @> ARRAY[CAST(:holder AS integer)] "
                     "AND query ~* :pattern"
                 ),
-                {"pattern": f"FROM {table}\\s.*FOR UPDATE"},
+                {"holder": holder_pid, "pattern": f"FROM {table}\\s.*FOR UPDATE"},
             ).scalar_one()
         )
 
 
-def _wait_for_lock_waiter(table: str) -> None:
+def _wait_for_lock_waiter(table: str, holder_pid: int) -> None:
     deadline = time.monotonic() + _WAIT_SECONDS
-    while _lock_waiters(table) < 1:
+    while _lock_waiters(table, holder_pid) < 1:
         if time.monotonic() > deadline:
             raise AssertionError(f"mutation never blocked on the {table} row lock")
         time.sleep(0.05)
@@ -401,6 +412,7 @@ def _race(
         holder_tx = holder.begin()
         thread = threading.Thread(target=fire)
         try:
+            holder_pid = int(holder.execute(text("SELECT pg_backend_pid()")).scalar_one())
             holder.execute(
                 text(f"SELECT id FROM {case.table} WHERE id = :id FOR UPDATE"),  # noqa: S608
                 {"id": ids["id"]},
@@ -412,13 +424,14 @@ def _race(
                     {"id": ids["id"], "c": w.c},
                 )
             thread.start()
-            _wait_for_lock_waiter(case.table)
+            _wait_for_lock_waiter(case.table, holder_pid)
             holder_tx.commit()
         finally:
             if holder_tx.is_active:
                 holder_tx.rollback()
             holder.close()
-            thread.join(timeout=_WAIT_SECONDS)
+            if thread.ident is not None:  # a setup failure must not be masked
+                thread.join(timeout=_WAIT_SECONDS)
         assert not thread.is_alive(), "mutation request never finished"
         if "error" in result:
             raise result["error"]
@@ -449,13 +462,14 @@ def test_mutation_waiting_on_row_lock_rechecks_authorization(
 def test_mutation_waiting_on_row_lock_without_transfer_still_proceeds(
     race_world: RaceWorld, name: str
 ) -> None:
-    """Control: the same lock wait with no ownership change does not 404 --
-    the 404 above comes from the transfer, not from the wait itself."""
+    """Control: the same lock wait with no ownership change succeeds and
+    writes -- the 404 above comes from the transfer, not from the wait."""
     w, case = race_world, CASES[name]
     with engine.begin() as connection:
         ids = case.seed(connection, w, datetime.now(UTC))
 
-    response, _ = _race(w, case, ids, transfer=False)
+    response, before = _race(w, case, ids, transfer=False)
 
-    assert response.status_code != 404, response.text
-    assert response.status_code != 403, response.text
+    assert response.status_code == case.ok_status, response.text
+    after = _row_snapshot(case.table, ids["id"])
+    assert after["version"] == before["version"] + 1
