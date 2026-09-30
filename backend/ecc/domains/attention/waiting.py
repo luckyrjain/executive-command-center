@@ -99,43 +99,67 @@ _SUBJECT_RESOURCE_TYPES: dict[str, str] = {
     "knowledge_entity": "pkos_nodes",
 }
 
-_SUBJECT_EXISTENCE_QUERIES: dict[str, Any] = {
-    "task": text(
-        "SELECT 1 FROM tasks WHERE workspace_id = :workspace_id AND id = :subject_id "
-        "AND archived_at IS NULL"
+# Per-parent-table locking read. `live` is the existence predicate (a task/
+# commitment must not be archived, a pkos node must be active); the row is
+# locked even when not live so every parent read below is a locked one.
+_PARENT_LOCK_QUERIES: dict[str, Any] = {
+    "tasks": text(
+        "SELECT archived_at IS NULL AS live, NULL AS node_type FROM tasks "
+        "WHERE workspace_id = :workspace_id AND id = :id FOR SHARE"
     ),
-    "commitment": text(
-        "SELECT 1 FROM commitments WHERE workspace_id = :workspace_id AND id = :subject_id "
-        "AND archived_at IS NULL"
+    "commitments": text(
+        "SELECT archived_at IS NULL AS live, NULL AS node_type FROM commitments "
+        "WHERE workspace_id = :workspace_id AND id = :id FOR SHARE"
     ),
-    "knowledge_entity": text(
-        "SELECT 1 FROM pkos_nodes WHERE workspace_id = :workspace_id AND id = :subject_id "
-        "AND status = 'active'"
+    "pkos_nodes": text(
+        "SELECT status = 'active' AS live, node_type FROM pkos_nodes "
+        "WHERE workspace_id = :workspace_id AND id = :id FOR SHARE"
     ),
 }
 
 
-def _subject_exists(
-    session: Session, auth: AuthContext, subject_type: SubjectType, subject_id: UUID
-) -> bool:
-    row = session.execute(
-        _SUBJECT_EXISTENCE_QUERIES[subject_type],
-        {"workspace_id": auth.workspace_id, "subject_id": subject_id},
-    ).one_or_none()
-    return row is not None
+def _lock_link_parents(
+    session: Session,
+    auth: AuthContext,
+    subject_type: SubjectType,
+    subject_id: UUID,
+    counterparty_entity_id: UUID,
+) -> tuple[bool, str | None]:
+    """Lock a new link's subject and counterparty rows `FOR SHARE`, held to
+    commit, before either is authorized.
 
+    `FOR SHARE` conflicts with an ownership transfer's `FOR UPDATE`
+    (`authz_grants`), so a transfer that commits while this waits is seen by
+    the authorize() calls that follow (READ COMMITTED: each later statement
+    reads the committed row), and one that starts after this lock waits
+    until the link is committed. Rows are locked in (table, id) order so two
+    requests naming the same pair in opposite roles, or any other
+    multi-row locker using the same order, cannot deadlock.
 
-def _counterparty_node_type(
-    session: Session, auth: AuthContext, counterparty_entity_id: UUID
-) -> str | None:
-    row = session.execute(
-        text(
-            "SELECT node_type FROM pkos_nodes "
-            "WHERE workspace_id = :workspace_id AND id = :counterparty_id AND status = 'active'"
-        ),
-        {"workspace_id": auth.workspace_id, "counterparty_id": counterparty_entity_id},
-    ).one_or_none()
-    return row[0] if row is not None else None
+    Returns whether the subject is live and the counterparty's node_type
+    (None when it is missing or not active).
+    """
+    subject_key = (_SUBJECT_RESOURCE_TYPES[subject_type], subject_id)
+    counterparty_key = ("pkos_nodes", counterparty_entity_id)
+    locked: dict[tuple[str, UUID], Any] = {}
+    for table, row_id in sorted({subject_key, counterparty_key}):
+        locked[(table, row_id)] = (
+            session.execute(
+                _PARENT_LOCK_QUERIES[table],
+                {"workspace_id": auth.workspace_id, "id": row_id},
+            )
+            .mappings()
+            .one_or_none()
+        )
+    subject = locked[subject_key]
+    counterparty = locked[counterparty_key]
+    subject_live = subject is not None and bool(subject["live"])
+    node_type = (
+        str(counterparty["node_type"])
+        if counterparty is not None and counterparty["live"]
+        else None
+    )
+    return subject_live, node_type
 
 
 def _would_create_cycle(
@@ -235,7 +259,10 @@ def create_waiting_link(
         )
         if cached is not None:
             return cached
-        if not _subject_exists(session, auth, payload.subject_type, payload.subject_id):
+        subject_live, node_type = _lock_link_parents(
+            session, auth, payload.subject_type, payload.subject_id, payload.counterparty_entity_id
+        )
+        if not subject_live:
             raise HTTPException(status_code=404, detail="WAITING_SUBJECT_NOT_FOUND")
         if not authz.authorize(
             session,
@@ -245,7 +272,6 @@ def create_waiting_link(
             action="read",
         ):
             raise HTTPException(status_code=404, detail="WAITING_SUBJECT_NOT_FOUND")
-        node_type = _counterparty_node_type(session, auth, payload.counterparty_entity_id)
         if node_type is None:
             raise HTTPException(status_code=404, detail="WAITING_COUNTERPARTY_NOT_FOUND")
         if not authz.authorize(
