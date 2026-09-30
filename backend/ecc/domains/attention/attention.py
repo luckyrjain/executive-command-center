@@ -559,6 +559,7 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
     now = datetime.now(UTC)
     policy = get_active_policy(1)
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="write")
         today, day_end = _workspace_day(session, auth, now)
         expires_at = min(now + timedelta(minutes=30), day_end)
         session.execute(
@@ -1079,6 +1080,7 @@ def _mutate_attention(
 ) -> AttentionItem:
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         # Lock the item before authorizing: a concurrent owner/visibility
         # change (personal-visibility backfill, ownership transfer,
         # regenerate) that commits while this request waits on the row lock
@@ -1261,6 +1263,7 @@ def record_attention_feedback(
     now = datetime.now(UTC)
     feedback_id = uuid4()
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="write")
         _lock_idempotency(session, auth, idempotency_key)
         cached = _load_cached_feedback(session, auth, idempotency_key, request_hash)
         if cached is not None:

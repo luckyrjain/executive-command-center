@@ -524,6 +524,10 @@ def _lock_meeting_for_write(
     meeting edit's) `FOR UPDATE` while letting concurrent prep/participant
     writes on the same meeting proceed side by side. A missing row answers
     the same 404 an invisible one does.
+
+    Write-transaction callers take `authz.lock_membership_for_write` first
+    in the same transaction, so a concurrent member removal or demotion is likewise
+    either visible to the checks below or waits for this write to commit.
     """
     meeting_row = get_meeting_row(session, auth, meeting_id, for_share=True)
     if meeting_row is None:
@@ -1519,6 +1523,7 @@ def add_participant(
     req_hash = request_hash(payload, f"add_participant:{meeting_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(session, auth, idempotency_key, req_hash, domain="meeting_prep")
         if cached is not None:
@@ -1770,6 +1775,7 @@ def create_prep(
 
     if not get_settings().meeting_prep_ai_enrichment_enabled:
         with session.begin():
+            authz.lock_membership_for_write(session, auth)
             lock_idempotency(session, auth, idempotency_key)
             cached = load_cached(session, auth, idempotency_key, req_hash, domain="meeting_prep")
             if cached is not None:
@@ -1811,8 +1817,13 @@ def create_prep(
 
         # Enrichment ran outside any transaction, so the authorization above
         # is seconds old by now: re-lock the meeting and re-check before the
-        # pack lands.
+        # pack lands. The membership lock is taken per write transaction,
+        # never across enrichment, so a removal never waits on a model call;
+        # it does come after the session-scoped idempotency lock here, the
+        # one documented inversion of `connector_security`'s lock order
+        # (bounded by the statement timeout, see there).
         with session.begin():
+            authz.lock_membership_for_write(session, auth)
             _lock_meeting_for_write(session, auth, meeting_id)
             return _insert_pack(generated, enrichment)
 
@@ -1820,6 +1831,9 @@ def create_prep(
 @router.get("/{meeting_id}/prep", response_model=MeetingPack)
 def get_prep(meeting_id: UUID, auth: AuthDep, session: SessionDep) -> MeetingPack:
     with session.begin():
+        # A read that can write (the stale flip below, attributed to the
+        # caller), so it takes the membership lock like any write.
+        authz.lock_membership_for_write(session, auth)
         require_meeting_read(session, auth, meeting_id)
         meeting_row = get_meeting_row(session, auth, meeting_id)
         if meeting_row is None:
@@ -2008,6 +2022,7 @@ def refresh_prep(
     if not get_settings().meeting_prep_ai_enrichment_enabled:
         try:
             with session.begin():
+                authz.lock_membership_for_write(session, auth)
                 lock_idempotency(session, auth, idempotency_key)
                 cached = load_cached(
                     session, auth, idempotency_key, req_hash, domain="meeting_prep"
@@ -2054,6 +2069,7 @@ def refresh_prep(
         try:
             # Same re-lock and re-check as `create_prep`'s enrichment path.
             with session.begin():
+                authz.lock_membership_for_write(session, auth)
                 _lock_meeting_for_write(session, auth, meeting_id)
                 return _retire_and_insert(old["id"], generated, enrichment)
         except IntegrityError as exc:
