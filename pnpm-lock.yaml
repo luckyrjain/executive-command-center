@@ -7,7 +7,7 @@ settings:
 overrides:
   nanoid: '>=3.3.17'
   browserslist: '>=4.28.7'
-  undici: ^7.29.1
+  jsdom>undici: ^7.29.1
 
 importers:
 
