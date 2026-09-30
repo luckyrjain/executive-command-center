@@ -89,6 +89,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
@@ -499,6 +500,21 @@ def _mutate_run(
         if cached is not None:
             return cached
 
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row. The run row is the
+        # first row every `mutate` helper locks, so this adds no new lock
+        # ordering. A missing row answers the same 404 as an invisible one.
+        locked = session.execute(
+            text(
+                "SELECT id FROM workflow_runs "
+                "WHERE workspace_id = :workspace_id AND id = :id FOR UPDATE"
+            ),
+            {"workspace_id": auth.workspace_id, "id": run_id},
+        ).one_or_none()
+        if locked is None:
+            raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="workflow_runs", resource_id=run_id, action="read"
         ):

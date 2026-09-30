@@ -463,6 +463,13 @@ def update_task(
         # distinguish 404 from 403 for a task id in their former
         # workspace. See calendar/events.py's update_calendar_event for
         # the identical reasoning.
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        current = _get_task_row(session, auth, task_id, for_update=True)
+        if current is None:
+            raise HTTPException(status_code=404, detail="TASK_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="tasks", resource_id=task_id, action="read"
         ):
@@ -471,9 +478,6 @@ def update_task(
             session, auth, resource_type="tasks", resource_id=task_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-        current = _get_task_row(session, auth, task_id, for_update=True)
-        if current is None:
-            raise HTTPException(status_code=404, detail="TASK_NOT_FOUND")
         _raise_version_conflict(current, payload.expected_version)
         if current["archived_at"] is not None:
             raise HTTPException(status_code=409, detail="TASK_ARCHIVED")
@@ -602,6 +606,13 @@ def set_task_status_write(
     already enforces. Deliberately excludes `session.begin()`/idempotency-key
     locking/replay -- see `insert_task`'s own docstring for why.
     """
+    # Lock before authorizing: an ownership transfer that commits while
+    # this request waits on the row lock must be seen by the checks below
+    # (READ COMMITTED: each later statement reads the committed row), not
+    # by checks that ran against the pre-transfer row.
+    current = _get_task_row(session, auth, task_id, for_update=True)
+    if current is None:
+        raise HTTPException(status_code=404, detail="TASK_NOT_FOUND")
     if not authz.authorize(
         session, auth, resource_type="tasks", resource_id=task_id, action="read"
     ):
@@ -610,9 +621,6 @@ def set_task_status_write(
         session, auth, resource_type="tasks", resource_id=task_id, action="write"
     ):
         raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-    current = _get_task_row(session, auth, task_id, for_update=True)
-    if current is None:
-        raise HTTPException(status_code=404, detail="TASK_NOT_FOUND")
     _raise_version_conflict(current, expected_version)
     if current["archived_at"] is not None:
         raise HTTPException(status_code=409, detail="TASK_ARCHIVED")
@@ -694,6 +702,13 @@ def lifecycle_task_write(
     scheme; nesting a second `session.begin()` here would raise) -- mirrors
     `insert_task`'s own precedent exactly.
     """
+    # Lock before authorizing: an ownership transfer that commits while
+    # this request waits on the row lock must be seen by the checks below
+    # (READ COMMITTED: each later statement reads the committed row), not
+    # by checks that ran against the pre-transfer row.
+    current = _get_task_row(session, auth, task_id, for_update=True)
+    if current is None:
+        raise HTTPException(status_code=404, detail="TASK_NOT_FOUND")
     if not authz.authorize(
         session, auth, resource_type="tasks", resource_id=task_id, action="read"
     ):
@@ -702,9 +717,6 @@ def lifecycle_task_write(
         session, auth, resource_type="tasks", resource_id=task_id, action="write"
     ):
         raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-    current = _get_task_row(session, auth, task_id, for_update=True)
-    if current is None:
-        raise HTTPException(status_code=404, detail="TASK_NOT_FOUND")
     _raise_version_conflict(current, expected_version)
 
     target_reached = (

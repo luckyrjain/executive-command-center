@@ -1092,6 +1092,25 @@ def create_workflow_endpoint(
         return response
 
 
+def _lock_version_for_authz(session: Session, auth: AuthContext, version_id: UUID) -> None:
+    """Lock the target version row before the endpoint authorizes: an
+    ownership transfer that commits while the request waits on the row lock
+    must be seen by the authorization checks (READ COMMITTED: each later
+    statement reads the committed row), not by checks that ran against the
+    pre-transfer row. The target row is the first row `activate_workflow_
+    version`/`disable_workflow_version` lock, so this adds no new lock
+    ordering. A missing row answers the same 404 as an invisible one."""
+    found = session.execute(
+        text(
+            "SELECT id FROM workflow_versions "
+            "WHERE workspace_id = :workspace_id AND id = :id FOR UPDATE"
+        ),
+        {"workspace_id": auth.workspace_id, "id": version_id},
+    ).one_or_none()
+    if found is None:
+        raise HTTPException(status_code=404, detail="WORKFLOW_NOT_FOUND")
+
+
 @router.post("/workflows/{version_id}/publish", response_model=WorkflowVersionResponse)
 def publish_workflow_endpoint(
     version_id: UUID,
@@ -1116,6 +1135,7 @@ def publish_workflow_endpoint(
         if cached is not None:
             return cached
 
+        _lock_version_for_authz(session, auth, version_id)
         if not authz.authorize(
             session, auth, resource_type="workflow_versions", resource_id=version_id, action="read"
         ):
@@ -1255,6 +1275,7 @@ def disable_workflow_endpoint(
         if cached is not None:
             return cached
 
+        _lock_version_for_authz(session, auth, version_id)
         if not authz.authorize(
             session, auth, resource_type="workflow_versions", resource_id=version_id, action="read"
         ):

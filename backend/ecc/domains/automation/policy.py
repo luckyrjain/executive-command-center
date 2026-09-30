@@ -502,6 +502,25 @@ def create_policy_endpoint(
         return response
 
 
+def _lock_policy_for_authz(session: Session, auth: AuthContext, policy_id: UUID) -> None:
+    """Lock the target row before the endpoint authorizes: an ownership
+    transfer that commits while the request waits on the row lock must be
+    seen by the authorization checks (READ COMMITTED: each later statement
+    reads the committed row), not by checks that ran against the
+    pre-transfer row. The target row is the first row `revoke_policy` locks, so this
+    adds no new lock ordering. A missing row answers the same 404 as an
+    invisible one."""
+    found = session.execute(
+        text(
+            "SELECT id FROM automation_policies "
+            "WHERE workspace_id = :workspace_id AND id = :id FOR UPDATE"
+        ),
+        {"workspace_id": auth.workspace_id, "id": policy_id},
+    ).one_or_none()
+    if found is None:
+        raise HTTPException(status_code=404, detail="POLICY_NOT_FOUND")
+
+
 @router.post("/policies/{policy_id}/revoke", response_model=PolicyResponse)
 def revoke_policy_endpoint(
     policy_id: UUID,
@@ -526,6 +545,7 @@ def revoke_policy_endpoint(
         if cached is not None:
             return cached
 
+        _lock_policy_for_authz(session, auth, policy_id)
         if not authz.authorize(
             session, auth, resource_type="automation_policies", resource_id=policy_id, action="read"
         ):

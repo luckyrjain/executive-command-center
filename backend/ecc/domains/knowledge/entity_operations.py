@@ -110,6 +110,36 @@ def _lock_entity(session: Session, auth: AuthContext, entity_id: UUID) -> dict[s
     return dict(row) if row is not None else None
 
 
+def _lock_and_authorize_pair(
+    session: Session, auth: AuthContext, target_id: UUID, source_id: UUID
+) -> dict[UUID, dict[str, Any]]:
+    """Lock both entities of a merge pair, then run the full read-then-write
+    check on each against the locked rows.
+
+    Locked in a fixed (sorted) order regardless of which is target/source,
+    so two concurrent merge/reverse/split operations touching an
+    overlapping pair can never deadlock against each other. Locked BEFORE
+    authorizing: an ownership transfer of either entity that commits while
+    this request waits on the row lock must be seen by the checks (READ
+    COMMITTED: each later statement reads the committed row), not by checks
+    that ran against the pre-transfer row. A missing entity answers the same
+    404 as one the caller cannot read.
+    """
+    first_id, second_id = sorted((target_id, source_id), key=str)
+    locked = {first_id: _lock_entity(session, auth, first_id)}
+    locked[second_id] = _lock_entity(session, auth, second_id)
+    for entity_id in (target_id, source_id):
+        if locked[entity_id] is None or not authz.authorize(
+            session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+    return {entity_id: row for entity_id, row in locked.items() if row is not None}
+
+
 def _rehome_aliases(
     session: Session, auth: AuthContext, source_id: UUID, target_id: UUID, now: datetime
 ) -> list[UUID]:
@@ -310,26 +340,9 @@ def merge_entities(
         # is redirected, target gains source's rehomed aliases/edges -- so
         # both need the full read-then-write two-phase check before anything
         # is touched.
-        for entity_id in (target_id, source_id):
-            if not authz.authorize(
-                session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
-            ):
-                raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
-            if not authz.authorize(
-                session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="write"
-            ):
-                raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-
-        # Lock both entities in a fixed (sorted) order regardless of which
-        # is target/source, so two concurrent merges touching an
-        # overlapping pair can never deadlock against each other.
-        first_id, second_id = sorted((target_id, source_id), key=str)
-        locked = {first_id: _lock_entity(session, auth, first_id)}
-        locked[second_id] = _lock_entity(session, auth, second_id)
+        locked = _lock_and_authorize_pair(session, auth, target_id, source_id)
         target = locked[target_id]
         source = locked[source_id]
-        if target is None or source is None:
-            raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
         if target["status"] != "active" or source["status"] != "active":
             raise HTTPException(status_code=409, detail="ENTITY_NOT_ACTIVE")
         if target["version"] != payload.expected_target_version:
@@ -586,23 +599,10 @@ def reverse_operation(
         if cached is not None:
             return cached
 
-        if not authz.authorize(
-            session,
-            auth,
-            resource_type="entity_operations",
-            resource_id=operation_id,
-            action="read",
-        ):
-            raise HTTPException(status_code=404, detail="OPERATION_NOT_FOUND")
-        if not authz.authorize(
-            session,
-            auth,
-            resource_type="entity_operations",
-            resource_id=operation_id,
-            action="write",
-        ):
-            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
         merge_op = (
             session.execute(
                 text(
@@ -620,6 +620,22 @@ def reverse_operation(
         )
         if merge_op is None:
             raise HTTPException(status_code=404, detail="OPERATION_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="entity_operations",
+            resource_id=operation_id,
+            action="read",
+        ):
+            raise HTTPException(status_code=404, detail="OPERATION_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="entity_operations",
+            resource_id=operation_id,
+            action="write",
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         if merge_op["operation_type"] != "merge":
             raise HTTPException(status_code=422, detail="NOT_A_MERGE_OPERATION")
         if merge_op["status"] != "active":
@@ -633,27 +649,10 @@ def reverse_operation(
         # merge_entities itself does, so both get the same full
         # read-then-write check, re-verified fresh here rather than trusted
         # to still hold from whenever the original merge ran.
-        for entity_id in (target_id, source_id):
-            if not authz.authorize(
-                session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
-            ):
-                raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
-            if not authz.authorize(
-                session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="write"
-            ):
-                raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-
+        locked = _lock_and_authorize_pair(session, auth, target_id, source_id)
         if _has_post_merge_dependent_activity(session, auth, target_id, merge_op["created_at"]):
             raise HTTPException(status_code=422, detail="UNSAFE_REVERSAL")
-
-        # Lock both entities in the same fixed (sorted) order merge_entities
-        # uses, so a reversal can never deadlock against a concurrent merge.
-        first_id, second_id = sorted((target_id, source_id), key=str)
-        locked = {first_id: _lock_entity(session, auth, first_id)}
-        locked[second_id] = _lock_entity(session, auth, second_id)
         source = locked[source_id]
-        if source is None:
-            raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
         if source["status"] != "redirected":
             raise HTTPException(status_code=409, detail="SOURCE_NOT_REDIRECTED")
 
@@ -867,23 +866,10 @@ def split_operation(
         if cached is not None:
             return cached
 
-        if not authz.authorize(
-            session,
-            auth,
-            resource_type="entity_operations",
-            resource_id=operation_id,
-            action="read",
-        ):
-            raise HTTPException(status_code=404, detail="OPERATION_NOT_FOUND")
-        if not authz.authorize(
-            session,
-            auth,
-            resource_type="entity_operations",
-            resource_id=operation_id,
-            action="write",
-        ):
-            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
         merge_op = (
             session.execute(
                 text(
@@ -901,6 +887,22 @@ def split_operation(
         )
         if merge_op is None:
             raise HTTPException(status_code=404, detail="OPERATION_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="entity_operations",
+            resource_id=operation_id,
+            action="read",
+        ):
+            raise HTTPException(status_code=404, detail="OPERATION_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="entity_operations",
+            resource_id=operation_id,
+            action="write",
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         if merge_op["operation_type"] != "merge":
             raise HTTPException(status_code=422, detail="NOT_A_MERGE_OPERATION")
         if merge_op["status"] != "active":
@@ -913,24 +915,8 @@ def split_operation(
         # Split mutates both of the original merge's entities the same way
         # merge_entities/reverse_operation do -- same full read-then-write
         # check on both, re-verified fresh here.
-        for entity_id in (target_id, source_id):
-            if not authz.authorize(
-                session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
-            ):
-                raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
-            if not authz.authorize(
-                session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="write"
-            ):
-                raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-
-        # Same fixed lock order as merge/reverse -- never deadlocks against
-        # a concurrent merge or reverse touching the same pair.
-        first_id, second_id = sorted((target_id, source_id), key=str)
-        locked = {first_id: _lock_entity(session, auth, first_id)}
-        locked[second_id] = _lock_entity(session, auth, second_id)
+        locked = _lock_and_authorize_pair(session, auth, target_id, source_id)
         source = locked[source_id]
-        if source is None:
-            raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
         if source["status"] != "redirected":
             raise HTTPException(status_code=409, detail="SOURCE_NOT_REDIRECTED")
 
@@ -938,7 +924,7 @@ def split_operation(
         # entity before touching anything -- an all-or-nothing check, so a
         # bad ID in the payload never leaves a partial reassignment. FOR
         # UPDATE is defense-in-depth, not what actually prevents a race here:
-        # the target/source _lock_entity() calls above already serialize any
+        # the _lock_and_authorize_pair() call above already serializes any
         # two operations that could plausibly change a claim's subject_id or
         # an edge's node references (split is the only code path that
         # mutates subject_id, and merge's _rehome_edges is the only one that

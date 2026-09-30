@@ -363,6 +363,24 @@ def supersede_claim(
         )
         if cached is not None:
             return cached
+        # Lock the parent entity (the row authorization is evaluated
+        # against) before authorizing: an ownership transfer of the entity
+        # that commits while this request waits on the row lock must be
+        # seen by the checks below (READ COMMITTED: each later statement
+        # reads the committed row), not by checks that ran against the
+        # pre-transfer row. Entity before claim, the same order split takes.
+        # NO KEY UPDATE: still conflicts with the transfer's FOR UPDATE, but
+        # not with the FOR KEY SHARE every child-row FK insert takes on the
+        # entity (this path never updates pkos_nodes itself).
+        entity = session.execute(
+            text(
+                "SELECT id FROM pkos_nodes "
+                "WHERE workspace_id = :workspace_id AND id = :entity_id FOR NO KEY UPDATE"
+            ),
+            {"workspace_id": auth.workspace_id, "entity_id": entity_id},
+        ).one_or_none()
+        if entity is None:
+            raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
         ):

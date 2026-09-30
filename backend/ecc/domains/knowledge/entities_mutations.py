@@ -75,6 +75,13 @@ def update_entity(
             return cached
         # Two-phase read-then-write authz check -- see calendar/events.py's
         # update_calendar_event for the identical existence-leak reasoning.
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        current = _get_row(session, auth, entity_id, for_update=True)
+        if current is None:
+            raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
         ):
@@ -83,9 +90,6 @@ def update_entity(
             session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-        current = _get_row(session, auth, entity_id, for_update=True)
-        if current is None:
-            raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
         if current["version"] != payload.expected_version:
             raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
 
@@ -185,6 +189,13 @@ def _transition_action(
         )
         if cached is not None:
             return cached
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        current = _get_row(session, auth, entity_id, for_update=True)
+        if current is None:
+            raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
         ):
@@ -193,9 +204,6 @@ def _transition_action(
             session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-        current = _get_row(session, auth, entity_id, for_update=True)
-        if current is None:
-            raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
         if current["version"] != payload.expected_version:
             raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
         if action == "archive" and current["status"] == "archived":

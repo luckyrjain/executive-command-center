@@ -171,15 +171,10 @@ def delete_evidence(
         if cached is not None:
             return cached
 
-        if not authz.authorize(
-            session, auth, resource_type="pkos_evidence", resource_id=evidence_id, action="read"
-        ):
-            raise HTTPException(status_code=404, detail="EVIDENCE_NOT_FOUND")
-        if not authz.authorize(
-            session, auth, resource_type="pkos_evidence", resource_id=evidence_id, action="write"
-        ):
-            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
         current = (
             session.execute(
                 text(
@@ -196,6 +191,14 @@ def delete_evidence(
         )
         if current is None:
             raise HTTPException(status_code=404, detail="EVIDENCE_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="pkos_evidence", resource_id=evidence_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="EVIDENCE_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="pkos_evidence", resource_id=evidence_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
         if current["evidence_state"] == "deleted":
             response = EvidenceDeleteResponse(id=evidence_id, evidence_state="deleted")
