@@ -1271,15 +1271,17 @@ def record_attention_feedback(
         # parent-authorization-boundary pattern) is what gates creation
         # here, not a write check on the item itself (recording feedback
         # never mutates the item).
-        if not authz.authorize(
-            session, auth, resource_type="attention_items", resource_id=item_id, action="read"
-        ):
-            raise HTTPException(status_code=404, detail="ATTENTION_ITEM_NOT_FOUND")
+        #
+        # Lock the parent before authorizing: FOR SHARE conflicts with an
+        # ownership transfer's FOR UPDATE, so a transfer that commits while
+        # this request waits is seen by the check below (READ COMMITTED: each
+        # later statement reads the committed row), and one that starts after
+        # this lock waits until the feedback row is committed.
         item = (
             session.execute(
                 text(
                     "SELECT id, policy_version FROM attention_items "
-                    "WHERE workspace_id = :workspace_id AND id = :item_id"
+                    "WHERE workspace_id = :workspace_id AND id = :item_id FOR SHARE"
                 ),
                 {"workspace_id": auth.workspace_id, "item_id": item_id},
             )
@@ -1287,6 +1289,10 @@ def record_attention_feedback(
             .one_or_none()
         )
         if item is None:
+            raise HTTPException(status_code=404, detail="ATTENTION_ITEM_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="attention_items", resource_id=item_id, action="read"
+        ):
             raise HTTPException(status_code=404, detail="ATTENTION_ITEM_NOT_FOUND")
         row = (
             session.execute(

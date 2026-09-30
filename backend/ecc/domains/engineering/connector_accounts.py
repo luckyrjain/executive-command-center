@@ -868,7 +868,7 @@ class TeamAssignmentRequest(BaseModel):
     just assign once); a UUID must reference an active `kind="team"`
     `pkos_nodes` row in the caller's own workspace, checked by `_validate_
     team_entity` below -- the same "existence + kind, checked at write
-    time" precedent `waiting.py`'s `_counterparty_node_type` already
+    time" precedent `waiting.py`'s `_lock_link_parents` already
     established for `waiting_links.counterparty_entity_id`.
 
     `expected_version` mirrors `entities_mutations.py`'s `EntityPatch`
@@ -3206,7 +3206,7 @@ def list_dashboards_endpoint(
 
 
 def _validate_team_entity(session: Session, auth: AuthContext, team_entity_id: UUID | None) -> None:
-    """Mirrors `waiting.py`'s `_counterparty_node_type` precedent: an
+    """Mirrors `waiting.py`'s `_lock_link_parents` precedent: an
     existence + kind check against `pkos_nodes` at write time, not a
     schema-level FK alone (the FK only proves the row exists in *some*
     workspace at commit time via the composite constraint -- it cannot
