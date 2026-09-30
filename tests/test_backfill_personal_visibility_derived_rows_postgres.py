@@ -20,10 +20,11 @@ import io
 import re
 import sys
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import pytest
@@ -268,7 +269,7 @@ def _confirm(
 def _email_rec(
     world: GmailSyncWorld,
     owner: UUID,
-    target_type: str,
+    target_type: Literal["task", "commitment", "risk"],
     *,
     fields: dict[str, Any] | None = None,
     target_id: UUID | None = None,
@@ -321,19 +322,20 @@ def _search_hits(world: GmailSyncWorld, viewer: UUID, query: str, row_id: UUID) 
 # ---------------------------------------------------------------------------
 
 
-def test_flag_off_confirmed_email_targets_become_private_to_the_recommendation_owner(
-    world: GmailSyncWorld,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    run_ids: list[UUID],
-) -> None:
-    a, b, ws = world.a, world.b, world.workspace_id
-    bystander = world.bystander_user_id
-    assert bystander is not None
+@dataclass(frozen=True)
+class _Seed:
+    derived: dict[tuple[str, UUID], Any]  # key -> the confirming member
+    task: UUID
+    task_grant: UUID
+    untouched: tuple[UUID, UUID]  # generic-recommendation task, set_status target
+    untouched_grant: UUID
 
-    # Flag off: A confirms their own detected task (probe P1); B confirms
-    # A's commitment (the flag-off confirm writes the CONFIRMING member as
-    # owner); A confirms a risk.
+
+def _seed_derived_rows(world: GmailSyncWorld) -> tuple[dict[tuple[str, UUID], Any], UUID]:
+    """Flag off: A confirms their own detected task (probe P1); B confirms
+    A's commitment (the flag-off confirm writes the CONFIRMING member as
+    owner); A confirms a risk."""
+    a, b = world.a, world.b
     task = _confirm(world, a.user_id, a.recommendation_ids[0])
     commitment = _confirm(
         world, b.user_id, _email_rec(world, a.user_id, "commitment", fields=_FIELDS["commitment"])
@@ -342,11 +344,14 @@ def test_flag_off_confirmed_email_targets_become_private_to_the_recommendation_o
     derived = {("tasks", task): a, ("commitments", commitment): b, ("risks", risk): a}
     for key, confirmer in derived.items():
         assert _owner_vis(*key) == (confirmer.user_id, "workspace")
-    task_grant = _grant(world, "tasks", task)
+    return derived, task
 
-    # Untouched: a task from a non-email recommendation, and a task an
-    # email recommendation only changed (operation set_status, not create).
-    client, token = world.harness.client_for(ws, a.user_id)
+
+def _seed_untouched_tasks(world: GmailSyncWorld) -> tuple[UUID, UUID]:
+    """A task from a non-email recommendation, and a task an email
+    recommendation only changed (operation set_status, not create)."""
+    a = world.a
+    client, token = world.harness.client_for(world.workspace_id, a.user_id)
     generic = client.post(
         "/api/v1/recommendations",
         headers=csrf_headers(token, str(uuid4())),
@@ -369,76 +374,108 @@ def test_flag_off_confirmed_email_targets_become_private_to_the_recommendation_o
     )
     assert manual.status_code == 201, manual.text
     manual_task = UUID(manual.json()["id"])
-    status_rec = _email_rec(
-        world,
-        a.user_id,
-        "task",
-        target_id=manual_task,
-        action={"operation": "set_status", "value": "in_progress"},
-    )
+    action = {"operation": "set_status", "value": "in_progress"}
+    status_rec = _email_rec(world, a.user_id, "task", target_id=manual_task, action=action)
     assert _confirm(world, a.user_id, status_rec, target_expected_version=1) == manual_task
-    untouched_grant = _grant(world, "tasks", generic_task)
+    return generic_task, manual_task
 
+
+def _seed(world: GmailSyncWorld) -> _Seed:
+    derived, task = _seed_derived_rows(world)
+    task_grant = _grant(world, "tasks", task)
+    untouched = _seed_untouched_tasks(world)
+    return _Seed(derived, task, task_grant, untouched, _grant(world, "tasks", untouched[0]))
+
+
+def _assert_dry_run_writes_nothing(
+    world: GmailSyncWorld, seed: _Seed, capsys: pytest.CaptureFixture[str], run_ids: list[UUID]
+) -> dict[str, tuple[int, int, int]]:
     before = _snapshot(world)
-    for key in derived:
-        assert _readable(world, bystander, *key)
-    assert _search_hits(world, b.user_id, "Reply to the request", task) == 1
-
-    # Dry run (flag off is fine): counts, nothing written.
-    code, dry_rows, err, dry_run_id = _run(capsys, run_ids, "--dry-run", "--workspace-id", str(ws))
+    args = ("--dry-run", "--workspace-id", str(world.workspace_id))
+    code, dry_rows, err, dry_run_id = _run(capsys, run_ids, *args)
     assert code in (backfill.EXIT_CLEAN, backfill.EXIT_UNRESOLVED), err
     assert _snapshot(world) == before
-    assert not _grant_revoked(task_grant)
+    assert not _grant_revoked(seed.task_grant)
     assert dry_run_id is not None and _log_rows(dry_run_id) == {}
     dry_counts = _counts(dry_rows)
     assert dry_counts["tasks"] == (1, 1, 0)
     assert dry_counts["commitments"] == (1, 0, 0)
     assert dry_counts["risks"] == (1, 0, 0)
+    return dry_counts
+
+
+def _assert_private_to_the_recommendation_owner(world: GmailSyncWorld, seed: _Seed) -> None:
+    """Owner = the recommendation's owner (A), private, grant revoked,
+    version bumped; readable by A only, gone from B's search."""
+    a, b, bystander = world.a, world.b, world.bystander_user_id
+    for key in seed.derived:
+        assert _owner_vis(*key) == (a.user_id, "private"), key
+        assert _version(*key) == 2, key
+        for viewer in (b.user_id, bystander):
+            assert viewer is not None and not _readable(world, viewer, *key), (key, viewer)
+        assert _readable(world, a.user_id, *key)
+    for viewer in (b.user_id, bystander):
+        assert viewer is not None
+        assert _search_hits(world, viewer, "Reply to the request", seed.task) == 0
+    assert _grant_revoked(seed.task_grant)
+    assert not _grant_revoked(seed.untouched_grant)
+
+
+def test_flag_off_confirmed_email_targets_become_private_to_the_recommendation_owner(
+    world: GmailSyncWorld,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    run_ids: list[UUID],
+) -> None:
+    ws, bystander = world.workspace_id, world.bystander_user_id
+    assert bystander is not None
+    seed = _seed(world)
+    before = _snapshot(world)
+    for key in seed.derived:
+        assert _readable(world, bystander, *key)
+    assert _search_hits(world, world.b.user_id, "Reply to the request", seed.task) == 1
+    dry_counts = _assert_dry_run_writes_nothing(world, seed, capsys, run_ids)
 
     _flag(monkeypatch, on=True)
     code, rows, err, run_id = _run(capsys, run_ids, "--workspace-id", str(ws))
     assert code in (backfill.EXIT_CLEAN, backfill.EXIT_UNRESOLVED), err
-    assert run_id is not None
-    assert _counts(rows) == dry_counts
+    assert run_id is not None and _counts(rows) == dry_counts
     assert not {k for k in _unresolved(rows) if k[0] in _DERIVED_TABLES}
-
-    # Owner = the recommendation's owner (A), private, grant revoked, version bumped.
-    for key in derived:
-        assert _owner_vis(*key) == (a.user_id, "private"), key
-        assert _version(*key) == 2, key
-        for viewer in (b.user_id, bystander):
-            assert not _readable(world, viewer, *key), (key, viewer)
-        assert _readable(world, a.user_id, *key)
-    assert _search_hits(world, b.user_id, "Reply to the request", task) == 0
-    assert _search_hits(world, bystander, "Reply to the request", task) == 0
-    assert _grant_revoked(task_grant)
-    assert not _grant_revoked(untouched_grant)
+    _assert_private_to_the_recommendation_owner(world, seed)
     after = _snapshot(world)
-    for key in set(before) - set(derived):
+    for key in set(before) - set(seed.derived):
         assert after[key] == before[key], key
-    assert after[("tasks", generic_task)] == (a.user_id, "workspace")
-    assert after[("tasks", manual_task)] == (a.user_id, "workspace")
-
-    # Logged in the same run: previous values, target table as table_name.
-    log = _log_rows(run_id)
-    for key, confirmer in derived.items():
+    log = _log_rows(run_id)  # previous values, target table as table_name
+    for key, confirmer in seed.derived.items():
         assert log[key] == ("workspace", confirmer.user_id, 1 if key[0] == "tasks" else 0)
-    assert not {k for k in log if k[0] in _DERIVED_TABLES} - set(derived)
+    assert not {k for k in log if k[0] in _DERIVED_TABLES} - set(seed.derived)
+    _assert_rerun_is_a_noop_and_restore_round_trips(
+        world, seed, before, after, run_id, monkeypatch, capsys, run_ids
+    )
 
-    # Re-run: no-op.
-    code, rows2, _err, run_id2 = _run(capsys, run_ids, "--workspace-id", str(ws))
+
+def _assert_rerun_is_a_noop_and_restore_round_trips(
+    world: GmailSyncWorld,
+    seed: _Seed,
+    before: dict[tuple[str, UUID], tuple[UUID, str]],
+    after: dict[tuple[str, UUID], tuple[UUID, str]],
+    run_id: UUID,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    run_ids: list[UUID],
+) -> None:
+    _code, rows2, _err, run_id2 = _run(capsys, run_ids, "--workspace-id", str(world.workspace_id))
     assert all(_counts(rows2)[t] == (0, 0, 0) for t in _DERIVED_TABLES)
     assert run_id2 is not None and _log_rows(run_id2) == {}
     assert _snapshot(world) == after
-
     # Restore (rollback: flag off): previous owner and visibility back,
-    # the revoked grant is not restored.
+    # the revoked grant is not restored; a second restore changes nothing.
     _flag(monkeypatch, on=False)
     code, restore_rows, err, _ = _run(capsys, run_ids, "--restore", str(run_id))
     assert code == backfill.EXIT_CLEAN, err
     assert all(_counts(restore_rows)[t][0] == 1 for t in _DERIVED_TABLES)
     assert _snapshot(world) == before
-    assert _grant_revoked(task_grant)
+    assert _grant_revoked(seed.task_grant)
     code, restore_rows2, err, _ = _run(capsys, run_ids, "--restore", str(run_id))
     assert code == backfill.EXIT_CLEAN, err
     assert all(_counts(restore_rows2)[t][0] == 0 for t in _DERIVED_TABLES)
@@ -556,7 +593,7 @@ def test_restore_leaves_rows_transferred_after_the_backfill_and_reports_them(
     assert code == backfill.EXIT_UNRESOLVED, err
     unresolved = _unresolved(rows)
     for key in (("tasks", task), ("risks", risk), ("recommendations", risk_rec)):
-        assert unresolved[key] == "changed_since_backfill", key
+        assert unresolved[key] == "changed_since_backfill:owner", key
         assert _owner_vis(*key) == (bystander, "private"), key
     assert ("commitments", commitment) not in unresolved
     assert _owner_vis("commitments", commitment) == (b.user_id, "workspace")
@@ -573,7 +610,7 @@ def test_derived_row_of_a_removed_member_stays_private_to_them_and_is_reported(
     commitment B confirmed from A's recommendation becomes A's and private
     -- like the rest of a removed member's personal data (DS2, as FX3
     leaves it on removal), never an admin's -- and the run reports it
-    `owner_inactive`. The next run has nothing to report for it; the
+    `owner_inactive` -- and so does every later run while it holds; the
     restore gives it back to B (still active)."""
     a, b, ws = world.a, world.b, world.workspace_id
     bystander = world.bystander_user_id
@@ -601,9 +638,10 @@ def test_derived_row_of_a_removed_member_stays_private_to_them_and_is_reported(
         assert not _readable(world, viewer, "commitments", commitment), viewer
     assert _log_rows(run_id)[("commitments", commitment)] == ("workspace", b.user_id, 0)
 
+    # Reported on every run while it holds (rebuilt from the log), nothing changes.
     _code, rows2, _err, _ = _run(capsys, run_ids, "--workspace-id", str(ws))
-    assert ("commitments", commitment) not in _unresolved(rows2)
-    assert _counts(rows2)["commitments"] == (0, 0, 0)
+    assert _unresolved(rows2)[("commitments", commitment)] == "owner_inactive"
+    assert _counts(rows2)["commitments"] == (0, 0, 1)
 
     _flag(monkeypatch, on=False)
     _code, restore_rows, err, _ = _run(capsys, run_ids, "--restore", str(run_id))
@@ -622,17 +660,12 @@ def _attention_feedback(world: GmailSyncWorld, actor: UUID, item_id: UUID) -> UU
     return UUID(response.json()["id"])
 
 
-def test_feedback_on_email_rows_loses_its_grants_and_keeps_owner_and_visibility(
+def _seed_granted_feedback(
     world: GmailSyncWorld,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    run_ids: list[UUID],
-) -> None:
-    """`recommendation_feedback` / `attention_feedback` on email rows are
-    in `PERSONAL_DERIVED_PREDICATES` (share-refused with the flag on). A
-    flag-off-era grant on them is revoked and logged; owner and visibility
-    stay as the flag-on writers write them (actor, `workspace`). Feedback
-    on a non-email target keeps its grant."""
+) -> tuple[dict[tuple[str, UUID], UUID], UUID, UUID]:
+    """A's `accept` on their email recommendation and `useful` on their email
+    attention item, each granted to B (flag-off era), plus feedback of the
+    same shape on a non-email attention target, also granted."""
     a, ws = world.a, world.workspace_id
     rec = a.recommendation_ids[0]
     _confirm(world, a.user_id, rec)  # writes A's `accept` feedback
@@ -643,7 +676,7 @@ def test_feedback_on_email_rows_loses_its_grants_and_keeps_owner_and_visibility(
         ).scalar_one()
     item_feedback = _attention_feedback(world, a.user_id, a.attention_item_ids[0])
     other_feedback = uuid4()
-    with engine.begin() as conn:  # same shape, target not an email attention item
+    with engine.begin() as conn:
         conn.execute(
             text(
                 "INSERT INTO attention_feedback (id, workspace_id, target_type, target_id, "
@@ -659,8 +692,22 @@ def test_feedback_on_email_rows_loses_its_grants_and_keeps_owner_and_visibility(
         ),
         ("attention_feedback", item_feedback): _grant(world, "attention_feedback", item_feedback),
     }
-    other_grant = _grant(world, "attention_feedback", other_feedback)
+    return grants, other_feedback, _grant(world, "attention_feedback", other_feedback)
 
+
+def test_feedback_on_email_rows_loses_its_grants_and_keeps_owner_and_visibility(
+    world: GmailSyncWorld,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    run_ids: list[UUID],
+) -> None:
+    """`recommendation_feedback` / `attention_feedback` on email rows are
+    in `PERSONAL_DERIVED_PREDICATES` (share-refused with the flag on). A
+    flag-off-era grant on them is revoked and logged; owner and visibility
+    stay as the flag-on writers write them (actor, `workspace`). Feedback
+    on a non-email target keeps its grant."""
+    a, ws = world.a, world.workspace_id
+    grants, other_feedback, other_grant = _seed_granted_feedback(world)
     _flag(monkeypatch, on=True)
     code, rows, err, run_id = _run(capsys, run_ids, "--workspace-id", str(ws))
     assert run_id is not None, err
@@ -792,7 +839,9 @@ def test_backfill_prints_the_rebuild_command_with_the_isolation_flag(
     _flag(monkeypatch, on=False)
     _code, _rows, err, _ = _run(capsys, run_ids, "--restore", str(run_id))
     reminder = next(line for line in err.splitlines() if line.startswith("REMINDER"))
-    assert "rebuild_knowledge_projections.py --workspace-id <UUID> --allow-without-isolation" in (
-        reminder
-    )
+    # After a full rollback the rebuild's guard releases by itself (no
+    # `private` evidence left), so no override is suggested.
+    assert "rebuild_knowledge_projections.py --workspace-id <UUID>" in reminder
+    assert "--allow-without-isolation" not in reminder
     assert "ECC_PERSONAL_DATA_ISOLATION=true" not in reminder
+    assert "NOT restored" in reminder

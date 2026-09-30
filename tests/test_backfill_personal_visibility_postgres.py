@@ -697,10 +697,11 @@ def test_restore_is_compare_and_set_and_requires_an_active_previous_owner(
             ),
             {"ws": ws, "u": bystander},
         )
+    monkeypatch.delenv(_FLAG, raising=False)  # rollback: flag off first
     code, rows, err, _ = _run(capsys, run_ids, "--restore", str(run_id))
     assert code == backfill.EXIT_UNRESOLVED, err
     unresolved = _unresolved(rows)
-    assert unresolved[("connector_accounts", changed_conn)] == "changed_since_backfill"
+    assert unresolved[("connector_accounts", changed_conn)] == "changed_since_backfill:visibility"
     assert _owner_vis("connector_accounts", changed_conn) == (
         world.b.user_id,
         "shared_explicitly",
@@ -719,6 +720,7 @@ def test_restore_of_unknown_run_is_an_error(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], run_ids: list[UUID]
 ) -> None:
     monkeypatch.setenv("ECC_DATABASE_URL", settings.database_url)
+    monkeypatch.delenv(_FLAG, raising=False)
     code, rows, err, _ = _run(capsys, run_ids, "--restore", str(uuid4()))
     assert code == backfill.EXIT_ERROR
     assert rows == []
@@ -860,6 +862,10 @@ def test_concurrent_row_lock_times_out_with_exit_2_and_the_run_id(
     capsys: pytest.CaptureFixture[str],
     run_ids: list[UUID],
 ) -> None:
+    # Fail fast: one quick retry, short lock_timeout (a lock regression must
+    # not turn this into a 30 s wait).
+    monkeypatch.setattr(backfill, "RETRY_DELAYS_SECONDS", (0.0,))
+    monkeypatch.setattr(backfill, "_LOCK_TIMEOUT", "200ms")
     _flag_on(monkeypatch)
     with engine.connect() as holder:
         holder.execute(
@@ -872,6 +878,7 @@ def test_concurrent_row_lock_times_out_with_exit_2_and_the_run_id(
     assert rows == []
     assert run_id is not None
     assert "sqlstate=55P03" in err  # lock_not_available (lock_timeout)
+    assert "retry 1/1" in err  # retried once, then gave up
     assert f"--restore {run_id}" in err
 
 
@@ -894,7 +901,7 @@ def test_refuses_without_the_isolation_flag(
     assert code == backfill.EXIT_ERROR
     assert rows == []
     assert run_id is None
-    assert "ECC_PERSONAL_DATA_ISOLATION must be enabled" in err
+    assert "set ECC_PERSONAL_DATA_ISOLATION=true on this command line" in err
     assert _snapshot(world.workspace_id) == before
 
 

@@ -1,9 +1,10 @@
+import os
 from base64 import urlsafe_b64decode
 from functools import lru_cache
 from typing import Literal
 
 from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, DotEnvSettingsSource, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -192,6 +193,24 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+SettingSource = Literal["environment", ".env file", "default"]
+
+
+def setting_source(env_name: str) -> SettingSource:
+    """Where `Settings` takes the setting named `env_name` from, following
+    pydantic-settings' own lookup: this process's environment (names are
+    case-insensitive), else the `.env` file `Settings` reads -- parsed by
+    pydantic-settings' own `DotEnvSettingsSource` (`export ` prefixes, any
+    key case), no separate dotenv dependency -- else the field default. For
+    operator-facing messages only."""
+    wanted = env_name.upper()
+    if any(key.upper() == wanted for key in os.environ):
+        return "environment"
+    if any(key.upper() == wanted for key in DotEnvSettingsSource(Settings).env_vars):
+        return ".env file"
+    return "default"
 
 
 class ConfigurationError(RuntimeError):

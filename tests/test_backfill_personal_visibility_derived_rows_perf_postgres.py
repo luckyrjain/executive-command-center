@@ -60,9 +60,11 @@ _OTHER_ROWS_PER_TABLE = 5_000  # not derived from anything
 _DANGLING_EMAIL_CREATES = 40_000  # executed email creates whose target is gone
 _OTHER_RECOMMENDATIONS = 60_000  # other types / not executed
 _INDEX = "ix_recommendations_email_derived_target"
-# Batch select, source ids, source recommendations, grants, grant revoke,
-# log insert (one executemany), update -- plus the few optional lookups.
-_MAX_STATEMENTS_PER_BATCH = 12
+# Unlocked keyset read, grant lock, locked row read, source ids, source
+# recommendations, active members, grant count, grant revoke, log insert
+# (one executemany), update, attention mirror -- plus the optional history
+# lookups. A per-row lookup would be ~500.
+_MAX_STATEMENTS_PER_BATCH = 14
 
 _SEED_ROWS = {
     "tasks": (
@@ -171,8 +173,117 @@ def _seed(connection: Any, world: GmailSyncWorld) -> dict[str, list[UUID]]:
     return derived
 
 
+def _assert_derived_index_serves_the_sources_query(connection: Any) -> None:
+    """Catalog check: migration 0083's index keys, in order, and its partial
+    predicate -- the conditions `email_derived_sources_sql` binds with
+    equality / `= ANY`."""
+    keys, predicate = connection.execute(
+        text(
+            "SELECT array(SELECT pg_get_indexdef(i.indexrelid, k, true) "
+            "FROM generate_series(1, i.indnkeyatts) AS k), pg_get_expr(i.indpred, i.indrelid) "
+            "FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = :name"
+        ),
+        {"name": _INDEX},
+    ).one()
+    normalized = [key.replace("::text", "").replace("(", "").replace(")", "") for key in keys]
+    assert normalized == [
+        "workspace_id",
+        "execution_result ->> 'operation'",
+        "execution_result ->> 'target_type'",
+        "execution_result ->> 'target_id'",
+    ], keys
+    assert "email_action_detected" in predicate and "execution_result IS NOT NULL" in predicate
+    sql = email_derived_sources_sql("tasks")
+    assert "derived_rec.workspace_id = :workspace_id" in sql
+    assert "(derived_rec.execution_result ->> 'target_id') = ANY(:target_ids)" in sql
+    assert "derived_rec.recommendation_type = 'email_action_detected'" in sql
+    assert "derived_rec.execution_result IS NOT NULL" in sql
+
+
 def _plan(connection: Any, sql: str, params: dict[str, Any]) -> str:
     return "\n".join(row[0] for row in connection.execute(text(f"EXPLAIN {sql}"), params))
+
+
+def _assert_plans(connection: Any, ws: UUID, derived: dict[str, list[UUID]]) -> None:
+    """No per-row SubPlan over `recommendations` in the batch reads or the
+    source query; the source query can use migration 0083's index
+    (planner-independent, QA-8: catalog check plus seq/bitmap scans off)."""
+    params = {
+        **personal_sql_params(),
+        "workspace_id": ws,
+        "after": UUID(int=0),
+        "limit": backfill.DEFAULT_BATCH_SIZE,
+        "ids": derived["tasks"][:500],
+    }
+    for table in _TARGET_TYPES:
+        for sql in (backfill._batch_sql(table, lock=False), backfill._locked_rows_sql(table)):
+            plan = _plan(connection, sql, params)
+            assert "SubPlan" not in plan, plan
+        sources_plan = _plan(
+            connection,
+            email_derived_sources_sql(table),
+            {"workspace_id": ws, "target_ids": [str(i) for i in derived[table][:500]]},
+        )
+        assert "SubPlan" not in sources_plan, sources_plan
+    _assert_derived_index_serves_the_sources_query(connection)
+    connection.execute(text("SET LOCAL enable_seqscan = off"))
+    connection.execute(text("SET LOCAL enable_bitmapscan = off"))
+    forced = _plan(
+        connection,
+        email_derived_sources_sql("tasks"),
+        {"workspace_id": ws, "target_ids": [str(i) for i in derived["tasks"][:500]]},
+    )
+    assert _INDEX in forced, forced
+    connection.execute(text("RESET enable_seqscan"))
+    connection.execute(text("RESET enable_bitmapscan"))
+
+
+def _run_all_batches(connection: Any, ws: UUID) -> tuple[Any, list[int], float]:
+    """Every derived-table batch on `connection` (write mode); returns the
+    report, the statement count of each batch, and the elapsed time."""
+    report = backfill.Report()
+    run_id = uuid4()
+    # Statements per batch: a constant, whatever the batch size -- a
+    # per-row lookup (N+1 in Python) would issue ~500 per batch.
+    statements: list[int] = []
+
+    def _count(*_args: Any) -> None:
+        statements[-1] += 1
+
+    started = time.perf_counter()
+    event.listen(connection, "before_cursor_execute", _count)
+    for table in _TARGET_TYPES:
+        after: UUID | None = UUID(int=0)
+        while after is not None:
+            statements.append(0)
+            after = backfill._process_batch(
+                connection,
+                table,
+                ws,
+                after,
+                backfill.DEFAULT_BATCH_SIZE,
+                write=True,
+                run_id=run_id,
+                report=report,
+            )
+    event.remove(connection, "before_cursor_execute", _count)
+    return report, statements, time.perf_counter() - started
+
+
+def _assert_all_private(
+    connection: Any, ws: UUID, report: Any, derived: dict[str, list[UUID]]
+) -> None:
+    for table, row_ids in derived.items():
+        assert report.stats[table].changed == len(row_ids), table
+        assert report.stats[table].unresolved == 0, table
+        private = connection.execute(
+            text(
+                f"SELECT count(*) FROM {table} WHERE workspace_id = :ws "  # noqa: S608
+                "AND visibility = 'private' AND id = ANY(:ids)"
+            ),
+            {"ws": ws, "ids": row_ids},
+        ).scalar_one()
+        assert private == len(row_ids), table
 
 
 def test_derived_row_batches_scale_without_a_per_row_scan(world: GmailSyncWorld) -> None:
@@ -186,69 +297,14 @@ def test_derived_row_batches_scale_without_a_per_row_scan(world: GmailSyncWorld)
                 {"ws": ws},
             ).scalar_one()
             assert recommendations >= 100_000
-
-            params = {
-                **personal_sql_params(),
-                "workspace_id": ws,
-                "after": UUID(int=0),
-                "limit": backfill.DEFAULT_BATCH_SIZE,
-            }
-            for table in _TARGET_TYPES:
-                batch_plan = _plan(connection, backfill._batch_sql(table, lock=True), params)
-                assert "SubPlan" not in batch_plan, batch_plan
-                sources_plan = _plan(
-                    connection,
-                    email_derived_sources_sql(table),
-                    {"workspace_id": ws, "target_ids": [str(i) for i in derived[table][:500]]},
-                )
-                assert "SubPlan" not in sources_plan, sources_plan
-                assert _INDEX in sources_plan, sources_plan
-
-            report = backfill.Report()
-            run_id = uuid4()
-            started = time.perf_counter()
-            batches = 0
-            # Statements per batch: a constant, whatever the batch size -- a
-            # per-row lookup (N+1 in Python) would issue ~500 per batch.
-            statements: list[int] = []
-
-            def _count(*_args: Any) -> None:
-                statements[-1] += 1
-
-            event.listen(connection, "before_cursor_execute", _count)
-            for table in _TARGET_TYPES:
-                after: UUID | None = UUID(int=0)
-                while after is not None:
-                    statements.append(0)
-                    after = backfill._process_batch(
-                        connection,
-                        table,
-                        ws,
-                        after,
-                        backfill.DEFAULT_BATCH_SIZE,
-                        write=True,
-                        run_id=run_id,
-                        report=report,
-                    )
-                    batches += 1
-            elapsed = time.perf_counter() - started
-            event.remove(connection, "before_cursor_execute", _count)
+            _assert_plans(connection, ws, derived)
+            report, statements, elapsed = _run_all_batches(connection, ws)
             print(
                 f"derived backfill: {sum(len(v) for v in derived.values())} rows, "
-                f"{recommendations} recommendations, {batches} batches, {elapsed:.2f} s"
+                f"{recommendations} recommendations, {len(statements)} batches, "
+                f"{elapsed:.2f} s, max {max(statements)} statements per batch"
             )
-            for table, row_ids in derived.items():
-                assert report.stats[table].changed == len(row_ids), table
-                assert report.stats[table].unresolved == 0, table
-                private = connection.execute(
-                    text(
-                        f"SELECT count(*) FROM {table} WHERE workspace_id = :ws "  # noqa: S608
-                        "AND visibility = 'private' AND id = ANY(:ids)"
-                    ),
-                    {"ws": ws, "ids": row_ids},
-                ).scalar_one()
-                assert private == len(row_ids), table
-            print(f"max statements per batch: {max(statements)}")
+            _assert_all_private(connection, ws, report, derived)
             assert max(statements) <= _MAX_STATEMENTS_PER_BATCH, statements
             # Round 1 took 123-144 s here; measured well under 10 s now.
             assert elapsed < 60.0, elapsed

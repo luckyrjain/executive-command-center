@@ -1,7 +1,9 @@
 """scripts/rebuild_knowledge_projections.py refuses to run with
-`ECC_PERSONAL_DATA_ISOLATION` off once the personal-data backfill has run
-(deep review B3: the flag-off rebuild writes claims backed by private
-evidence back into shared search text), unless `--allow-without-isolation`.
+`ECC_PERSONAL_DATA_ISOLATION` off while `private` evidence exists in scope
+(deep review B3 / FX2 deep review A: a flag-off rebuild copies claims backed
+by it into shared search text), unless `--allow-without-isolation`. Nothing
+else triggers it -- in particular not the backfill log (a full rollback
+releases the guard) and not narrowed (`shared_explicitly`) evidence.
 """
 
 from __future__ import annotations
@@ -12,14 +14,14 @@ from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.orm import Session
 
 from ecc.config import get_settings
-from ecc.database import engine
+from ecc.database import SessionFactory, engine
 
 settings = get_settings()
 pytestmark = pytest.mark.skipif(
@@ -153,33 +155,8 @@ def _seed_evidence(ws: UUID, accounts: list[UUID], *, source_type: str, visibili
 
 
 @pytest.fixture
-def without_backfill_log(
-    monkeypatch: pytest.MonkeyPatch, workspace_id: UUID, other_workspace_id: UUID
-) -> Iterator[None]:
-    """The rebuild runs on one connection whose transaction has emptied
-    `personal_visibility_backfill_log` and is rolled back afterwards -- so
-    "no backfill has run" holds whatever rows other tests or runs left in
-    this database, and nothing is deleted for real. Depends on both
-    workspace fixtures so it is rolled back before either is dropped (a
-    rebuild that wrongly ran against one holds locks there until then)."""
-    del workspace_id, other_workspace_id
-    with engine.connect() as conn:
-        transaction = conn.begin()
-        conn.execute(text("DELETE FROM personal_visibility_backfill_log"))
-        monkeypatch.setattr(
-            rebuild,
-            "SessionFactory",
-            lambda: Session(bind=conn, join_transaction_mode="create_savepoint"),
-        )
-        try:
-            yield
-        finally:
-            transaction.rollback()
-
-
-@pytest.fixture
 def backfill_log_row() -> Iterator[None]:
-    """One `personal_visibility_backfill_log` row: the backfill has run."""
+    """One `personal_visibility_backfill_log` row: a backfill has run."""
     run_id = uuid4()
     with engine.begin() as conn:
         conn.execute(
@@ -205,122 +182,114 @@ def _flag(monkeypatch: pytest.MonkeyPatch, value: str | None) -> None:
     get_settings.cache_clear()
 
 
+def _rebuild(*argv: str, capsys: pytest.CaptureFixture[str]) -> tuple[int, str, str]:
+    code = rebuild.main(list(argv))
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def test_runs_without_the_flag_when_no_private_evidence_exists(
+    workspace_id: UUID, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A default flag-off deployment. Scoped to an empty workspace, so it
+    holds whatever other tests left in this database."""
+    _flag(monkeypatch, None)
+    code, out, err = _rebuild("--workspace-id", str(workspace_id), capsys=capsys)
+    assert code == 0, err
+    assert "refusing" not in err
+    assert f"{workspace_id}\ttimeline_entries\t" in out
+
+
 @pytest.mark.usefixtures("backfill_log_row")
+def test_backfill_log_rows_alone_do_not_block(
+    workspace_id: UUID, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """After a full rollback the log keeps its rows (restore needs them)
+    while the evidence is back to `workspace`: the guard must release."""
+    _flag(monkeypatch, None)
+    code, out, err = _rebuild("--workspace-id", str(workspace_id), capsys=capsys)
+    assert code == 0, err
+    assert "WARNING" not in err
+
+
 @pytest.mark.parametrize("value", [None, "false"])
-def test_refuses_after_a_backfill_without_the_isolation_flag(
+def test_refuses_without_the_flag_when_private_evidence_exists(
     workspace_id: UUID,
+    accounts: list[UUID],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     value: str | None,
 ) -> None:
+    for _ in range(2):
+        _seed_evidence(workspace_id, accounts, source_type="gmail_sync", visibility="private")
     _flag(monkeypatch, value)
-    code = rebuild.main(["--workspace-id", str(workspace_id)])
-    captured = capsys.readouterr()
+    code, out, err = _rebuild("--workspace-id", str(workspace_id), capsys=capsys)
     assert code == rebuild.EXIT_REFUSED == 2
-    assert "refusing to run" in captured.err
-    assert "ECC_PERSONAL_DATA_ISOLATION=true" in captured.err
-    assert captured.out == ""  # nothing rebuilt
+    assert "refusing to run" in err
+    assert f"total=2 in 1 workspace(s): {workspace_id}=2" in err
+    assert "ECC_PERSONAL_DATA_ISOLATION=true" in err
+    assert out == ""  # nothing rebuilt
 
 
-@pytest.mark.usefixtures("backfill_log_row")
-def test_runs_after_a_backfill_with_the_isolation_flag(
-    workspace_id: UUID, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    _flag(monkeypatch, "true")
-    code = rebuild.main(["--workspace-id", str(workspace_id)])
-    captured = capsys.readouterr()
-    assert code == 0, captured.err
-    assert f"{workspace_id}\tretrieval_documents\t" in captured.out
-    assert "WARNING" not in captured.err
-
-
-@pytest.mark.usefixtures("backfill_log_row")
-def test_override_runs_without_the_flag_with_a_warning(
-    workspace_id: UUID, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    _flag(monkeypatch, None)
-    code = rebuild.main(["--workspace-id", str(workspace_id), "--allow-without-isolation"])
-    captured = capsys.readouterr()
-    assert code == 0, captured.err
-    assert "WARNING" in captured.err
-    assert f"{workspace_id}\tretrieval_documents\t" in captured.out
-
-
-@pytest.mark.usefixtures("without_backfill_log")
-def test_runs_without_the_flag_before_any_backfill(
-    workspace_id: UUID, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """A default flag-off deployment: no backfill, no private evidence."""
-    _flag(monkeypatch, None)
-    code = rebuild.main(["--workspace-id", str(workspace_id)])
-    captured = capsys.readouterr()
-    assert code == 0, captured.err
-    assert "refusing" not in captured.err
-    assert f"{workspace_id}\ttimeline_entries\t" in captured.out
-
-
-@pytest.mark.usefixtures("without_backfill_log")
-def test_refuses_without_the_flag_when_private_evidence_exists_and_no_backfill_ran(
+def test_override_and_flag_on_both_run(
     workspace_id: UUID,
     accounts: list[UUID],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The flag was on before any flag-off Gmail rows existed: the backfill
-    log can be empty while private evidence exists. A flag-off rebuild
-    would copy the claims it backs into the shared retrieval body."""
     _seed_evidence(workspace_id, accounts, source_type="gmail_sync", visibility="private")
     _flag(monkeypatch, None)
-    code = rebuild.main(["--workspace-id", str(workspace_id)])
-    captured = capsys.readouterr()
-    assert code == rebuild.EXIT_REFUSED
-    assert "refusing to run" in captured.err
-    assert captured.out == ""
-
-    code = rebuild.main(["--workspace-id", str(workspace_id), "--allow-without-isolation"])
-    captured = capsys.readouterr()
-    assert code == 0, captured.err
-    assert "WARNING" in captured.err
-    assert f"{workspace_id}\tretrieval_documents\t" in captured.out
+    code, out, err = _rebuild(
+        "--workspace-id", str(workspace_id), "--allow-without-isolation", capsys=capsys
+    )
+    assert code == 0, err
+    assert "WARNING" in err and f"{workspace_id}=1" in err
+    assert f"{workspace_id}\tretrieval_documents\t" in out
 
     _flag(monkeypatch, "true")
-    code = rebuild.main(["--workspace-id", str(workspace_id)])
-    captured = capsys.readouterr()
-    assert code == 0, captured.err
-    assert "WARNING" not in captured.err
+    code, out, err = _rebuild("--workspace-id", str(workspace_id), capsys=capsys)
+    assert code == 0, err
+    assert "WARNING" not in err
+    assert "isolation=on (from environment)" in err
 
 
-@pytest.mark.usefixtures("without_backfill_log")
-@pytest.mark.parametrize(
-    ("source_type", "refused"),
-    [("gmail_sync", True), ("manual", False)],
-)
-def test_narrowed_evidence_refuses_only_when_it_is_gmail_sourced(
+@pytest.mark.parametrize("source_type", ["gmail_sync", "manual"])
+def test_narrowed_evidence_does_not_block(
     workspace_id: UUID,
     accounts: list[UUID],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     source_type: str,
-    refused: bool,
 ) -> None:
-    """`shared_explicitly` evidence: an ordinary narrowed grant on
-    non-personal evidence (a flag-off app already puts it in shared bodies)
-    must not block every later flag-off rebuild; narrowed Gmail evidence
-    does."""
+    """`shared_explicitly` evidence -- Gmail-sourced too: a flag-off
+    application creates it with an ordinary narrowing grant and already puts
+    it in shared search text, so refusing would only block deployments that
+    never enable isolation."""
     _seed_evidence(workspace_id, accounts, source_type=source_type, visibility="shared_explicitly")
     _flag(monkeypatch, None)
-    code = rebuild.main(["--workspace-id", str(workspace_id)])
-    captured = capsys.readouterr()
-    if refused:
-        assert code == rebuild.EXIT_REFUSED
-        assert "refusing to run" in captured.err
-    else:
-        assert code == 0, captured.err
-        assert "refusing" not in captured.err
-        assert f"{workspace_id}\tretrieval_documents\t" in captured.out
+    code, out, err = _rebuild("--workspace-id", str(workspace_id), capsys=capsys)
+    assert code == 0, err
+    assert f"{workspace_id}\tretrieval_documents\t" in out
 
 
-@pytest.mark.usefixtures("without_backfill_log")
+def test_evidence_back_to_workspace_after_a_rollback_releases_the_guard(
+    workspace_id: UUID,
+    accounts: list[UUID],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _seed_evidence(workspace_id, accounts, source_type="gmail_sync", visibility="private")
+    _flag(monkeypatch, None)
+    assert _rebuild("--workspace-id", str(workspace_id), capsys=capsys)[0] == 2
+    with engine.begin() as conn:  # what `--restore` does to backfilled evidence
+        conn.execute(
+            text("UPDATE pkos_evidence SET visibility = 'workspace' WHERE workspace_id = :ws"),
+            {"ws": workspace_id},
+        )
+    code, _out, err = _rebuild("--workspace-id", str(workspace_id), capsys=capsys)
+    assert code == 0, err
+
+
 def test_private_evidence_in_another_workspace_does_not_block_a_scoped_rebuild(
     workspace_id: UUID,
     other_workspace_id: UUID,
@@ -330,9 +299,85 @@ def test_private_evidence_in_another_workspace_does_not_block_a_scoped_rebuild(
 ) -> None:
     _seed_evidence(other_workspace_id, accounts, source_type="gmail_sync", visibility="private")
     _flag(monkeypatch, None)
-    code = rebuild.main(["--workspace-id", str(workspace_id)])
-    captured = capsys.readouterr()
-    assert code == 0, captured.err
-    assert "refusing" not in captured.err
-    code = rebuild.main(["--workspace-id", str(other_workspace_id)])
+    code, _out, err = _rebuild("--workspace-id", str(workspace_id), capsys=capsys)
+    assert code == 0, err
+    assert _rebuild("--workspace-id", str(other_workspace_id), capsys=capsys)[0] == 2
+
+
+def test_unscoped_rebuild_refuses_and_lists_the_workspace(
+    workspace_id: UUID,
+    accounts: list[UUID],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """QA-2: no `--workspace-id` -- every workspace is in scope."""
+    _seed_evidence(workspace_id, accounts, source_type="gmail_sync", visibility="private")
+    _flag(monkeypatch, None)
+    code, out, err = _rebuild(capsys=capsys)
     assert code == rebuild.EXIT_REFUSED
+    assert out == ""
+    assert "private pkos_evidence: total=" in err
+
+
+def test_counts_list_the_top_workspaces_and_the_total() -> None:
+    counts = [(uuid4(), 20 - i) for i in range(12)]
+    described = rebuild._describe_counts(counts)
+    assert f"total={sum(n for _, n in counts)} in 12 workspace(s)" in described
+    assert f"{counts[9][0]}=" in described and f"{counts[10][0]}=" not in described
+    assert "(+2 more workspaces)" in described
+
+
+def test_unknown_workspace_and_invalid_uuid_exit_2(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _flag(monkeypatch, None)
+    code, out, err = _rebuild("--workspace-id", str(uuid4()), capsys=capsys)
+    assert code == 2
+    assert "workspace not found" in err and out == ""
+    with pytest.raises(SystemExit) as raised:
+        rebuild.main(["--workspace-id", "not-a-uuid"])
+    assert raised.value.code == 2
+
+
+def test_announces_the_database_and_the_flag_source(
+    workspace_id: UUID, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _flag(monkeypatch, "false")
+    _code, _out, err = _rebuild("--workspace-id", str(workspace_id), capsys=capsys)
+    assert "isolation=off (from environment)" in err
+    assert "password" not in err and "ecc:ecc@" not in err
+    assert "name=" in err and "host=" in err
+    _flag(monkeypatch, None)
+    monkeypatch.chdir(Path(__file__).parent)  # no .env here: the default
+    _code, _out, err = _rebuild("--workspace-id", str(workspace_id), capsys=capsys)
+    assert "isolation=off (from default)" in err
+
+
+def test_private_evidence_counts_are_largest_first_under_the_guard_timeout(
+    workspace_id: UUID,
+    other_workspace_id: UUID,
+    accounts: list[UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """QA2-3: the refusal lists the workspace with more private evidence
+    first, and the guard's read runs under its own 120 s statement timeout
+    (checked inside the transaction)."""
+    _seed_evidence(workspace_id, accounts, source_type="gmail_sync", visibility="private")
+    for _ in range(2):
+        _seed_evidence(other_workspace_id, accounts, source_type="gmail_sync", visibility="private")
+    seen: list[str] = []
+    with SessionFactory() as session:
+        original = session.execute
+
+        def spy(statement: Any, *args: Any, **kwargs: Any) -> Any:
+            result = original(statement, *args, **kwargs)
+            if "pkos_evidence" in str(statement):
+                seen.append(original(text("SHOW statement_timeout")).scalar_one())
+            return result
+
+        monkeypatch.setattr(session, "execute", spy)
+        counts = rebuild.private_evidence_counts(session, None)
+    ours = [ws for ws, _n in counts if ws in (workspace_id, other_workspace_id)]
+    assert ours == [other_workspace_id, workspace_id]
+    assert dict(counts)[other_workspace_id] == 2 and dict(counts)[workspace_id] == 1
+    assert seen == ["2min"]

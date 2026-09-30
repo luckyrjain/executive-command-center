@@ -2,7 +2,7 @@
 id: PHASE-2-DEPLOYMENT
 title: Phase 2 Deployment Runbook
 status: Active
-version: 1.2.0
+version: 1.4.0
 owner: Lucky Jain
 ---
 
@@ -54,17 +54,25 @@ assumes it.
   # deterministically, from the authoritative tables they're derived from
   # (audit_events, pkos_nodes, knowledge_claims). Safe to re-run any time —
   # both projections are declared rebuildable in phase-002/DATA-MODEL.md —
-  # as long as the isolation flag matches the application's. When the
-  # application runs with ECC_PERSONAL_DATA_ISOLATION on, prefix the same
-  # flag here; the command refuses (exit 2) without it after a backfill or
-  # when private or narrowed Gmail evidence exists (see "Personal-data
-  # isolation" below). Each invocation is one transaction, so on large
-  # deployments prefer one workspace at a time.
-  uv run python scripts/rebuild_knowledge_projections.py
+  # as long as the isolation flag matches the application's: when the
+  # application runs with ECC_PERSONAL_DATA_ISOLATION on, add
+  # ECC_PERSONAL_DATA_ISOLATION=true here too. With the flag off the command
+  # refuses (exit 2) while `private` evidence exists in scope (see
+  # "Personal-data isolation" below). Each invocation is one transaction, so
+  # on large deployments prefer one workspace at a time.
+  PYTHONPATH=backend ECC_DATABASE_URL=<url> \
+      uv run python scripts/rebuild_knowledge_projections.py
 
   # Or scope it to one workspace:
-  uv run python scripts/rebuild_knowledge_projections.py --workspace-id <UUID>
+  PYTHONPATH=backend ECC_DATABASE_URL=<url> \
+      uv run python scripts/rebuild_knowledge_projections.py --workspace-id <UUID>
   ```
+
+  It prints the effective database (host and name) and whether
+  `ECC_PERSONAL_DATA_ISOLATION` is on and where it came from (environment,
+  `.env` file, or default) on stderr. Exit codes: 0 rebuilt; 2 refused by the
+  isolation guard, invalid arguments, or unknown workspace; 1 unexpected
+  error.
 
   There is no scheduled job that runs this automatically — the projection
   writers (`queue_timeline_entry`, `queue_retrieval_document`) keep both
@@ -74,43 +82,82 @@ assumes it.
   checks in `scripts/verify_restore.sh`, not as a routine deployment step.
 
   **Personal-data isolation (security remediation Spec A).** With the flag
-  off, the rebuild refuses to run (exit 2, unless given
-  `--allow-without-isolation`) when any of these holds (the evidence
-  checks are scoped to the `--workspace-id` workspace, else every
-  workspace; the backfill-log check is always global):
+  off, `retrieval._build_body` copies every claim into shared search text,
+  including claims backed by evidence that is `private` only because the
+  flag was on (Gmail evidence written with the flag on, or evidence the
+  personal-visibility backfill made private). So with the flag off the
+  rebuild refuses (exit 2) while any `pkos_evidence` row in scope (the
+  `--workspace-id` workspace, else every workspace) is `private`, and lists
+  the workspaces with counts (top 10 plus the total). Nothing else triggers
+  it: not the backfill log, and not narrowed (`shared_explicitly`) evidence,
+  which a flag-off application already puts in shared search text. The
+  check is one read with a 120 s statement timeout; unscoped, it scans
+  `pkos_evidence` once. `--allow-without-isolation` overrides it with a
+  warning.
 
-  - `personal_visibility_backfill_log` has rows
-    (`scripts/backfill_personal_visibility.py` has run);
-  - a `pkos_evidence` row is `private` (only written with the flag on,
-    e.g. Gmail evidence synced while isolation was enabled);
-  - Gmail-sourced (`gmail_sync`) evidence has been narrowed to specific
-    people (`shared_explicitly`).
-
-  In those cases run it with `ECC_PERSONAL_DATA_ISOLATION=true` in its own
-  environment: without the flag it writes claims backed by that evidence
-  into shared search text. Ordinary narrowed grants on non-personal
-  evidence do not trigger the refusal (a flag-off application already puts
-  that evidence in shared search text). Order:
+  Order at rollout step R5 (details, durations, every backfill reason and
+  exit code: `docs/SETUP.md`, "Personal-data isolation rollout notes"):
 
   1. Enable `ECC_PERSONAL_DATA_ISOLATION` on the application and restart
      every process.
-  2. Run the backfill (`--dry-run` first). It refuses to run without the
-     flag.
-  3. Rebuild, one workspace at a time, with the flag:
+  2. Dry-run the backfill and review its report:
 
      ```bash
-     ECC_PERSONAL_DATA_ISOLATION=true \
+     PYTHONPATH=backend ECC_DATABASE_URL=<url> \
+         uv run python scripts/backfill_personal_visibility.py --dry-run
+     ```
+
+  3. Review the dry run's `owner_inactive` rows: for each, tell the
+     confirming member (the row's `created_by`) which task, commitment or
+     risk will leave their view (`docs/SETUP.md` has the query mapping the
+     ids to titles and email addresses). The per-row remedy in
+     `docs/SETUP.md` works only AFTER the real run; it cannot be applied in
+     advance. Moving a row from an active confirming member to an inactive
+     recommendation owner (review item A2) is signed off (2026-09-30):
+     keep current behaviour.
+  4. Run the backfill (it refuses to run without the flag). Measured: 457.7 s
+     for 720k recommendations and 520k derived rows; 5 min 50 s for 300k
+     recommendations and 200k derived rows with three earlier runs, under
+     heavy machine load. Plan for roughly 11 to 20 minutes per million
+     recommendations (about 6 minutes per million recommendations plus
+     derived rows on an idle machine). Batches that hit a deadlock, lock timeout
+     (`lock_timeout` 5 s) or statement timeout (120 s) are retried up to
+     four times; after that the run stops with exit 2 and a re-run
+     continues.
+
+     ```bash
+     PYTHONPATH=backend ECC_DATABASE_URL=<url> ECC_PERSONAL_DATA_ISOLATION=true \
+         uv run python scripts/backfill_personal_visibility.py
+     ```
+
+  5. Rebuild, one workspace at a time, with the flag:
+
+     ```bash
+     PYTHONPATH=backend ECC_DATABASE_URL=<url> ECC_PERSONAL_DATA_ISOLATION=true \
          uv run python scripts/rebuild_knowledge_projections.py --workspace-id <UUID>
      ```
 
-  Rollback: turn the flag off on the application, then restore EVERY
-  backfill run id, newest first
+  Rollback: turn the flag off on the application (and restart), then
+  restore EVERY backfill run id, newest first
   (`SELECT run_id, min(at) FROM personal_visibility_backfill_log GROUP BY 1
-  ORDER BY 2 DESC;`, then `--restore <run_id>` for each). Only after that,
-  rebuild with the flag off and `--allow-without-isolation`. Note that this
-  rebuild puts evidence written while the flag was on (for example Gmail
-  evidence synced as `private`) back into shared search text: `--restore`
-  only reverts rows the backfill logged.
+  ORDER BY 2 DESC;`, then
+  `PYTHONPATH=backend ECC_DATABASE_URL=<url> uv run python scripts/backfill_personal_visibility.py --restore <run_id>`
+  for each; it refuses while the flag is on in its environment or in the
+  application's settings, `.env` included, unless given
+  `--allow-with-isolation`). The restore is an exact compare-and-set on
+  migration 0084's snapshot (rows edited or acted on since are reported
+  `changed_since_backfill:<cause>`), and each log page is retried like a
+  backfill batch. Revoked grants are not restored; `docs/SETUP.md`
+  has the SQL that lists them. Then rebuild with the flag off: the evidence
+  the restores put back is `workspace` again. Evidence stays `private`, and
+  keeps the guard on, where a restore reported the row instead of restoring
+  it (`previous_owner_inactive`, `changed_since_backfill:*`) and where it was
+  written while the flag was on (restore never touches it). The guard's
+  refusal lists those workspaces with counts; `SELECT id, source_type,
+  owner_id FROM pkos_evidence WHERE workspace_id = '<ws>' AND visibility =
+  'private'` lists the rows. Then re-enable the flag, or pass
+  `--allow-without-isolation` knowing that claims backed by that evidence
+  become shared search text.
 
 ## Optional: enabling embeddings and hybrid retrieval (Task 7)
 
