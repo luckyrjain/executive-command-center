@@ -109,6 +109,13 @@ def set_risk_status_write(
     `insert_risk`'s own docstring for why (both callers already run inside
     their own already-open transaction and idempotency scheme).
     """
+    # Lock before authorizing: an ownership transfer that commits while
+    # this request waits on the row lock must be seen by the checks below
+    # (READ COMMITTED: each later statement reads the committed row), not
+    # by checks that ran against the pre-transfer row.
+    current = _get_row(session, auth, risk_id, for_update=True)
+    if current is None:
+        raise HTTPException(status_code=404, detail="RISK_NOT_FOUND")
     if not authz.authorize(
         session, auth, resource_type="risks", resource_id=risk_id, action="read"
     ):
@@ -117,9 +124,6 @@ def set_risk_status_write(
         session, auth, resource_type="risks", resource_id=risk_id, action="write"
     ):
         raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-    current = _get_row(session, auth, risk_id, for_update=True)
-    if current is None:
-        raise HTTPException(status_code=404, detail="RISK_NOT_FOUND")
     if current["archived_at"] is not None:
         raise HTTPException(status_code=409, detail="RISK_ARCHIVED")
     if current["version"] != expected_version:
@@ -189,6 +193,13 @@ def update_risk(
         )
         if cached is not None:
             return cached
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        current = _get_row(session, auth, risk_id, for_update=True)
+        if current is None:
+            raise HTTPException(status_code=404, detail="RISK_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="risks", resource_id=risk_id, action="read"
         ):
@@ -197,9 +208,6 @@ def update_risk(
             session, auth, resource_type="risks", resource_id=risk_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-        current = _get_row(session, auth, risk_id, for_update=True)
-        if current is None:
-            raise HTTPException(status_code=404, detail="RISK_NOT_FOUND")
         if current["archived_at"] is not None:
             raise HTTPException(status_code=409, detail="RISK_ARCHIVED")
         if current["version"] != payload.expected_version:
@@ -277,6 +285,13 @@ def _archive_action(
         )
         if cached is not None:
             return cached
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        current = _get_row(session, auth, risk_id, for_update=True)
+        if current is None:
+            raise HTTPException(status_code=404, detail="RISK_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="risks", resource_id=risk_id, action="read"
         ):
@@ -285,9 +300,6 @@ def _archive_action(
             session, auth, resource_type="risks", resource_id=risk_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-        current = _get_row(session, auth, risk_id, for_update=True)
-        if current is None:
-            raise HTTPException(status_code=404, detail="RISK_NOT_FOUND")
         if current["version"] != payload.expected_version:
             raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
         if action == "archive" and current["archived_at"] is not None:
