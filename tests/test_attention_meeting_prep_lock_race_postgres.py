@@ -16,7 +16,10 @@ Siblings of the same race, covered here too:
 
 - `scheduling/meetings.py`'s PATCH, archive and restore authorized before
   taking their own `FOR UPDATE` on the meeting (a transfer does not bump
-  `version`, so `expected_version` could not catch it). They now lock first.
+  `version`, so `expected_version` could not catch it). They lock first since
+  #321 (its own lose-read cases live in
+  test_calendar_scheduling_mutation_lock_race_postgres.py); the lose-write
+  (403) cases here pin the post-lock write check too.
 - A grantor revoking their own grant never locked the resource row, so it
   did not wait for a writer holding the meeting lock: the revoke returned
   while a write it should have ordered after was still in flight. Every
