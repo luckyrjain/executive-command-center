@@ -133,6 +133,7 @@ def record_risk_review(
     now = datetime.now(UTC)
     review_id = uuid4()
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         idempotency.lock_idempotency(session, auth, idempotency_key)
         cached = idempotency.load_cached(
             session,

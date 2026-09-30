@@ -18,6 +18,10 @@ Architecture Decision Records capture decisions that materially affect system st
 12. [ADR-0012 — Ollama Local Inference](ADR-0012-ollama-local-inference.md)
 13. [ADR-0013 — Durable Workflow Execution](ADR-0013-durable-workflow-execution.md)
 
+## Proposed decisions
+
+- [ADR-0014 — Membership Lock on Authorized Writes](ADR-0014-membership-lock-on-authorized-writes.md)
+
 ## Naming
 
 ```text

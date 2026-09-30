@@ -115,6 +115,7 @@ from ecc.auth import AuthContext
 from ecc.platform.connector_security import (
     PERSONAL_DERIVED_PREDICATES,
     PERSONAL_ROW_PREDICATES,
+    lock_membership_shared,
     personal_data_isolation_enabled,
     personal_sql_params,
 )
@@ -766,6 +767,46 @@ def require_role_action(session: Session, auth: AuthContext, action: Action) -> 
     """
     role = require_active_role(session, auth)
     if action not in ROLE_PERMISSIONS[role]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="INSUFFICIENT_ROLE")
+
+
+def lock_membership_for_write(
+    session: Session, auth: AuthContext, *, role_action: Action | None = None
+) -> None:
+    """Serialize an authorized write against membership removal and role
+    change. Call it as the FIRST statement of every write transaction,
+    before `idempotency.lock_idempotency` and before any row lock (the
+    normative order in `connector_security`'s lock-ordering note), and
+    authorize only after it.
+
+    Removal and role change (`identity/membership_removal.py`) take the
+    workspace's membership-mutation advisory lock exclusively; this takes
+    its shared side for the rest of the transaction. So a removal or
+    demotion either committed before this returns -- and every
+    `authorize()`/`current_role()` read after it, each its own READ
+    COMMITTED snapshot, sees the new role -- or waits until this
+    transaction ends. Without it, a caller could pass `authorize()`, get
+    removed or demoted to `viewer`, have that commit, and still commit the
+    write afterwards.
+
+    `role_action` re-checks the caller's role inside the transaction, for
+    endpoints whose only role gate is `require_role_action` before the
+    transaction begins (creates, and bulk writes with no per-resource
+    `authorize()`); pass `"read"` to require any active membership. `403
+    INSUFFICIENT_ROLE` on failure, like `require_role_action`. Never rolls
+    back (see `current_role`'s docstring).
+
+    Writers never conflict with each other on this lock. The cost falls on
+    removal/role change, which waits for every in-flight write transaction
+    in the workspace, while writes arriving after it queue behind it (a
+    waiting exclusive request blocks new shared requests). Keep the locked
+    transactions short and free of network or model calls.
+    """
+    lock_membership_shared(session, auth.workspace_id)
+    if role_action is None:
+        return
+    role = current_role(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
+    if role is None or role_action not in ROLE_PERMISSIONS[role]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="INSUFFICIENT_ROLE")
 
 

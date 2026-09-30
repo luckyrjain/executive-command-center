@@ -720,6 +720,7 @@ def create_plan(
     now = datetime.now(UTC)
     plan_id = uuid4()
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="write")
         idempotency.lock_idempotency(session, auth, idempotency_key)
         cached = idempotency.load_cached(
             session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
@@ -1011,6 +1012,7 @@ def accept_plan(
     request_hash = idempotency.request_hash(payload, f"accept:{plan_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         idempotency.lock_idempotency(session, auth, idempotency_key)
         cached = idempotency.load_cached(
             session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
@@ -1106,6 +1108,7 @@ def supersede_plan(
     request_hash = idempotency.request_hash(payload, f"supersede:{plan_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         idempotency.lock_idempotency(session, auth, idempotency_key)
         cached = idempotency.load_cached(
             session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
@@ -1262,6 +1265,7 @@ def replan(
     now = datetime.now(UTC)
     new_plan_id = uuid4()
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         idempotency.lock_idempotency(session, auth, idempotency_key)
         cached = idempotency.load_cached(
             session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
@@ -1508,6 +1512,7 @@ def move_block(
     request_hash = idempotency.request_hash(payload, f"move:{plan_id}:{block_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         idempotency.lock_idempotency(session, auth, idempotency_key)
         cached = idempotency.load_cached(
             session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
@@ -1656,6 +1661,7 @@ def remove_block(
     request_hash = idempotency.request_hash(payload, f"remove:{plan_id}:{block_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         idempotency.lock_idempotency(session, auth, idempotency_key)
         cached = idempotency.load_cached(
             session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan

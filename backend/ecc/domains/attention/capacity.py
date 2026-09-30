@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.observability import queue_lifecycle_event
-from ecc.platform import audit_outbox, idempotency
+from ecc.platform import audit_outbox, authz, idempotency
 
 router = APIRouter(prefix="/api/v1/planning", tags=["planning"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -155,6 +155,7 @@ def put_capacity_profile(
     request_hash = idempotency.request_hash(payload, "put_capacity")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="read")
         idempotency.lock_idempotency(session, auth, idempotency_key)
         cached = idempotency.load_cached(
             session,
