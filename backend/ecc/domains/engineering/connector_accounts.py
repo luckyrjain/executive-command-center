@@ -1512,6 +1512,7 @@ def _run_connector_sync(
     now: datetime,
     idempotency: _IdempotencyArgs | None = None,
     source: str = "user",
+    authorize_route: ConnectorAccessDeniedRoute | None = None,
 ) -> SyncRunResponse:
     """The reserve/call/record core of `POST .../sync`, extracted so
     `_run_auto_backfill` (below) can run it without an HTTP request at
@@ -1556,11 +1557,13 @@ def _run_connector_sync(
     (`uq_sync_runs_running_per_account`, migration `0046`) -- see the
     module docstring's "closing a pooled connection between phases"
     section for why this, not a held lock, is what serializes concurrent
-    syncs here. Authz (the HTTP path's own 404/403 pre-checks) is
-    deliberately not this function's concern at all -- see
-    `sync_connector_endpoint`'s own body for where that lives; `_run_auto_
-    backfill`'s call has no separate actor to authorize against, only the
-    same one who just created the connector account this call is for.
+    syncs here. Authz: `sync_connector_endpoint` runs fast-fail 404/403
+    pre-checks itself, and passes `authorize_route` so the authoritative
+    check (`_locked_connector_denial`) is re-run here in phase 1 on the
+    locked account row, before anything is written or the adapter is
+    called. `_run_auto_backfill`'s call passes none: it has no separate
+    actor to authorize against, only the same one who just created the
+    connector account this call is for.
     """
     # --- Phase 1: validate, reserve the run, read the cursor -------------
     with session.begin():
@@ -1614,9 +1617,19 @@ def _run_connector_sync(
         # lost-cursor-update race a plain unlocked read would otherwise
         # allow between the `cursor_row` read below and the cursor UPSERT
         # in phase 3.
+        #
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by `sync_connector_endpoint`'s pre-checks, which ran in an earlier,
+        # rolled-back transaction against the pre-transfer row.
         account = get_connector_account(session, auth.workspace_id, account_id, for_update=True)
         if account is None:
             raise SyncSkipped("CONNECTOR_NOT_FOUND", 404)
+        if authorize_route is not None:
+            denial = _locked_connector_denial(session, auth, account, authorize_route)
+            if denial is not None:
+                raise SyncSkipped(denial[1], denial[0])
         if account.status == "disconnected":
             raise SyncSkipped("CONNECTOR_DISCONNECTED", 409)
         # The personal connector's owner too (still under the shared lock
@@ -2209,13 +2222,57 @@ def _deny_non_owner_personal_connector(
         .mappings()
         .one_or_none()
     )
-    if row is None or row["provider"] not in PERSONAL_PROVIDERS:
-        return
-    if row["owner_id"] == auth.user_id:
+    if row is None or not _is_non_owner_personal_connector(auth, row["provider"], row["owner_id"]):
         return
     session.rollback()
     record_connector_access_denied(row["provider"], route)
     raise HTTPException(status_code=404, detail="CONNECTOR_NOT_FOUND")
+
+
+def _is_non_owner_personal_connector(
+    auth: AuthContext, provider: str, owner_id: UUID | None
+) -> bool:
+    """`_deny_non_owner_personal_connector`'s predicate, shared with
+    `_locked_connector_denial`'s re-check on the locked row. Only
+    meaningful with `ECC_PERSONAL_DATA_ISOLATION` on (callers check)."""
+    return provider in PERSONAL_PROVIDERS and owner_id != auth.user_id
+
+
+def _locked_connector_denial(
+    session: Session,
+    auth: AuthContext,
+    account: ConnectorAccount,
+    route: ConnectorAccessDeniedRoute,
+) -> tuple[int, str] | None:
+    """The authoritative authorization of a connector mutation, run on the
+    row the caller's write transaction has already locked `FOR UPDATE`:
+    the personal-connector owner layer
+    (`_deny_non_owner_personal_connector`'s rule, same metric), then authz
+    read (404) and write (403). Returns `(status_code, code)` for a denial,
+    `None` when allowed -- the caller raises in its own error type.
+
+    Why again after the lock: ownership transfers (`authz_grants`) lock
+    this row, rewrite `owner_id` and do not bump `version`, and grants or
+    visibility can change too. A check that ran before the lock -- in the
+    endpoints' separate, rolled-back pre-check transaction, or in this one
+    before a lock wait -- saw the pre-change row; under READ COMMITTED
+    every statement issued after the lock is granted reads the committed
+    post-change row, so this one decides.
+    """
+    if personal_data_isolation_enabled() and _is_non_owner_personal_connector(
+        auth, account.provider, account.owner_id
+    ):
+        record_connector_access_denied(account.provider, route)
+        return 404, "CONNECTOR_NOT_FOUND"
+    if not authz.authorize(
+        session, auth, resource_type="connector_accounts", resource_id=account.id, action="read"
+    ):
+        return 404, "CONNECTOR_NOT_FOUND"
+    if not authz.authorize(
+        session, auth, resource_type="connector_accounts", resource_id=account.id, action="write"
+    ):
+        return 403, "INSUFFICIENT_ROLE"
+    return None
 
 
 @router.post(
@@ -2255,6 +2312,13 @@ def sync_connector_endpoint(
     # transaction, which must be rolled back before `_run_connector_sync`'s
     # own `with session.begin():`, or SQLAlchemy raises
     # `InvalidRequestError: A transaction is already begun on this Session`.
+    #
+    # These are fast-fail pre-checks only, kept so an unauthorized caller
+    # is refused before phase 1 takes the membership/idempotency/row locks
+    # and before an `Idempotency-Key` replay can return a cached response.
+    # They are not authoritative: anything may change between this rolled-
+    # back transaction and phase 1's, so `authorize_route` has phase 1
+    # re-run them on the locked row.
     session.rollback()
 
     req_hash = request_hash(payload, f"sync:{account_id}")
@@ -2270,6 +2334,7 @@ def sync_connector_endpoint(
             request=request,
             now=now,
             idempotency=_IdempotencyArgs(key=idempotency_key, req_hash=req_hash),
+            authorize_route="sync",
         )
     except SyncSkipped as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
@@ -2354,21 +2419,10 @@ def disable_connector_endpoint(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> ConnectorAccountResponse:
-    _deny_non_owner_personal_connector(session, auth, account_id, "disable")
-    if not authz.authorize(
-        session, auth, resource_type="connector_accounts", resource_id=account_id, action="read"
-    ):
-        session.rollback()
-        raise HTTPException(status_code=404, detail="CONNECTOR_NOT_FOUND")
-    if not authz.authorize(
-        session, auth, resource_type="connector_accounts", resource_id=account_id, action="write"
-    ):
-        session.rollback()
-        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-    # See sync_connector_endpoint's identical comment -- these pre-checks
-    # must be rolled back before phase 1's own `with session.begin():`.
-    session.rollback()
-
+    # No pre-transaction authz here (unlike `sync_connector_endpoint`, whose
+    # pre-checks also gate an `Idempotency-Key` replay that is served before
+    # its row lock): the personal-owner layer and authz run below, on the
+    # locked row, ahead of the idempotency cache and every write.
     req_hash = request_hash(_EmptyBody(), f"disable:{account_id}")
     now = datetime.now(UTC)
     # Round 23 review: `adapter.disconnect(...)` used to be called from
@@ -2409,9 +2463,17 @@ def disable_connector_endpoint(
         #
         # `for_update=True`: see sync_connector_endpoint's identical comment
         # -- serializes a concurrent disable/sync against the same account.
+        #
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
         account = get_connector_account(session, auth.workspace_id, account_id, for_update=True)
         if account is None:
             raise HTTPException(status_code=404, detail="CONNECTOR_NOT_FOUND")
+        denial = _locked_connector_denial(session, auth, account, "disable")
+        if denial is not None:
+            raise HTTPException(status_code=denial[0], detail=denial[1])
 
         cached = load_cached(
             session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
@@ -3218,8 +3280,8 @@ def _assign_team[ResponseT: _TeamAssignedResponse](
 ) -> ResponseT:
     """The guard+write+audit path behind both `assign_repository_team_
     endpoint` and `assign_work_item_team_endpoint` -- byte-for-byte
-    identical control flow between the two (two-phase pre-transaction
-    authz, idempotency lock/cache/store, `_validate_team_entity`,
+    identical control flow between the two (row lock then authz on the
+    locked row, idempotency lock/cache/store, `_validate_team_entity`,
     `expected_version`-vs-`team_assignment_version` optimistic-concurrency
     check, audit/outbox write) discovered as real duplication, not just
     superficially similar code, before extraction. `table`/`returning_
@@ -3234,32 +3296,19 @@ def _assign_team[ResponseT: _TeamAssignedResponse](
     so an in-flight idempotency-key replay computes the identical hash
     this refactor's callers used to compute inline.
     """
-    if not authz.authorize(
-        session, auth, resource_type=table, resource_id=entity_id, action="read"
-    ):
-        session.rollback()
-        raise HTTPException(status_code=404, detail=not_found_detail)
-    if not authz.authorize(
-        session, auth, resource_type=table, resource_id=entity_id, action="write"
-    ):
-        session.rollback()
-        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-    # See sync_connector_endpoint's identical comment -- these pre-checks
-    # must be rolled back before this endpoint's own `with session.begin():`.
-    session.rollback()
-
     req_hash = request_hash(payload, f"{idempotency_action}:{entity_id}")
     now = datetime.now(UTC)
     with session.begin():
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
-        )
-        if cached is not None:
-            return cast(ResponseT, response_model.model_validate(cached))
 
-        _validate_team_entity(session, auth, payload.team_entity_id)
-
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row. (These checks used
+        # to run in a separate, rolled-back transaction before this one, so
+        # any ownership/visibility change in between was missed too.) Still
+        # ahead of the idempotency cache and the team-entity check, as
+        # before: an unauthorized caller learns nothing from either.
         current = session.execute(
             text(
                 f"SELECT team_assignment_version FROM {table} "
@@ -3269,6 +3318,23 @@ def _assign_team[ResponseT: _TeamAssignedResponse](
         ).one_or_none()
         if current is None:
             raise HTTPException(status_code=404, detail=not_found_detail)
+        if not authz.authorize(
+            session, auth, resource_type=table, resource_id=entity_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail=not_found_detail)
+        if not authz.authorize(
+            session, auth, resource_type=table, resource_id=entity_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
+        )
+        if cached is not None:
+            return cast(ResponseT, response_model.model_validate(cached))
+
+        _validate_team_entity(session, auth, payload.team_entity_id)
+
         if current[0] != payload.expected_version:
             raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
 
