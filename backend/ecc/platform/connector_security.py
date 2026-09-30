@@ -725,10 +725,11 @@ def personal_data_share_guard(
 # documented exception: sync phase 1 holds this workspace-wide shared lock
 # across `ensure_fresh_credential` (an OAuth token-endpoint POST when the
 # access token has expired, up to 10s). A concurrent removal / role change
-# waits on it and can fail with a 500 once the wait exceeds
-# `ecc.database.STATEMENT_TIMEOUT_MS` (5s; retryable), and other
-# shared-lock writers queue behind that waiting exclusive request in the
-# meantime. Moving the refresh out of the locked section is Spec B work.
+# waits on it and gives up with a retryable 409 `MEMBERSHIP_CHANGE_BUSY`
+# once the wait exceeds its `lock_timeout` (`membership_removal.
+# MEMBERSHIP_CHANGE_LOCK_TIMEOUT_MS`, 3s), and other shared-lock writers
+# queue behind that waiting exclusive request in the meantime. Moving the
+# refresh out of the locked section is Spec B work.
 #
 # Lock ordering (normative; no path may take these in another order, or
 # removal and a writer can deadlock):
@@ -758,8 +759,9 @@ def personal_data_share_guard(
 # before this lock, which it takes per write transaction so a removal never
 # waits on a model call. A cycle through it needs a same-user, same-key
 # request on the transaction-scoped idempotency lock plus a pending removal,
-# and Postgres cannot detect it across the two connections; the main
-# engine's statement timeout breaks it (a retryable 500, not a hang).
+# and Postgres cannot detect it across the two connections; the removal's
+# `lock_timeout` breaks it (a retryable 409 for the removal, not a hang),
+# with the main engine's statement timeout as the backstop.
 #
 # FX5 (consent race): every Gmail write transaction above additionally
 # re-checks the mailbox owner's `email` consent under row locks, as its
