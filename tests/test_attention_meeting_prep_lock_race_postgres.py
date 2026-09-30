@@ -209,20 +209,23 @@ def _client(token: str) -> TestClient:
     return client
 
 
-def _set_enrichment(monkeypatch: pytest.MonkeyPatch, *, enabled: bool) -> None:
+def _set_enrichment(monkeypatch: pytest.MonkeyPatch, *, enabled: bool) -> list[UUID]:
     """Pins the enrichment flag (a developer `.env` must not flip which path
-    runs); when on, stubs the model call so nothing reaches Ollama."""
+    runs); when on, stubs the model call so nothing reaches Ollama. Returns
+    the meeting ids the stub was called for, so a test can tell whether a
+    request got past the enrichment path's first transaction."""
     monkeypatch.setenv(_ENRICHMENT_ENV, "true" if enabled else "false")
     get_settings.cache_clear()
+    calls: list[UUID] = []
     if enabled:
+
+        def enrich(_session: Any, _auth: Any, meeting_id: UUID, **_kwargs: Any) -> EnrichmentOut:
+            calls.append(meeting_id)
+            return EnrichmentOut(available=False, summary=None, error_code="model_unavailable")
+
         monkeypatch.setattr(meeting_prep_module, "_resolve_ollama_adapter", lambda _request: None)
-        monkeypatch.setattr(
-            meeting_prep_module,
-            "_compute_enrichment",
-            lambda *_a, **_k: EnrichmentOut(
-                available=False, summary=None, error_code="model_unavailable"
-            ),
-        )
+        monkeypatch.setattr(meeting_prep_module, "_compute_enrichment", enrich)
+    return calls
 
 
 @pytest.fixture(autouse=True)
@@ -262,6 +265,8 @@ def _wait_for_lock_waiter(holder_pid: int, pattern: str) -> None:
         time.sleep(0.05)
 
 
+_LOCK_FOR_UPDATE = "SELECT id FROM meetings WHERE id = :id FOR UPDATE"
+_LOCK_FOR_SHARE = "SELECT id FROM meetings WHERE id = :id FOR SHARE"
 _PREP_WAIT = r"FROM meetings\s.*FOR SHARE"
 _UPDATE_WAIT = r"FROM meetings\s.*FOR UPDATE"
 
@@ -273,8 +278,10 @@ def _race(
     body: dict[str, Any] | None,
     *,
     holder_lock: str,
+    lock_id: UUID,
     holder_writes: Callable[[Connection], None] | None,
     wait_pattern: str,
+    after_wait: Callable[[Connection], None] | None = None,
 ) -> Any:
     """Holds a meetings row lock in a separate transaction (optionally
     changing who may write the meeting there), fires the request, waits until
@@ -294,11 +301,13 @@ def _race(
         thread = threading.Thread(target=fire)
         try:
             holder_pid = int(holder.execute(text("SELECT pg_backend_pid()")).scalar_one())
-            holder.execute(text(holder_lock))
+            holder.execute(text(holder_lock), {"id": lock_id})
             if holder_writes is not None:
                 holder_writes(holder)
             thread.start()
             _wait_for_lock_waiter(holder_pid, wait_pattern)
+            if after_wait is not None:
+                after_wait(holder)
             holder_tx.commit()
         finally:
             if holder_tx.is_active:
@@ -455,7 +464,7 @@ def test_prep_write_waiting_on_meeting_lock_rechecks_authorization(
     _set_enrichment(monkeypatch, enabled=False)
     if case.needs_pack:
         _seed_pack(w)
-    _set_enrichment(monkeypatch, enabled=enrichment)
+    enrichment_calls = _set_enrichment(monkeypatch, enabled=enrichment)
     before = _writes(w.ws)
 
     response = _race(
@@ -463,7 +472,8 @@ def test_prep_write_waiting_on_meeting_lock_rechecks_authorization(
         "POST",
         _path(w, case),
         _body(w, case),
-        holder_lock=f"SELECT id FROM meetings WHERE id = '{w.meeting_id}' FOR UPDATE",
+        holder_lock=_LOCK_FOR_UPDATE,
+        lock_id=w.meeting_id,
         holder_writes=make_writes(w),
         wait_pattern=_PREP_WAIT,
     )
@@ -472,17 +482,28 @@ def test_prep_write_waiting_on_meeting_lock_rechecks_authorization(
     assert response.json()["error"]["code"] == code
     assert _meeting_row(w.meeting_id)["owner_id"] == w.c
     assert _writes(w.ws) == before
+    # The enrichment path must reject in its first transaction, under the
+    # lock -- not run the model call and get caught only by the final recheck.
+    assert enrichment_calls == []
 
 
-@pytest.mark.parametrize("name", list(CASES))
+_PREP_CONTROLS = [
+    pytest.param(name, enrichment, id=f"{name}-enrichment_{enrichment}")
+    for name in CASES
+    for enrichment in ((False, True) if name != "add_participant" else (False,))
+]
+
+
+@pytest.mark.parametrize(("name", "enrichment"), _PREP_CONTROLS)
 def test_prep_write_waiting_on_meeting_lock_without_transfer_still_writes(
-    race_world: RaceWorld, monkeypatch: pytest.MonkeyPatch, name: str
+    race_world: RaceWorld, monkeypatch: pytest.MonkeyPatch, name: str, enrichment: bool
 ) -> None:
     """Control: the same lock wait with no ownership change succeeds and
     writes -- the 404/403 above come from the transfer, not the wait."""
     w, case = race_world, CASES[name]
     _set_enrichment(monkeypatch, enabled=False)
     old_pack = _seed_pack(w) if case.needs_pack else None
+    enrichment_calls = _set_enrichment(monkeypatch, enabled=enrichment)
     before = _writes(w.ws)
 
     response = _race(
@@ -490,7 +511,8 @@ def test_prep_write_waiting_on_meeting_lock_without_transfer_still_writes(
         "POST",
         _path(w, case),
         _body(w, case),
-        holder_lock=f"SELECT id FROM meetings WHERE id = '{w.meeting_id}' FOR UPDATE",
+        holder_lock=_LOCK_FOR_UPDATE,
+        lock_id=w.meeting_id,
         holder_writes=None,
         wait_pattern=_PREP_WAIT,
     )
@@ -506,16 +528,19 @@ def test_prep_write_waiting_on_meeting_lock_without_transfer_still_writes(
             expected.add((str(old_pack), "refreshed"))
         assert set(after["packs"]) == expected
     assert after["audit_events"] > before["audit_events"]
+    assert enrichment_calls == ([w.meeting_id] if enrichment else [])
 
 
+@pytest.mark.parametrize("transfer", list(_TRANSFERS))
 @pytest.mark.parametrize("name", ["create_prep", "refresh_prep"])
 def test_enrichment_path_rechecks_authorization_before_writing_pack(
-    race_world: RaceWorld, name: str, monkeypatch: pytest.MonkeyPatch
+    race_world: RaceWorld, name: str, transfer: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """With enrichment on, authorization and the pack write sit in separate
     transactions with the model call between them. A transfer committed
     during that call must stop the write."""
     w, case = race_world, CASES[name]
+    make_writes, status, code = _TRANSFERS[transfer]
     _set_enrichment(monkeypatch, enabled=False)
     if case.needs_pack:
         _seed_pack(w)
@@ -523,7 +548,7 @@ def test_enrichment_path_rechecks_authorization_before_writing_pack(
 
     def transfer_during_enrichment(*_args: Any, **_kwargs: Any) -> EnrichmentOut:
         with engine.begin() as connection:
-            _transfer_private(w)(connection)
+            make_writes(w)(connection)
         return EnrichmentOut(available=False, summary=None, error_code="model_unavailable")
 
     _set_enrichment(monkeypatch, enabled=True)
@@ -534,8 +559,8 @@ def test_enrichment_path_rechecks_authorization_before_writing_pack(
     finally:
         client.close()
 
-    assert response.status_code == 404, response.text
-    assert response.json()["error"]["code"] == "MEETING_NOT_FOUND"
+    assert response.status_code == status, response.text
+    assert response.json()["error"]["code"] == code
     assert _meeting_row(w.meeting_id)["owner_id"] == w.c
     assert _writes(w.ws) == before
 
@@ -548,7 +573,20 @@ def test_enrichment_path_rechecks_authorization_before_writing_pack(
 _EDITS: dict[str, tuple[str, str, dict[str, Any]]] = {
     "patch": ("PATCH", "/api/v1/meetings/{m}", {"expected_version": 1, "title": "Race edit"}),
     "archive": ("POST", "/api/v1/meetings/{m}/archive", {"expected_version": 1}),
+    "restore": ("POST", "/api/v1/meetings/{m}/restore", {"expected_version": 1}),
 }
+
+
+def _prepare_edit(w: RaceWorld, name: str) -> None:
+    if name == "restore":  # restore needs an archived meeting (version stays 1)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE meetings SET archived_at = now(), pre_archive_status = status "
+                    "WHERE id = :id"
+                ),
+                {"id": w.meeting_id},
+            )
 
 
 @pytest.mark.parametrize("name", list(_EDITS))
@@ -559,6 +597,7 @@ def test_meeting_edit_waiting_on_meeting_lock_rechecks_authorization(
     w = race_world
     method, path, body = _EDITS[name]
     make_writes, status, code = _TRANSFERS[transfer]
+    _prepare_edit(w, name)
     before = _meeting_row(w.meeting_id)
 
     response = _race(
@@ -566,7 +605,8 @@ def test_meeting_edit_waiting_on_meeting_lock_rechecks_authorization(
         method,
         path.format(m=w.meeting_id),
         body,
-        holder_lock=f"SELECT id FROM meetings WHERE id = '{w.meeting_id}' FOR UPDATE",
+        holder_lock=_LOCK_FOR_UPDATE,
+        lock_id=w.meeting_id,
         holder_writes=make_writes(w),
         wait_pattern=_UPDATE_WAIT,
     )
@@ -588,6 +628,7 @@ def test_meeting_edit_waiting_on_meeting_lock_without_transfer_still_writes(
 ) -> None:
     w = race_world
     method, path, body = _EDITS[name]
+    _prepare_edit(w, name)
     before = _meeting_row(w.meeting_id)
 
     response = _race(
@@ -595,7 +636,8 @@ def test_meeting_edit_waiting_on_meeting_lock_without_transfer_still_writes(
         method,
         path.format(m=w.meeting_id),
         body,
-        holder_lock=f"SELECT id FROM meetings WHERE id = '{w.meeting_id}' FOR UPDATE",
+        holder_lock=_LOCK_FOR_UPDATE,
+        lock_id=w.meeting_id,
         holder_writes=None,
         wait_pattern=_UPDATE_WAIT,
     )
@@ -609,11 +651,9 @@ def test_meeting_edit_waiting_on_meeting_lock_without_transfer_still_writes(
 # ---------------------------------------------------------------------------
 
 
-def test_grantor_revoke_waits_for_in_flight_meeting_write(race_world: RaceWorld) -> None:
-    """A grantor revoking their own grant must wait for a writer that holds
-    the meeting lock (as `_lock_meeting_for_write` does), so the revoke
-    cannot return while a write it should be ordered after is still open."""
-    w = race_world
+def _seed_write_grant(w: RaceWorld) -> UUID:
+    """Meeting owned by A, shared explicitly with B through a read+write
+    grant A created."""
     grant_id = uuid4()
     with engine.begin() as connection:
         connection.execute(
@@ -637,16 +677,62 @@ def test_grantor_revoke_waits_for_in_flight_meeting_write(race_world: RaceWorld)
                 "a": w.a,
             },
         )
+    return grant_id
+
+
+def test_grantor_revoke_waits_for_in_flight_meeting_write(race_world: RaceWorld) -> None:
+    """A grantor revoking their own grant must wait for a writer that holds
+    the meeting lock (as `_lock_meeting_for_write` does), so the revoke
+    cannot return while a write it should be ordered after is still open."""
+    w = race_world
+    grant_id = _seed_write_grant(w)
 
     response = _race(
         w.a_token,
         "DELETE",
         f"/api/v1/sharing/grants/{grant_id}",
         None,
-        holder_lock=f"SELECT id FROM meetings WHERE id = '{w.meeting_id}' FOR SHARE",
+        holder_lock=_LOCK_FOR_SHARE,
+        lock_id=w.meeting_id,
         holder_writes=None,
         wait_pattern=_UPDATE_WAIT,
     )
 
     assert response.status_code == 200, response.text
     assert response.json()["revoked_at"] is not None
+
+
+def test_revoke_locks_resource_before_grant_so_removal_cannot_deadlock(
+    race_world: RaceWorld,
+) -> None:
+    """Member removal locks the removed member's rows, then revokes their
+    evidence grants. A revoke that locked the grant row first and then waited
+    on the resource deadlocked against that. The holder here plays removal:
+    it locks the resource, lets the revoke queue behind it, then updates the
+    grant. With resource-then-grant ordering the revoke holds no grant lock
+    while it waits, so the holder's update goes through and the revoke then
+    sees the grant already revoked."""
+    w = race_world
+    grant_id = _seed_write_grant(w)
+
+    def revoke_grant_as_removal(conn: Connection) -> None:
+        conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+        conn.execute(
+            text("UPDATE resource_grants SET revoked_at = now() WHERE id = :id"),
+            {"id": grant_id},
+        )
+
+    response = _race(
+        w.a_token,
+        "DELETE",
+        f"/api/v1/sharing/grants/{grant_id}",
+        None,
+        holder_lock=_LOCK_FOR_UPDATE,
+        lock_id=w.meeting_id,
+        holder_writes=None,
+        wait_pattern=_UPDATE_WAIT,
+        after_wait=revoke_grant_as_removal,
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "GRANT_ALREADY_REVOKED"

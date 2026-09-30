@@ -28,7 +28,7 @@ grant can always undo it, even if their role changes afterward.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -125,6 +125,11 @@ def _load_resource_for_update(
     against the *locked* row -- what every call site below now does --
     closes that: the authorization decision and the mutation always see
     the same, serialized value.
+
+    `revoke_grant_endpoint` also takes it on a grantor's own revoke, where
+    it neither authorizes against nor mutates the row: there it only makes
+    the revoke wait for writers that lock the resource row before
+    authorizing (see that endpoint's inline comment).
     """
     require_known_resource_type(resource_type)
     row = (
@@ -433,6 +438,23 @@ def list_grants_endpoint(auth: AuthDep, session: SessionDep) -> GrantListRespons
     )
 
 
+def _grant_row(session: Session, grant_id: UUID, *, for_update: bool) -> dict[str, Any] | None:
+    suffix = " FOR UPDATE" if for_update else ""
+    row = (
+        session.execute(
+            text(
+                "SELECT id, workspace_id, grantee_account_id, resource_type, resource_id, "
+                "actions, granted_by, expires_at, revoked_at, created_at "
+                f"FROM resource_grants WHERE id = :id{suffix}"
+            ),
+            {"id": grant_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    return dict(row) if row is not None else None
+
+
 @router.delete("/grants/{grant_id}", response_model=GrantResponse)
 def revoke_grant_endpoint(
     grant_id: UUID,
@@ -441,27 +463,18 @@ def revoke_grant_endpoint(
     _csrf: CsrfDep,
 ) -> GrantResponse:
     with session.begin():
-        grant = (
-            session.execute(
-                text(
-                    "SELECT id, workspace_id, grantee_account_id, resource_type, resource_id, "
-                    "actions, granted_by, expires_at, revoked_at, created_at "
-                    "FROM resource_grants WHERE id = :id FOR UPDATE"
-                ),
-                {"id": grant_id},
-            )
-            .mappings()
-            .one_or_none()
-        )
+        # Lock order is resource row, then grant row -- the same order as
+        # `create_grant_endpoint` (resource, then grant insert) and member
+        # removal (`cancel_delegations_for_removed_member` updates evidence
+        # grants after locking the removed member's rows). Locking the grant
+        # first would deadlock against removal. The first, unlocked read only
+        # finds which resource to lock (a grant's resource_type/resource_id
+        # never change); everything below is decided on the locked rows.
+        grant = _grant_row(session, grant_id, for_update=False)
         if grant is None or grant["workspace_id"] != auth.workspace_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="GRANT_NOT_FOUND")
-        if grant["revoked_at"] is not None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail="GRANT_ALREADY_REVOKED"
-            )
 
-        # Locked, consistent with `create_grant_endpoint`'s own fix -- the
-        # grant row itself is already locked above, so this additionally
+        # Locked, consistent with `create_grant_endpoint`'s own fix: this
         # serializes against a concurrent ownership transfer of the
         # underlying resource while this revoke is in flight. Taken on every
         # revoke, including the grantor's own: writers that lock the resource
@@ -471,6 +484,14 @@ def revoke_grant_endpoint(
         resource = _load_resource_for_update(
             session, resource_type=grant["resource_type"], resource_id=grant["resource_id"]
         )
+        grant = _grant_row(session, grant_id, for_update=True)
+        if grant is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="GRANT_NOT_FOUND")
+        if grant["revoked_at"] is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="GRANT_ALREADY_REVOKED"
+            )
+
         if grant["granted_by"] != auth.user_id:
             role = current_role(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
             is_resource_owner = resource is not None and resource.owner_id == auth.user_id
