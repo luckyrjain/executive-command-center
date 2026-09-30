@@ -452,12 +452,13 @@ def lock_delegations_for_removed_member(
     session: Session, *, workspace_id: UUID, account_id: UUID
 ) -> None:
     """Locks every `proposed`/`accepted` delegation naming `account_id`, for
-    `remove_member_endpoint` to take before it locks any resource row (run
-    cancellation) and before `cancel_delegations_for_removed_member` updates
-    them. Accept locks the delegation, then its evidence resources, then
-    inserts grants; removal must take the delegation first too, or a removal
-    holding a run that is evidence on a delegation being accepted deadlocks
-    against that accept.
+    `remove_member_endpoint` to take before it locks any resource row (the
+    isolation block's personal rows, then run cancellation -- see the lock
+    order comment at that call site) and before
+    `cancel_delegations_for_removed_member` updates them. Accept locks the
+    delegation, then its evidence resources, then inserts grants; removal
+    must take the delegation first too, or a removal holding a run that is
+    evidence on a delegation being accepted deadlocks against that accept.
     """
     session.execute(
         text(
