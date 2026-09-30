@@ -146,6 +146,8 @@ def test_revoke_index_and_backfill_log_exist_at_head() -> None:
         "previous_owner_id": ("uuid", "YES"),
         "grants_revoked": ("integer", "NO"),
         "at": ("timestamp with time zone", "NO"),
+        # Added by 0084 (backfill snapshot; test_backfill_log_previous_state_...).
+        "previous_state": ("jsonb", "YES"),
     }
     assert columns["grants_revoked"][2] == "0"
     assert columns["at"][2] == "now()"
