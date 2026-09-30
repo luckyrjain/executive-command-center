@@ -976,8 +976,8 @@ def _get_plan_for_update(
     session: Session, auth: AuthContext, plan_id: UUID
 ) -> dict[str, Any] | None:
     # No `user_id =` filter here -- every call site authz.authorize()s the
-    # plan (read+write) immediately before calling this, so ownership is
-    # already established there; this only needs to lock and fetch by id.
+    # plan (read+write) immediately after this lock, against the locked
+    # row; this only needs to lock and fetch by id.
     row = (
         session.execute(
             text(
@@ -1018,6 +1018,13 @@ def accept_plan(
         if cached is not None:
             return cached
 
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        current = _get_plan_for_update(session, auth, plan_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="plans", resource_id=plan_id, action="read"
         ):
@@ -1026,10 +1033,6 @@ def accept_plan(
             session, auth, resource_type="plans", resource_id=plan_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-
-        current = _get_plan_for_update(session, auth, plan_id)
-        if current is None:
-            raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
         if current["version"] != payload.expected_version:
             raise HTTPException(
                 status_code=409,
@@ -1110,6 +1113,13 @@ def supersede_plan(
         if cached is not None:
             return cached
 
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        current = _get_plan_for_update(session, auth, plan_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="plans", resource_id=plan_id, action="read"
         ):
@@ -1118,10 +1128,6 @@ def supersede_plan(
             session, auth, resource_type="plans", resource_id=plan_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-
-        current = _get_plan_for_update(session, auth, plan_id)
-        if current is None:
-            raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
         if current["version"] != payload.expected_version:
             raise HTTPException(
                 status_code=409,
@@ -1263,6 +1269,13 @@ def replan(
         if cached is not None:
             return cached
 
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        old = _get_plan_for_update(session, auth, plan_id)
+        if old is None:
+            raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="plans", resource_id=plan_id, action="read"
         ):
@@ -1271,10 +1284,6 @@ def replan(
             session, auth, resource_type="plans", resource_id=plan_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-
-        old = _get_plan_for_update(session, auth, plan_id)
-        if old is None:
-            raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
         if old["version"] != payload.expected_version:
             raise HTTPException(
                 status_code=409,
@@ -1506,6 +1515,13 @@ def move_block(
         if cached is not None:
             return cached
 
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        current = _get_plan_for_update(session, auth, plan_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="plans", resource_id=plan_id, action="read"
         ):
@@ -1514,10 +1530,6 @@ def move_block(
             session, auth, resource_type="plans", resource_id=plan_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-
-        current = _get_plan_for_update(session, auth, plan_id)
-        if current is None:
-            raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
         if current["version"] != payload.expected_version:
             raise HTTPException(
                 status_code=409,
@@ -1651,6 +1663,13 @@ def remove_block(
         if cached is not None:
             return cached
 
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        current = _get_plan_for_update(session, auth, plan_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="plans", resource_id=plan_id, action="read"
         ):
@@ -1659,10 +1678,6 @@ def remove_block(
             session, auth, resource_type="plans", resource_id=plan_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-
-        current = _get_plan_for_update(session, auth, plan_id)
-        if current is None:
-            raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
         if current["version"] != payload.expected_version:
             raise HTTPException(
                 status_code=409,
