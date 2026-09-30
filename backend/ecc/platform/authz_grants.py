@@ -460,15 +460,18 @@ def revoke_grant_endpoint(
                 status_code=status.HTTP_409_CONFLICT, detail="GRANT_ALREADY_REVOKED"
             )
 
+        # Locked, consistent with `create_grant_endpoint`'s own fix -- the
+        # grant row itself is already locked above, so this additionally
+        # serializes against a concurrent ownership transfer of the
+        # underlying resource while this revoke is in flight. Taken on every
+        # revoke, including the grantor's own: writers that lock the resource
+        # row before authorizing (e.g. meeting_prep's `_lock_meeting_for_write`)
+        # rely on a revoke waiting for them, so a write the grantee was
+        # authorized for cannot commit after the revoke has returned.
+        resource = _load_resource_for_update(
+            session, resource_type=grant["resource_type"], resource_id=grant["resource_id"]
+        )
         if grant["granted_by"] != auth.user_id:
-            # Locked, consistent with `create_grant_endpoint`'s own fix --
-            # the grant row itself is already locked above, so this
-            # additionally serializes against a concurrent ownership
-            # transfer of the underlying resource while this revoke is in
-            # flight.
-            resource = _load_resource_for_update(
-                session, resource_type=grant["resource_type"], resource_id=grant["resource_id"]
-            )
             role = current_role(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
             is_resource_owner = resource is not None and resource.owner_id == auth.user_id
             if role not in {"owner", "admin"} and not is_resource_owner:

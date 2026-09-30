@@ -431,6 +431,13 @@ def update_meeting(
         )
         if cached is not None:
             return cached
+        # Lock before authorizing: an ownership transfer locks this row and
+        # rewrites owner_id without bumping version, so authorizing first let
+        # a transfer that committed while this request waited on the lock go
+        # unnoticed. Missing and invisible rows answer the same 404.
+        current = _get_row(session, auth, meeting_id, for_update=True)
+        if current is None:
+            raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
         # Two-phase read-then-write authz check -- see calendar/events.py's
         # update_calendar_event for the identical existence-leak reasoning.
         if not authz.authorize(
@@ -441,9 +448,6 @@ def update_meeting(
             session, auth, resource_type="meetings", resource_id=meeting_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-        current = _get_row(session, auth, meeting_id, for_update=True)
-        if current is None:
-            raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
         if current["version"] != payload.expected_version:
             raise HTTPException(
                 status_code=409,
@@ -571,6 +575,13 @@ def _lifecycle(
         )
         if cached is not None:
             return cached
+        # Lock before authorizing: an ownership transfer locks this row and
+        # rewrites owner_id without bumping version, so authorizing first let
+        # a transfer that committed while this request waited on the lock go
+        # unnoticed. Missing and invisible rows answer the same 404.
+        current = _get_row(session, auth, meeting_id, for_update=True)
+        if current is None:
+            raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="meetings", resource_id=meeting_id, action="read"
         ):
@@ -579,9 +590,6 @@ def _lifecycle(
             session, auth, resource_type="meetings", resource_id=meeting_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-        current = _get_row(session, auth, meeting_id, for_update=True)
-        if current is None:
-            raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
         if current["version"] != payload.expected_version:
             raise HTTPException(
                 status_code=409,
