@@ -382,6 +382,7 @@ def update_calendar_event(
         # distinguish 404 from 403 for an event id in their former
         # workspace. See decisions_incidents.py's resolve_incident_
         # endpoint for the identical reasoning.
+        #
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not

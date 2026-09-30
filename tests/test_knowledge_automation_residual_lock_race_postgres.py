@@ -1,8 +1,7 @@
-"""Cross-domain sweep of the lock-before-authorize fix (#314/#315/#316):
-calendar events, tasks, commitments, risks, recommendations, notes, the
-knowledge graph (entities, claims, evidence, relationships, resolution
-candidates, merge/reverse/split) and automation (workflow publish/disable,
-approvals, run cancel/pause/resume, policy revoke) all authorized the caller *before* taking
+"""Lock-before-authorize sweep, the sites the per-domain fixes (#317-#324)
+did not cover: resolution candidate confirm/defer, entity merge / reverse /
+split (both the operation row and the entity pair) and workflow run
+cancel/pause/resume all authorized the caller *before* taking
 `SELECT ... FOR UPDATE` on the row the decision is about. An ownership
 transfer (`authz_grants` transfer locks the row, rewrites `owner_id`, and
 does not bump `version`) that committed while the request waited on that
@@ -52,24 +51,15 @@ _WAIT_SECONDS = 15
 # Every table a seed below writes a row the racing caller must not see once
 # it is transferred -- all flipped to `private` after seeding.
 _PRIVATE_TABLES = (
-    "tasks",
-    "commitments",
-    "risks",
-    "notes",
-    "calendar_events",
-    "recommendations",
     "pkos_nodes",
     "pkos_evidence",
     "pkos_edges",
-    "knowledge_claims",
     "entity_aliases",
     "resolution_candidates",
     "entity_operations",
     "workflow_definitions",
     "workflow_versions",
     "workflow_runs",
-    "approval_requests",
-    "automation_policies",
 )
 
 
@@ -211,44 +201,6 @@ def _sql(sql: str, **params: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _task(w: RaceWorld) -> UUID:
-    task_id = uuid4()
-    _sql(
-        "INSERT INTO tasks (id, workspace_id, owner_id, title, created_by, updated_by, "
-        "created_at, updated_at) VALUES (:id, :ws, :b, 'Race task', :b, :b, now(), now())",
-        id=task_id,
-        ws=w.ws,
-        b=w.b,
-    )
-    return task_id
-
-
-def _commitment(w: RaceWorld) -> UUID:
-    commitment_id = uuid4()
-    _sql(
-        "INSERT INTO commitments (id, workspace_id, owner_id, summary, direction, status, "
-        "created_by, updated_by, created_at, updated_at) "
-        "VALUES (:id, :ws, :b, 'Race commitment', 'made_by_me', 'active', :b, :b, now(), now())",
-        id=commitment_id,
-        ws=w.ws,
-        b=w.b,
-    )
-    return commitment_id
-
-
-def _risk(w: RaceWorld) -> UUID:
-    risk_id = uuid4()
-    _sql(
-        "INSERT INTO risks (id, workspace_id, description, probability, impact, owner_id, "
-        "created_by, updated_by, created_at, updated_at) "
-        "VALUES (:id, :ws, 'Race risk', 3, 3, :b, :b, :b, now(), now())",
-        id=risk_id,
-        ws=w.ws,
-        b=w.b,
-    )
-    return risk_id
-
-
 def _node(w: RaceWorld, name: str = "Race Entity") -> UUID:
     node_id = uuid4()
     _sql(
@@ -260,22 +212,6 @@ def _node(w: RaceWorld, name: str = "Race Entity") -> UUID:
         b=w.b,
     )
     return node_id
-
-
-def _evidence(w: RaceWorld, node_id: UUID) -> UUID:
-    evidence_id = uuid4()
-    _sql(
-        "INSERT INTO pkos_evidence (id, workspace_id, node_id, source_type, source_ref, "
-        "sha256, captured_at, owner_id) "
-        "VALUES (:id, :ws, :node, 'seed_fixture', :ref, :digest, now(), :b)",
-        id=evidence_id,
-        ws=w.ws,
-        node=node_id,
-        ref=f"test://lock-race/{evidence_id}",
-        digest=sha256(str(evidence_id).encode()).hexdigest(),
-        b=w.b,
-    )
-    return evidence_id
 
 
 def _candidate(w: RaceWorld, status: str = "open") -> dict[str, UUID]:
@@ -309,28 +245,6 @@ def _merged(w: RaceWorld) -> dict[str, UUID]:
         },
     )
     return {"operation": UUID(operation["id"]), "target": pair["left"], "source": pair["right"]}
-
-
-def _recommendation(
-    w: RaceWorld, *, status: str, target_type: str, target_id: UUID, action: dict[str, Any]
-) -> UUID:
-    recommendation_id = uuid4()
-    _sql(
-        "INSERT INTO recommendations (id, workspace_id, recommendation_type, target_type, "
-        "target_id, proposed_action, rationale, confidence, status, evidence_ids, source, "
-        "created_by, updated_by, created_at, updated_at, version, expected_version, owner_id) "
-        "VALUES (:id, :ws, 'task_priority', :target_type, :target_id, "
-        "CAST(:action AS jsonb), 'Race rationale', 0.9, :status, ARRAY[]::uuid[], 'rule', "
-        ":b, :b, now(), now(), 1, 1, :b)",
-        id=recommendation_id,
-        ws=w.ws,
-        target_type=target_type,
-        target_id=target_id,
-        action=dumps(action),
-        status=status,
-        b=w.b,
-    )
-    return recommendation_id
 
 
 def _workflow_version(w: RaceWorld, status: str, workflow_id: str | None = None) -> UUID:
@@ -373,34 +287,6 @@ def _workflow_version(w: RaceWorld, status: str, workflow_id: str | None = None)
     return version_id
 
 
-_DIGEST = sha256(b"lock-race-action").hexdigest()
-
-
-def _approval(w: RaceWorld) -> UUID:
-    run_id, approval_id = uuid4(), uuid4()
-    _workflow_version(w, "active", "race.workflow")
-    _sql(
-        "INSERT INTO workflow_runs (id, workspace_id, workflow_id, workflow_version, status, "
-        "queued_at, created_by, created_at, updated_at, owner_id) "
-        "VALUES (:id, :ws, 'race.workflow', 1, 'waiting_approval', now(), :b, now(), now(), :b)",
-        id=run_id,
-        ws=w.ws,
-        b=w.b,
-    )
-    _sql(
-        "INSERT INTO approval_requests (id, workspace_id, run_id, step_index, action_digest, "
-        "status, requested_at, expires_at, created_at, updated_at, owner_id) "
-        "VALUES (:id, :ws, :run, 0, :digest, 'pending', now(), now() + interval '1 day', "
-        "now(), now(), :b)",
-        id=approval_id,
-        ws=w.ws,
-        run=run_id,
-        digest=_DIGEST,
-        b=w.b,
-    )
-    return approval_id
-
-
 def _run(w: RaceWorld, status: str) -> UUID:
     run_id = uuid4()
     _workflow_version(w, "active", "race.workflow")
@@ -414,55 +300,6 @@ def _run(w: RaceWorld, status: str) -> UUID:
         b=w.b,
     )
     return run_id
-
-
-def _policy(w: RaceWorld) -> UUID:
-    policy_id = uuid4()
-    _workflow_version(w, "active", "race.workflow")
-    _sql(
-        "INSERT INTO automation_policies (id, workspace_id, workflow_id, value_limit, "
-        "count_limit, approval_mode, expires_at, created_by, updated_by, created_at, "
-        "updated_at, owner_id) VALUES (:id, :ws, 'race.workflow', 0, 0, 'per_run', "
-        "now() + interval '1 day', :b, :b, now(), now(), :b)",
-        id=policy_id,
-        ws=w.ws,
-        b=w.b,
-    )
-    return policy_id
-
-
-def _seed_claim(w: RaceWorld) -> dict[str, UUID]:
-    node_id = _node(w)
-    evidence_id = _evidence(w, node_id)
-    claim_id = uuid4()
-    _sql(
-        "INSERT INTO knowledge_claims (id, workspace_id, subject_id, predicate, value_json, "
-        "source_id, created_at, owner_id) "
-        "VALUES (:id, :ws, :node, 'title', '{\"text\": \"old\"}'::jsonb, :ev, now(), :b)",
-        id=claim_id,
-        ws=w.ws,
-        node=node_id,
-        ev=evidence_id,
-        b=w.b,
-    )
-    return {"id": node_id, "claim": claim_id, "source": evidence_id}
-
-
-def _seed_edge(w: RaceWorld) -> dict[str, UUID]:
-    left, right = _node(w, "Edge Left"), _node(w, "Edge Right")
-    evidence_id = _evidence(w, left)
-    edge_id = uuid4()
-    _sql(
-        "INSERT INTO pkos_edges (id, workspace_id, source_node_id, target_node_id, edge_type, "
-        "evidence_id, owner_id) VALUES (:id, :ws, :l, :r, 'RELATES_TO', :ev, :b)",
-        id=edge_id,
-        ws=w.ws,
-        l=left,
-        r=right,
-        ev=evidence_id,
-        b=w.b,
-    )
-    return {"id": edge_id}
 
 
 def _seed_merge(w: RaceWorld) -> dict[str, UUID]:
@@ -481,56 +318,6 @@ def _seed_merged_by_entity(w: RaceWorld) -> dict[str, UUID]:
     return {"id": merged["source"], "operation": merged["operation"]}
 
 
-def _seed_task_recommendation(w: RaceWorld, *, lock_target: bool) -> dict[str, UUID]:
-    task_id = _task(w)
-    recommendation_id = _recommendation(
-        w,
-        status="pending_confirmation",
-        target_type="task",
-        target_id=task_id,
-        action={"operation": "set_status", "value": "in_progress"},
-    )
-    if lock_target:
-        return {"id": task_id, "recommendation": recommendation_id}
-    return {"id": recommendation_id}
-
-
-def _seed_risk_recommendation(w: RaceWorld) -> dict[str, UUID]:
-    risk_id = _risk(w)
-    recommendation_id = _recommendation(
-        w,
-        status="pending_confirmation",
-        target_type="risk",
-        target_id=risk_id,
-        action={"operation": "set_status", "value": "mitigating"},
-    )
-    return {"id": risk_id, "recommendation": recommendation_id}
-
-
-def _seed_commitment_recommendation(w: RaceWorld) -> dict[str, UUID]:
-    commitment_id = _commitment(w)
-    recommendation_id = _recommendation(
-        w,
-        status="pending_confirmation",
-        target_type="commitment",
-        target_id=commitment_id,
-        action={"operation": "set_status", "value": "fulfilled"},
-    )
-    return {"id": commitment_id, "recommendation": recommendation_id}
-
-
-def _seed_proposed_recommendation(w: RaceWorld) -> dict[str, UUID]:
-    return {
-        "id": _recommendation(
-            w,
-            status="proposed",
-            target_type="task",
-            target_id=_task(w),
-            action={"operation": "set_priority", "value": "critical"},
-        )
-    }
-
-
 def _one(seed: Callable[[RaceWorld], UUID]) -> Callable[[RaceWorld], dict[str, UUID]]:
     return lambda w: {"id": seed(w)}
 
@@ -546,158 +333,10 @@ class Case:
     ok_status: int = 200  # uncontested success, asserted by the control
 
 
-_V1: dict[str, Any] = {"expected_version": 1}
-_CONFIRM: dict[str, Any] = {"expected_version": 1, "target_expected_version": 1}
 _FUTURE = (datetime.now(UTC) + timedelta(days=3)).isoformat()
 
 
 CASES: dict[str, Case] = {
-    # calendar/events.py
-    "calendar_patch": Case(
-        "calendar_events",
-        _one(
-            lambda w: _calendar_event(w),
-        ),
-        "/api/v1/calendar/events/{id}",
-        {"expected_version": 1, "title": "Race probe"},
-        "CALENDAR_EVENT_NOT_FOUND",
-        method="PATCH",
-    ),
-    "calendar_archive": Case(
-        "calendar_events",
-        _one(lambda w: _calendar_event(w)),
-        "/api/v1/calendar/events/{id}/archive",
-        _V1,
-        "CALENDAR_EVENT_NOT_FOUND",
-    ),
-    # planning/tasks.py
-    "task_patch": Case(
-        "tasks",
-        _one(_task),
-        "/api/v1/tasks/{id}",
-        {"expected_version": 1, "title": "Race probe"},
-        "TASK_NOT_FOUND",
-        method="PATCH",
-    ),
-    "task_complete": Case(
-        "tasks", _one(_task), "/api/v1/tasks/{id}/complete", _V1, "TASK_NOT_FOUND"
-    ),
-    "task_set_status_via_recommendation": Case(
-        "tasks",
-        lambda w: _seed_task_recommendation(w, lock_target=True),
-        "/api/v1/recommendations/{recommendation}/confirm",
-        _CONFIRM,
-        "TASK_NOT_FOUND",
-    ),
-    # communication/commitments.py
-    "commitment_patch": Case(
-        "commitments",
-        _one(_commitment),
-        "/api/v1/commitments/{id}",
-        {"expected_version": 1, "summary": "Race probe"},
-        "COMMITMENT_NOT_FOUND",
-        method="PATCH",
-    ),
-    "commitment_fulfil": Case(
-        "commitments",
-        _one(_commitment),
-        "/api/v1/commitments/{id}/fulfil",
-        _V1,
-        "COMMITMENT_NOT_FOUND",
-    ),
-    # governance/risk_mutations.py
-    "risk_patch": Case(
-        "risks",
-        _one(_risk),
-        "/api/v1/risks/{id}",
-        {"expected_version": 1, "description": "Race probe"},
-        "RISK_NOT_FOUND",
-        method="PATCH",
-    ),
-    "risk_archive": Case("risks", _one(_risk), "/api/v1/risks/{id}/archive", _V1, "RISK_NOT_FOUND"),
-    "risk_set_status_via_recommendation": Case(
-        "risks",
-        _seed_risk_recommendation,
-        "/api/v1/recommendations/{recommendation}/confirm",
-        _CONFIRM,
-        "RISK_NOT_FOUND",
-    ),
-    "commitment_lifecycle_via_recommendation": Case(
-        "commitments",
-        _seed_commitment_recommendation,
-        "/api/v1/recommendations/{recommendation}/confirm",
-        _CONFIRM,
-        "COMMITMENT_NOT_FOUND",
-    ),
-    # governance/recommendation_mutations.py
-    "recommendation_publish": Case(
-        "recommendations",
-        _seed_proposed_recommendation,
-        "/api/v1/recommendations/{id}/publish",
-        _V1,
-        "RECOMMENDATION_NOT_FOUND",
-    ),
-    "recommendation_confirm": Case(
-        "recommendations",
-        lambda w: _seed_task_recommendation(w, lock_target=False),
-        "/api/v1/recommendations/{id}/confirm",
-        _CONFIRM,
-        "RECOMMENDATION_NOT_FOUND",
-    ),
-    # knowledge/notes.py
-    "note_patch": Case(
-        "notes",
-        _one(lambda w: _note(w)),
-        "/api/v1/notes/{id}",
-        {"expected_version": 1, "body": "Race probe"},
-        "NOTE_NOT_FOUND",
-        method="PATCH",
-    ),
-    "note_archive": Case(
-        "notes", _one(lambda w: _note(w)), "/api/v1/notes/{id}/archive", _V1, "NOTE_NOT_FOUND"
-    ),
-    # knowledge/entities_mutations.py
-    "entity_patch": Case(
-        "pkos_nodes",
-        _one(_node),
-        "/api/v1/knowledge/entities/{id}",
-        {"expected_version": 1, "canonical_name": "Race probe"},
-        "ENTITY_NOT_FOUND",
-        method="PATCH",
-    ),
-    "entity_archive": Case(
-        "pkos_nodes",
-        _one(_node),
-        "/api/v1/knowledge/entities/{id}/archive",
-        _V1,
-        "ENTITY_NOT_FOUND",
-    ),
-    # knowledge/claims.py -- authorized against, and so locked on, the entity
-    "claim_supersede": Case(
-        "pkos_nodes",
-        _seed_claim,
-        "/api/v1/knowledge/entities/{id}/claims/{claim}/supersede",
-        None,  # built from the seed's evidence id, see _body
-        "ENTITY_NOT_FOUND",
-        ok_status=201,
-    ),
-    # knowledge/evidence.py
-    "evidence_delete": Case(
-        "pkos_evidence",
-        _one(lambda w: _evidence(w, _node(w))),
-        "/api/v1/evidence/{id}/delete",
-        {"reason": "race probe"},
-        "EVIDENCE_NOT_FOUND",
-    ),
-    # knowledge/relationships_mutations.py
-    "relationship_invalidate": Case(
-        "pkos_edges",
-        _seed_edge,
-        "/api/v1/knowledge/relationships/{id}/invalidate",
-        {},
-        "RELATIONSHIP_NOT_FOUND",
-    ),
-    # knowledge/resolution.py
     "candidate_confirm": Case(
         "resolution_candidates",
         _candidate,
@@ -712,7 +351,6 @@ CASES: dict[str, Case] = {
         {"deferred_until": _FUTURE},
         "CANDIDATE_NOT_FOUND",
     ),
-    # knowledge/entity_operations.py
     "merge_target_entity": Case(
         "pkos_nodes",
         _seed_merge,
@@ -753,35 +391,6 @@ CASES: dict[str, Case] = {
         "ENTITY_NOT_FOUND",
         ok_status=201,
     ),
-    # automation/workflows.py, approvals.py, runs.py, policy.py
-    "workflow_publish": Case(
-        "workflow_versions",
-        _one(lambda w: _workflow_version(w, "draft")),
-        "/api/v1/automations/workflows/{id}/publish",
-        None,
-        "WORKFLOW_NOT_FOUND",
-    ),
-    "workflow_disable": Case(
-        "workflow_versions",
-        _one(lambda w: _workflow_version(w, "active")),
-        "/api/v1/automations/workflows/{id}/disable",
-        None,
-        "WORKFLOW_NOT_FOUND",
-    ),
-    "approval_approve": Case(
-        "approval_requests",
-        _one(_approval),
-        "/api/v1/automations/approvals/{id}/approve",
-        {"action_digest": _DIGEST},
-        "APPROVAL_NOT_FOUND",
-    ),
-    "approval_reject": Case(
-        "approval_requests",
-        _one(_approval),
-        "/api/v1/automations/approvals/{id}/reject",
-        {},
-        "APPROVAL_NOT_FOUND",
-    ),
     "run_cancel": Case(
         "workflow_runs",
         _one(lambda w: _run(w, "queued")),
@@ -803,45 +412,10 @@ CASES: dict[str, Case] = {
         None,
         "RUN_NOT_FOUND",
     ),
-    "policy_revoke": Case(
-        "automation_policies",
-        _one(_policy),
-        "/api/v1/automations/policies/{id}/revoke",
-        None,
-        "POLICY_NOT_FOUND",
-    ),
 }
 
 
-def _calendar_event(w: RaceWorld) -> UUID:
-    event_id = uuid4()
-    _sql(
-        "INSERT INTO calendar_events (id, workspace_id, title, starts_at, ends_at, timezone, "
-        "created_by, updated_by, created_at, updated_at, owner_id) "
-        "VALUES (:id, :ws, 'Race event', now() + interval '1 day', "
-        "now() + interval '1 day 1 hour', 'UTC', :b, :b, now(), now(), :b)",
-        id=event_id,
-        ws=w.ws,
-        b=w.b,
-    )
-    return event_id
-
-
-def _note(w: RaceWorld) -> UUID:
-    note_id = uuid4()
-    _sql(
-        "INSERT INTO notes (id, workspace_id, owner_id, body, created_by, updated_by, "
-        "created_at, updated_at) VALUES (:id, :ws, :b, 'Race note', :b, :b, now(), now())",
-        id=note_id,
-        ws=w.ws,
-        b=w.b,
-    )
-    return note_id
-
-
 def _body(name: str, case: Case, ids: dict[str, UUID]) -> dict[str, Any] | None:
-    if name == "claim_supersede":
-        return {"predicate": "title", "value": {"text": "new"}, "source_id": str(ids["source"])}
     if name == "merge_target_entity":
         return {
             "candidate_id": str(ids["candidate"]),

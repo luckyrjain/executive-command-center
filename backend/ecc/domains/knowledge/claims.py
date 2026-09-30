@@ -20,6 +20,9 @@ from ecc.domains.knowledge.entity_lookup import (
 from ecc.domains.knowledge.entity_lookup import (
     entity_version as _entity_version,
 )
+from ecc.domains.knowledge.entity_lookup import (
+    get_entity_row as _get_entity_row,
+)
 from ecc.domains.knowledge.retrieval import queue_retrieval_document
 from ecc.domains.knowledge.timeline import queue_timeline_entry
 from ecc.observability import queue_lifecycle_event
@@ -195,6 +198,16 @@ def create_claim(
         )
         if cached is not None:
             return cached
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        # The lock is on the subject entity (the authorization boundary
+        # checked below), which also holds a transfer of it off until this
+        # transaction commits. Entity before claim is the order
+        # entity_operations.split_operation locks in too.
+        if _get_entity_row(session, auth, entity_id, for_update=True) is None:
+            raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
         # A claim's authorization boundary is its subject entity -- claims
         # have no independent ownership/visibility meaningful apart from
         # the entity they're claims about, so the two-phase check runs
@@ -363,23 +376,15 @@ def supersede_claim(
         )
         if cached is not None:
             return cached
-        # Lock the parent entity (the row authorization is evaluated
-        # against) before authorizing: an ownership transfer of the entity
-        # that commits while this request waits on the row lock must be
-        # seen by the checks below (READ COMMITTED: each later statement
-        # reads the committed row), not by checks that ran against the
-        # pre-transfer row. Entity before claim, the same order split takes.
-        # NO KEY UPDATE: still conflicts with the transfer's FOR UPDATE, but
-        # not with the FOR KEY SHARE every child-row FK insert takes on the
-        # entity (this path never updates pkos_nodes itself).
-        entity = session.execute(
-            text(
-                "SELECT id FROM pkos_nodes "
-                "WHERE workspace_id = :workspace_id AND id = :entity_id FOR NO KEY UPDATE"
-            ),
-            {"workspace_id": auth.workspace_id, "entity_id": entity_id},
-        ).one_or_none()
-        if entity is None:
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        # The lock is on the subject entity (the authorization boundary
+        # checked below), which also holds a transfer of it off until this
+        # transaction commits. Entity before claim is the order
+        # entity_operations.split_operation locks in too.
+        if _get_entity_row(session, auth, entity_id, for_update=True) is None:
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"

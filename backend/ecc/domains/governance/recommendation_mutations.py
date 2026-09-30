@@ -325,11 +325,10 @@ def _transition(
     cached = _start(session, auth, idempotency_key, digest)
     if cached is not None:
         return cached
-    # Lock before authorizing: an ownership transfer that commits while this
-    # request waits on the row lock must be seen by the checks below (READ
-    # COMMITTED: each later statement reads the committed row), not by
-    # checks that ran against the pre-transfer row. `get_row` 404s a missing
-    # row, the same answer an invisible one gets.
+    # Lock before authorizing: an ownership transfer that commits while
+    # this request waits on the row lock must be seen by the checks below
+    # (READ COMMITTED: each later statement reads the committed row), not
+    # by checks that ran against the pre-transfer row.
     locked = get_row(session, auth, recommendation_id, for_update=True)
     if not authz.authorize(
         session, auth, resource_type="recommendations", resource_id=recommendation_id, action="read"
@@ -595,12 +594,13 @@ def confirm_recommendation(
     ):
         raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
     _require_email_consent_for_confirm(session, auth, recommendation_id)
-    # The consent locks must precede the row lock (see
-    # `_require_email_consent_for_confirm`), so the checks above run
-    # unlocked and are repeated here against the locked row: an ownership
-    # transfer that commits while this request waits on the row lock must
-    # be seen (READ COMMITTED: each later statement reads the committed
-    # row), not decided by checks that ran against the pre-transfer row.
+    # Lock before authorizing: an ownership transfer that commits while
+    # this request waits on the row lock must be seen by the checks below
+    # (READ COMMITTED: each later statement reads the committed row), not
+    # by checks that ran against the pre-transfer row.
+    # The pair above stays: the consent check must run before this lock
+    # (see `_require_email_consent_for_confirm`) and must not answer a
+    # caller who cannot see the recommendation; the pair is re-run here.
     locked = get_row(session, auth, recommendation_id, for_update=True)
     if not authz.authorize(
         session, auth, resource_type="recommendations", resource_id=recommendation_id, action="read"

@@ -483,9 +483,9 @@ def _require_meeting_write(session: Session, auth: AuthContext, meeting_id: UUID
 
 
 def get_meeting_row(
-    session: Session, auth: AuthContext, meeting_id: UUID, *, for_update: bool = False
+    session: Session, auth: AuthContext, meeting_id: UUID, *, for_share: bool = False
 ) -> dict[str, Any] | None:
-    suffix = " FOR UPDATE" if for_update else ""
+    suffix = " FOR SHARE" if for_share else ""
     row = (
         session.execute(
             text(
@@ -503,6 +503,34 @@ def get_meeting_row(
         .one_or_none()
     )
     return dict(row) if row is not None else None
+
+
+def _lock_meeting_for_write(
+    session: Session, auth: AuthContext, meeting_id: UUID
+) -> dict[str, Any]:
+    """Lock the meeting row, then authorize the write against it.
+
+    The meeting is the authorization boundary for every participant and
+    pack write here, and `authz_grants`' ownership transfer locks that same
+    row `FOR UPDATE` before rewriting `owner_id`. Authorizing first and
+    reading the row unlocked afterwards let a transfer commit between the
+    check and the write, so the caller wrote into a meeting it could no
+    longer see. Taking the lock first makes a concurrent transfer either
+    commit before this point (and the checks below see the new owner) or
+    wait until this transaction ends.
+
+    `FOR SHARE`, not `FOR UPDATE`: nothing here writes the meeting row
+    itself, and a shared lock still conflicts with the transfer's (and any
+    meeting edit's) `FOR UPDATE` while letting concurrent prep/participant
+    writes on the same meeting proceed side by side. A missing row answers
+    the same 404 an invisible one does.
+    """
+    meeting_row = get_meeting_row(session, auth, meeting_id, for_share=True)
+    if meeting_row is None:
+        raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
+    require_meeting_read(session, auth, meeting_id)
+    _require_meeting_write(session, auth, meeting_id)
+    return meeting_row
 
 
 def _meeting_input(session: Session, auth: AuthContext, row: dict[str, Any]) -> MeetingInput:
@@ -1496,11 +1524,7 @@ def add_participant(
         if cached is not None:
             return ParticipantResponse.model_validate(cached)
 
-        require_meeting_read(session, auth, meeting_id)
-        _require_meeting_write(session, auth, meeting_id)
-        meeting_row = get_meeting_row(session, auth, meeting_id)
-        if meeting_row is None:
-            raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
+        _lock_meeting_for_write(session, auth, meeting_id)
         entity = (
             session.execute(
                 text(
@@ -1751,11 +1775,7 @@ def create_prep(
             if cached is not None:
                 return MeetingPack.model_validate(cached)
 
-            require_meeting_read(session, auth, meeting_id)
-            _require_meeting_write(session, auth, meeting_id)
-            meeting_row = get_meeting_row(session, auth, meeting_id)
-            if meeting_row is None:
-                raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
+            meeting_row = _lock_meeting_for_write(session, auth, meeting_id)
 
             existing = _current_pack_row(session, auth, meeting_id)
             if existing is not None:
@@ -1775,11 +1795,7 @@ def create_prep(
             return MeetingPack.model_validate(cached)
 
         with session.begin():
-            require_meeting_read(session, auth, meeting_id)
-            _require_meeting_write(session, auth, meeting_id)
-            meeting_row = get_meeting_row(session, auth, meeting_id)
-            if meeting_row is None:
-                raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
+            meeting_row = _lock_meeting_for_write(session, auth, meeting_id)
 
             existing = _current_pack_row(session, auth, meeting_id)
             if existing is not None:
@@ -1793,7 +1809,11 @@ def create_prep(
             session, auth, meeting_id, ollama_adapter=_resolve_ollama_adapter(request)
         )
 
+        # Enrichment ran outside any transaction, so the authorization above
+        # is seconds old by now: re-lock the meeting and re-check before the
+        # pack lands.
         with session.begin():
+            _lock_meeting_for_write(session, auth, meeting_id)
             return _insert_pack(generated, enrichment)
 
 
@@ -1995,11 +2015,7 @@ def refresh_prep(
                 if cached is not None:
                     return MeetingPack.model_validate(cached)
 
-                require_meeting_read(session, auth, meeting_id)
-                _require_meeting_write(session, auth, meeting_id)
-                meeting_row = get_meeting_row(session, auth, meeting_id)
-                if meeting_row is None:
-                    raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
+                meeting_row = _lock_meeting_for_write(session, auth, meeting_id)
 
                 old = _current_pack_row(session, auth, meeting_id, for_update=True)
                 if old is None:
@@ -2023,11 +2039,7 @@ def refresh_prep(
             return MeetingPack.model_validate(cached)
 
         with session.begin():
-            require_meeting_read(session, auth, meeting_id)
-            _require_meeting_write(session, auth, meeting_id)
-            meeting_row = get_meeting_row(session, auth, meeting_id)
-            if meeting_row is None:
-                raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
+            meeting_row = _lock_meeting_for_write(session, auth, meeting_id)
 
             old = _current_pack_row(session, auth, meeting_id, for_update=True)
             if old is None:
@@ -2040,7 +2052,9 @@ def refresh_prep(
         )
 
         try:
+            # Same re-lock and re-check as `create_prep`'s enrichment path.
             with session.begin():
+                _lock_meeting_for_write(session, auth, meeting_id)
                 return _retire_and_insert(old["id"], generated, enrichment)
         except IntegrityError as exc:
             if _violated_constraint(exc) != "uq_meeting_packs_active_per_meeting":

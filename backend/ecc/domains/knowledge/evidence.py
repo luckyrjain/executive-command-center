@@ -191,6 +191,7 @@ def delete_evidence(
         )
         if current is None:
             raise HTTPException(status_code=404, detail="EVIDENCE_NOT_FOUND")
+
         if not authz.authorize(
             session, auth, resource_type="pkos_evidence", resource_id=evidence_id, action="read"
         ):

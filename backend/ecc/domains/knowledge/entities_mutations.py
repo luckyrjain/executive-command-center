@@ -73,8 +73,6 @@ def update_entity(
         )
         if cached is not None:
             return cached
-        # Two-phase read-then-write authz check -- see calendar/events.py's
-        # update_calendar_event for the identical existence-leak reasoning.
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
@@ -82,6 +80,8 @@ def update_entity(
         current = _get_row(session, auth, entity_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+        # Two-phase read-then-write authz check -- see calendar/events.py's
+        # update_calendar_event for the identical existence-leak reasoning.
         if not authz.authorize(
             session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
         ):
