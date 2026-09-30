@@ -26,7 +26,16 @@ A second, smaller gap existed. Create endpoints check the caller's role once wit
 - The helper takes `lock_membership_shared(session, auth.workspace_id)`. With `role_action`, it also checks the caller's current role inside the transaction and raises `403 INSUFFICIENT_ROLE`, as `require_role_action` does. Endpoints whose only role gate runs before the transaction (creates, and the bulk `regenerate`) pass `role_action="write"`. `role_action="read"` means "any active member".
 - The call goes before `idempotency.lock_idempotency` and before any row lock. This follows the normative lock order in `connector_security`: membership, then idempotency, then rows.
 - Paths that span several transactions (meeting-prep enrichment under `held_idempotency_lock`) take the lock in each write transaction, never across the model call. That places it after the session-scoped idempotency lock. This one inversion of the lock order is accepted, for the reasons under Risks.
-- The helper is called explicitly at each site, one line per write transaction. Adoption is per module. This change covers `attention/*` (attention items, feedback, regenerate, capacity, plans, planning constraints, risk reviews, waiting links) and `attention/meeting_prep`. The remaining domains adopt it in follow-up changes, and each follow-up needs a race test.
+- The helper is called explicitly at each site, one line per write transaction. Adoption is per module. This change covers `attention/*` (attention items, feedback, regenerate, capacity, plans, planning constraints, risk reviews, waiting links) and `attention/meeting_prep`. The remaining domains adopt it in follow-up changes. Each follow-up needs a race test and a coverage guard, and adds a row under Adoption.
+
+## Adoption
+
+Each row is one adoption change. The race tests share `tests/membership_lock_race_support.py`, and each coverage guard runs its `unlocked_transactions()` scan over the listed modules.
+
+| Modules | Race test | Coverage guard | Notes |
+| --- | --- | --- | --- |
+| `attention/*`, `attention/meeting_prep` | `test_attention_membership_lock_race_postgres.py` | `test_attention_membership_lock_coverage.py` | Enrichment locks per write transaction, never across the model call. |
+| `planning/tasks`, `communication/commitments` | `test_tasks_commitments_membership_lock_race_postgres.py` | `test_tasks_commitments_membership_lock_coverage.py` | Creates pass `role_action="write"`. The shared write helpers (`insert_task`, `lifecycle_write`, ...) run inside their caller's transaction, so the caller locks. |
 
 ## Consequences
 
@@ -42,7 +51,7 @@ A second, smaller gap existed. Create endpoints check the caller's role once wit
 - Removal's wait for the lock is itself a statement, capped at `STATEMENT_TIMEOUT_MS` (5 s). If any write transaction in the workspace holds the shared lock longer than that, the removal or role change fails with a retryable 500. It is not simply delayed. `regenerate_attention` on a very large workspace is the likeliest such transaction. It is accepted for now. The fix, if it ever bites, is a `lock_timeout` on removal plus a retry, or a shorter `regenerate`.
 - Idempotent replays (`load_cached`) run after the lock but before any membership check on endpoints that authorize per row, so a removed member can still read back a response it was already given. Nothing is written, so this is accepted.
 - `get_prep` (a GET) takes the lock too, because it can flip a pack to `stale` in the caller's name. This puts every prep view into the set of transactions a removal waits on and queues it behind a pending removal. That is accepted because the transaction is short. Taking the lock only right before the flip (then re-reading and re-authorizing) is the fallback if it ever matters.
-- Each explicit call site can be forgotten. A new write endpoint that skips the helper reopens the window for that endpoint only. `tests/test_attention_membership_lock_coverage.py` guards the adopted modules: it fails on any `session.begin()` block there that doesn't start with the helper, except an explicit allowlist of read-only transactions. Each module that adopts the helper later should join that scan.
+- Each explicit call site can be forgotten. A new write endpoint that skips the helper reopens the window for that endpoint only. `tests/test_attention_membership_lock_coverage.py` guards the adopted modules: it fails on any `session.begin()` block there that doesn't start with the helper, except an explicit allowlist of read-only transactions. Each later adopter adds a sibling guard over its own modules (see Adoption).
 
 ### Risks
 

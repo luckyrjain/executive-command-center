@@ -782,10 +782,13 @@ def personal_data_share_guard(
 # (`ai_runtime/runtime._persist_terminal`) and recommendation insert
 # (`governance/recommendation_mutations.create_recommendation`, before its
 # idempotency lock); ownership transfer (`platform/authz_grants`); and
-# every authorized write transaction in `attention/*` (including
-# `meeting_prep`), through `authz.lock_membership_for_write`, which can
-# also re-check the caller's role under the lock (ADR-0014; other domains adopt
-# it module by module). Meeting-prep enrichment is the one inversion: its
+# every authorized write transaction in the modules below, through
+# `authz.lock_membership_for_write`, which can also re-check the caller's
+# role under the lock (ADR-0014; adopted module by module, each set guarded
+# by its `tests/test_*_membership_lock_coverage.py`):
+#   - `attention/*`, including `meeting_prep`;
+#   - `planning/tasks`, `communication/commitments`.
+# Meeting-prep enrichment is the one inversion: its
 # session-scoped `held_idempotency_lock` (a different connection) is taken
 # before this lock, which it takes per write transaction so a removal never
 # waits on a model call. A cycle through it needs a same-user, same-key
