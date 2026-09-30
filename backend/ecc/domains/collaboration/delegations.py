@@ -441,6 +441,28 @@ def _expire_due(
         )
 
 
+def lock_delegations_for_removed_member(
+    session: Session, *, workspace_id: UUID, account_id: UUID
+) -> None:
+    """Locks every `proposed`/`accepted` delegation naming `account_id`, for
+    `remove_member_endpoint` to take before it locks any resource row (run
+    cancellation) and before `cancel_delegations_for_removed_member` updates
+    them. Accept locks the delegation, then its evidence resources, then
+    inserts grants; removal must take the delegation first too, or a removal
+    holding a run that is evidence on a delegation being accepted deadlocks
+    against that accept.
+    """
+    session.execute(
+        text(
+            "SELECT id FROM delegations "
+            "WHERE workspace_id = :workspace_id AND status IN ('proposed', 'accepted') "
+            "AND (delegator_account_id = :account_id OR recipient_account_id = :account_id) "
+            "ORDER BY id FOR UPDATE"
+        ),
+        {"workspace_id": workspace_id, "account_id": account_id},
+    )
+
+
 def cancel_delegations_for_removed_member(
     session: Session, *, workspace_id: UUID, account_id: UUID, now: datetime
 ) -> None:
