@@ -300,6 +300,7 @@ def create_task(
     request_id, correlation_id = _request_ids(request)
 
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="write")
         idempotency.lock_idempotency(session, auth, idempotency_key)
         cached = idempotency.load_cached(
             session,
@@ -447,6 +448,7 @@ def update_task(
     now = datetime.now(UTC)
 
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         idempotency.lock_idempotency(session, auth, idempotency_key)
         cached = idempotency.load_cached(
             session,
@@ -831,6 +833,7 @@ def _lifecycle_task(
     request_id, correlation_id = _request_ids(request)
 
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         idempotency.lock_idempotency(session, auth, idempotency_key)
         cached = idempotency.load_cached(
             session,
