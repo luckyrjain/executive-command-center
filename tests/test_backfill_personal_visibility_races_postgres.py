@@ -496,10 +496,22 @@ def test_a_restore_page_that_times_out_on_a_lock_is_retried(
         text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
         {"key": f"attention-regenerate:{world.workspace_id}"},
     )
-    releaser = threading.Timer(0.4, holder.close)  # rolls back: the lock goes
-    releaser.start()
-    code, _rows, err, _ = _run(capsys, run_ids, "--restore", str(run_id))
-    _join(releaser)
+    # Release the lock from the retry's own backoff sleep, i.e. only after
+    # the first attempt has really timed out -- a wall-clock timer could
+    # fire before a slow (loaded) restore ever reaches the lock.
+    real_sleep = time.sleep
+
+    def release_then_sleep(seconds: float) -> None:
+        if not holder.closed:
+            holder.close()  # rolls back: the lock goes
+        real_sleep(seconds)
+
+    monkeypatch.setattr(backfill.time, "sleep", release_then_sleep)
+    try:
+        code, _rows, err, _ = _run(capsys, run_ids, "--restore", str(run_id))
+    finally:
+        if not holder.closed:
+            holder.close()
     assert "restore page rolled back (sqlstate=55P03)" in err
     assert code == backfill.EXIT_CLEAN, err
     assert _owner_vis("tasks", task) == (world.b.user_id, "workspace")
