@@ -14,13 +14,15 @@ the enrichment path re-locks and re-authorizes in its final transaction.
 
 Siblings of the same race, covered here too:
 
-- `scheduling/meetings.py`'s PATCH and archive authorized before taking their
-  own `FOR UPDATE` on the meeting (a transfer does not bump `version`, so
-  `expected_version` could not catch it). They now lock first.
+- `scheduling/meetings.py`'s PATCH, archive and restore authorized before
+  taking their own `FOR UPDATE` on the meeting (a transfer does not bump
+  `version`, so `expected_version` could not catch it). They now lock first.
 - A grantor revoking their own grant never locked the resource row, so it
   did not wait for a writer holding the meeting lock: the revoke returned
   while a write it should have ordered after was still in flight. Every
-  revoke now locks the resource row.
+  revoke now locks the resource row, before the grant row, so it cannot
+  deadlock against member removal (which revokes grants after locking the
+  member's rows).
 
 Concurrency is real (request thread + separate connection); "is waiting" is
 observed in `pg_stat_activity`, scoped to this test's own lock holder, not
