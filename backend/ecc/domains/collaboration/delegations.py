@@ -406,12 +406,19 @@ def _expire_due(
     params: dict[str, Any] = {"workspace_id": workspace_id, "now": now}
     if account_id is not None:
         params["account_id"] = account_id
+    # Rows are locked in `id` order (the sub-select), not whatever order the
+    # UPDATE's plan scans them in: `lock_delegations_for_removed_member`
+    # locks an overlapping set of rows in `id` order, and two bulk lockers
+    # taking the same rows in different orders deadlock.
     expired_rows = (
         session.execute(
             text(
                 "UPDATE delegations SET status = 'expired', updated_at = :now "
+                "WHERE id IN (SELECT id FROM delegations "
                 "WHERE workspace_id = :workspace_id AND status = 'proposed' AND due_at < :now "
-                f"{clause}RETURNING id, delegator_account_id, recipient_account_id"  # noqa: S608 -- clause is a code literal; values bound
+                f"{clause}ORDER BY id FOR UPDATE) "  # noqa: S608 -- clause is a code literal; values bound
+                "AND status = 'proposed' AND due_at < :now "
+                "RETURNING id, delegator_account_id, recipient_account_id"
             ),
             params,
         )
@@ -541,7 +548,15 @@ def _grant_evidence(
     # `timezone` is a placeholder -- `authorize()`'s six-step decision never
     # reads it, so fetching the delegator's real one would be a wasted query.
     delegator_auth = AuthContext(workspace_id=workspace_id, user_id=granted_by, timezone="UTC")
-    for item in _evidence_for(session, delegation_id):
+    # Canonical (type, id) order, not `_evidence_for`'s insertion order:
+    # two delegations naming the same private resources in different orders
+    # would otherwise lock them in different orders when accepted together,
+    # and deadlock.
+    evidence = sorted(
+        _evidence_for(session, delegation_id),
+        key=lambda item: (item.resource_type, item.resource_id),
+    )
+    for item in evidence:
         authz.require_known_resource_type(item.resource_type)  # defense in depth
         if not authz.authorize(
             session,

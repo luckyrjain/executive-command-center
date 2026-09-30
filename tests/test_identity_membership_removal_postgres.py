@@ -521,11 +521,12 @@ def _describe(results: dict[str, Any], name: str) -> str:
 
 def _race_two(
     *,
-    lock_run_id: UUID,
+    lock_run_id: UUID | None = None,
+    lock_delegation_id: UUID | None = None,
     first: tuple[str, Any],
     second: tuple[str, Any],
 ) -> dict[str, Any]:
-    """Holds `lock_run_id` FOR UPDATE, fires `first`, waits until it is
+    """Holds a run (or delegation) row FOR UPDATE, fires `first`, waits until it is
     queued behind the holder, fires `second`, waits until it is queued too,
     then commits. A request that finishes instead of queueing fails the test
     at once with its own response."""
@@ -555,9 +556,16 @@ def _race_two(
     holder_tx = holder.begin()
     try:
         holder_pid = int(holder.execute(text("SELECT pg_backend_pid()")).scalar_one())
-        holder.execute(
-            text("SELECT id FROM workflow_runs WHERE id = :id FOR UPDATE"), {"id": lock_run_id}
-        )
+        if lock_run_id is not None:
+            holder.execute(
+                text("SELECT id FROM workflow_runs WHERE id = :id FOR UPDATE"),
+                {"id": lock_run_id},
+            )
+        else:
+            holder.execute(
+                text("SELECT id FROM delegations WHERE id = :id FOR UPDATE"),
+                {"id": lock_delegation_id},
+            )
         threads[0].start()
         wait_queued(1)
         threads[1].start()
@@ -629,10 +637,19 @@ def _seed_run(ctx: _MembershipContext, *, created_by: UUID, visibility: str, now
 
 
 def _seed_delegation(
-    ctx: _MembershipContext, *, status: str, evidence: list[UUID], now: datetime
+    ctx: _MembershipContext,
+    *,
+    status: str,
+    evidence: list[UUID],
+    now: datetime,
+    recipient: _Actor | None = None,
+    due_at: datetime | None = None,
+    delegation_id: UUID | None = None,
 ) -> UUID:
-    """Owner -> member_b delegation with `evidence` runs, in that order."""
-    delegation_id = uuid4()
+    """Owner -> `recipient` (member_b by default) delegation with `evidence`
+    runs, inserted in that order."""
+    delegation_id = delegation_id or uuid4()
+    recipient = recipient or ctx.member_b
     with engine.begin() as connection:
         connection.execute(
             text(
@@ -646,9 +663,9 @@ def _seed_delegation(
                 "id": delegation_id,
                 "ws": ctx.workspace_id,
                 "owner_account": ctx.owner.account_id,
-                "b_account": ctx.member_b.account_id,
+                "b_account": recipient.account_id,
                 "run": evidence[0],
-                "due": now + timedelta(days=1),
+                "due": due_at or now + timedelta(days=1),
                 "status": status,
                 "now": now,
             },
@@ -913,3 +930,94 @@ def test_list_ownership_transfers_role_scoped(membership_context: _MembershipCon
         "/api/v1/ownership/transfers", headers=_headers(ctx.member_a.token)
     )
     assert transfer_id not in {t["id"] for t in uninvolved_view.json()["transfers"]}
+
+
+def test_remove_member_and_lazy_expiry_do_not_deadlock(
+    membership_context: _MembershipContext,
+) -> None:
+    """Removal locks the member's live delegations in `id` order. Listing
+    delegations lazily expires the caller's overdue proposed ones in one bulk
+    UPDATE; unless that also locks in `id` order it scans in physical order,
+    and two overdue delegations stored in the reverse of their `id` order
+    deadlocked the two.
+
+    The larger-id delegation is stored first. The holder locks it; the
+    listing queues on it first, then the removal (which by then holds the
+    smaller-id one). On release both must finish."""
+    ctx = membership_context
+    now = datetime.now(UTC)
+    _seed_race_workflow(ctx, now)
+    run_id = _seed_run(ctx, created_by=ctx.owner.user_id, visibility="workspace", now=now)
+    low, high = sorted([uuid4(), uuid4()])
+    overdue = now - timedelta(hours=1)
+    for delegation_id in (high, low):  # physical order: high first
+        _seed_delegation(
+            ctx,
+            status="proposed",
+            evidence=[run_id],
+            now=now,
+            due_at=overdue,
+            delegation_id=delegation_id,
+        )
+
+    results = _race_two(
+        lock_delegation_id=high,
+        first=(
+            "listing",
+            lambda: ctx.member_b.client.get(
+                "/api/v1/delegations", headers=_headers(ctx.member_b.token)
+            ),
+        ),
+        second=_remove_member_b(ctx),
+    )
+
+    assert results["listing"].status_code == 200, results["listing"].text
+    assert results["removal"].status_code == 200, results["removal"].text
+    with engine.connect() as connection:
+        statuses = set(
+            connection.execute(
+                text("SELECT status FROM delegations WHERE id = ANY(:ids)"),
+                {"ids": [low, high]},
+            ).scalars()
+        )
+    # Expired by the listing (it got the rows first), never left proposed.
+    assert statuses == {"expired"}
+
+
+def test_concurrent_accepts_of_shared_evidence_do_not_deadlock(
+    membership_context: _MembershipContext,
+) -> None:
+    """Two delegations naming the same two private runs, in opposite
+    orders, accepted at once. Each accept locks its delegation, then its
+    evidence rows to share them; unless both lock the evidence in one
+    canonical order they deadlock.
+
+    The holder locks the smaller-id run; the first accept (evidence listed
+    small-then-large) queues on it; the second (large-then-small) queues
+    behind. On release both must be accepted."""
+    ctx = membership_context
+    now = datetime.now(UTC)
+    _seed_race_workflow(ctx, now)
+    runs = sorted(
+        _seed_run(ctx, created_by=ctx.owner.user_id, visibility="private", now=now)
+        for _ in range(2)
+    )
+    to_a = _seed_delegation(ctx, status="proposed", evidence=runs, now=now, recipient=ctx.member_a)
+    to_b = _seed_delegation(
+        ctx, status="proposed", evidence=list(reversed(runs)), now=now, recipient=ctx.member_b
+    )
+
+    def accept(actor: _Actor, delegation_id: UUID) -> Any:
+        return actor.client.post(
+            f"/api/v1/delegations/{delegation_id}/accept",
+            headers=_headers(actor.token, key=str(uuid4())),
+        )
+
+    results = _race_two(
+        lock_run_id=runs[0],
+        first=("accept_a", lambda: accept(ctx.member_a, to_a)),
+        second=("accept_b", lambda: accept(ctx.member_b, to_b)),
+    )
+
+    assert results["accept_a"].status_code == 200, results["accept_a"].text
+    assert results["accept_b"].status_code == 200, results["accept_b"].text

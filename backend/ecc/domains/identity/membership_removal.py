@@ -687,6 +687,22 @@ def remove_member_endpoint(
                 status_code=status.HTTP_409_CONFLICT, detail="LAST_OWNER_CANNOT_BE_REMOVED"
             )
 
+        # Lock order for everything below, matching every other writer of
+        # these tables: delegations, then resource rows, then grants.
+        # `accept_delegation_endpoint` locks a delegation, then its evidence
+        # resources, then inserts grants; `authz_grants.revoke_grant_endpoint`
+        # and `authz_grants.create_grant_endpoint` lock the resource row, then
+        # the grant. So the member's live delegations are locked first --
+        # before the personal rows the isolation block locks (an accept on a
+        # pod that disagrees about the isolation flag can lock those too) and
+        # before run cancellation (`cancel_run` locks `workflow_runs` rows) --
+        # and the delegations are only updated, and their evidence grants
+        # revoked, after both. Any other order deadlocks against a concurrent
+        # accept or grant revoke touching one of the member's rows.
+        lock_delegations_for_removed_member(
+            session, workspace_id=auth.workspace_id, account_id=member["account_id"]
+        )
+
         # Spec A S1.4 (`ECC_PERSONAL_DATA_ISOLATION`): the member's personal
         # (Gmail-derived) rows and Gmail-only person nodes no longer block
         # removal -- connectors are disconnected, nodes re-owned, the rest
@@ -697,8 +713,9 @@ def remove_member_endpoint(
         if isolation:
             # Mutate FIRST, check SECOND, all in this one transaction (a 409
             # below rolls every disconnect/re-own/audit back). Lock order:
-            # membership advisory lock (above) -> connector rows -> nodes
-            # -> the member's Gmail-derived aliases.
+            # membership advisory lock -> the member's delegations (both
+            # above) -> connector rows -> nodes -> the member's Gmail-derived
+            # aliases.
             pending_revokes = _disconnect_personal_connectors(
                 session, auth, request, removed_users_id=user_id, now=now
             )
@@ -750,19 +767,6 @@ def remove_member_endpoint(
                 detail={"code": "OWNED_RESOURCES_BLOCK_REMOVAL", "owned_resources": owned},
             )
 
-        # Lock order for the cascade below, matching every other writer of
-        # these tables: delegations, then resource rows, then grants.
-        # `accept_delegation_endpoint` locks a delegation, then its evidence
-        # resources, then inserts grants; `authz_grants.revoke_grant_endpoint`
-        # and `authz_grants.create_grant_endpoint` lock the resource row, then
-        # the grant. So: lock the member's live delegations first, cancel
-        # their runs (`cancel_run` locks `workflow_runs` rows) second, and
-        # only then update the delegations and revoke their evidence grants.
-        # Any other order deadlocks against a concurrent accept or grant
-        # revoke touching one of the member's runs.
-        lock_delegations_for_removed_member(
-            session, workspace_id=auth.workspace_id, account_id=member["account_id"]
-        )
         # Found in the second whole-phase review, mirroring the delegation
         # cascade immediately below: `worker.py`'s own docstring already
         # discloses that a run is authorized once, at enqueue, and never
