@@ -1079,14 +1079,12 @@ def _mutate_attention(
 ) -> AttentionItem:
     now = datetime.now(UTC)
     with session.begin():
-        if not authz.authorize(
-            session, auth, resource_type="attention_items", resource_id=item_id, action="read"
-        ):
-            raise HTTPException(status_code=404, detail="ATTENTION_ITEM_NOT_FOUND")
-        if not authz.authorize(
-            session, auth, resource_type="attention_items", resource_id=item_id, action="write"
-        ):
-            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        # Lock the item before authorizing: a concurrent owner/visibility
+        # change (personal-visibility backfill, ownership transfer,
+        # regenerate) that commits while this request waits on the row lock
+        # must be seen by the authorization check below, not by a check that
+        # ran against the pre-change row. Under READ COMMITTED each
+        # statement after the lock reads the committed post-change state.
         row = (
             session.execute(
                 text(f"""
@@ -1102,6 +1100,14 @@ def _mutate_attention(
         )
         if row is None:
             raise HTTPException(status_code=404, detail="ATTENTION_ITEM_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="attention_items", resource_id=item_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="ATTENTION_ITEM_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="attention_items", resource_id=item_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         if action == "dismiss":
             if (
                 row["dismissed_at"] is not None
