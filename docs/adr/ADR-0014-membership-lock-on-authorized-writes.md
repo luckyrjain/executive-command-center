@@ -33,6 +33,7 @@ A second, smaller gap existed. Create endpoints check the caller's role once wit
 ### Positive
 
 - Removal and demotion now happen either before or after a write. A membership change that commits first is seen by every `authorize()` or `current_role()` read later in the write transaction, because each statement reads its own READ COMMITTED snapshot. A membership change that starts later waits for the write to commit. The race tests (`tests/test_attention_membership_lock_race_postgres.py`) hold the exclusive lock, demote or remove the caller, and assert `403`/`404` with no row written.
+- Demotion revokes write access that came from the role. It does not revoke access to rows the caller owns, because `authorize()` always allows the owner (existing policy, pinned by `test_demoted_owner_still_writes_own_row`). `role_action="read"` answers a removed caller `403 INSUFFICIENT_ROLE`, not the `404` that per-row paths give.
 - Writers never conflict with each other, because shared advisory locks are compatible. Ordinary write throughput is unchanged, apart from one extra lock statement per write transaction.
 
 ### Negative
@@ -40,8 +41,8 @@ A second, smaller gap existed. Create endpoints check the caller's role once wit
 - Removal and role change now wait for every in-flight write transaction in the workspace. While removal waits, Postgres queues new shared requests behind the pending exclusive one, so writes across the whole workspace pause until the removal commits. Removal is a rare admin action, so this is accepted. The requirement that follows is that a locked write transaction must stay short and must never make a network or model call. The one existing exception, sync phase 1's token refresh, is documented in `connector_security`.
 - Removal's wait for the lock is itself a statement, capped at `STATEMENT_TIMEOUT_MS` (5 s). If any write transaction in the workspace holds the shared lock longer than that, the removal or role change fails with a retryable 500. It is not simply delayed. `regenerate_attention` on a very large workspace is the likeliest such transaction. It is accepted for now. The fix, if it ever bites, is a `lock_timeout` on removal plus a retry, or a shorter `regenerate`.
 - Idempotent replays (`load_cached`) run after the lock but before any membership check on endpoints that authorize per row, so a removed member can still read back a response it was already given. Nothing is written, so this is accepted.
-- `get_prep` (a GET) takes the lock too, because it can flip a pack to `stale` in the caller's name.
-- Each explicit call site can be forgotten. A new write endpoint that skips the helper reopens the window for that endpoint only.
+- `get_prep` (a GET) takes the lock too, because it can flip a pack to `stale` in the caller's name. This puts every prep view into the set of transactions a removal waits on and queues it behind a pending removal. That is accepted because the transaction is short. Taking the lock only right before the flip (then re-reading and re-authorizing) is the fallback if it ever matters.
+- Each explicit call site can be forgotten. A new write endpoint that skips the helper reopens the window for that endpoint only. `tests/test_attention_membership_lock_coverage.py` guards the adopted modules: it fails on any `session.begin()` block there that doesn't start with the helper, except an explicit allowlist of read-only transactions. Each module that adopts the helper later should join that scan.
 
 ### Risks
 

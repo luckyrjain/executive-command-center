@@ -696,6 +696,24 @@ def test_viewer_demotion_does_not_block_own_capacity_edit(race_world: RaceWorld)
     assert blocked
 
 
+def test_demoted_owner_still_writes_own_row(race_world: RaceWorld) -> None:
+    """Demotion does not revoke write access to the caller's own rows:
+    `authorize()` always allows the owner. Pinned so that stays a
+    deliberate policy, not an accident of the lock."""
+    w, case = race_world, CASES["attention_dismiss"]
+    ids = _prepare(w, case)
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE attention_items SET owner_id = :b WHERE id = :id"),
+            {"b": w.b, "id": ids["id"]},
+        )
+
+    response, blocked = _race(w, case, ids, change="demote")
+
+    assert response.status_code == 200, response.text
+    assert blocked
+
+
 @pytest.mark.parametrize("name", ["meeting_create_prep", "meeting_refresh_prep"])
 @pytest.mark.parametrize("change", ["demote", "remove"])
 def test_enrichment_pack_write_waits_on_membership_lock(
