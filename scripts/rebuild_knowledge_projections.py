@@ -42,9 +42,10 @@ and `SELECT id FROM pkos_evidence WHERE workspace_id = '<ws>' AND visibility =
 'private'` lists the rows. Re-enable the flag, or pass
 `--allow-without-isolation` knowingly (those claims become shared search
 text -- as the flag-off application's own writers would make them on their
-next write anyway). The check is one short read in its own transaction
-(`statement_timeout` 120 s); unscoped, it scans `pkos_evidence` once. Exit
-codes are listed at the end of `--help` (`_parse_args`'s epilog).
+next write anyway). The check is one read at the start of the rebuild's own
+transaction, before any write (`statement_timeout` 120 s via `SET LOCAL`);
+unscoped, it scans `pkos_evidence` once. Exit codes are listed at the end of
+`--help` (`_parse_args`'s epilog).
 """
 
 from __future__ import annotations
@@ -99,17 +100,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def private_evidence_counts(session: Session, workspace_id: UUID | None) -> list[tuple[UUID, int]]:
     """`(workspace_id, count)` of `private` `pkos_evidence` in scope, largest
     first -- evidence a flag-off rebuild would copy into shared search text.
-    Its own short transaction, under `GUARD_STATEMENT_TIMEOUT`."""
-    with session.begin():
-        session.execute(text(f"SET LOCAL statement_timeout = '{GUARD_STATEMENT_TIMEOUT}'"))
-        rows = session.execute(
-            text(
-                "SELECT workspace_id, count(*) FROM pkos_evidence WHERE visibility = 'private' "
-                "AND (CAST(:ws AS uuid) IS NULL OR workspace_id = CAST(:ws AS uuid)) "
-                "GROUP BY workspace_id ORDER BY count(*) DESC, workspace_id"
-            ),
-            {"ws": workspace_id},
-        ).all()
+    Runs in the caller's (the rebuild's) transaction, before any write, under
+    `GUARD_STATEMENT_TIMEOUT` set with `SET LOCAL`; the session's own timeout
+    is put back (transaction-locally) for the rebuild that follows."""
+    previous = session.execute(text("SHOW statement_timeout")).scalar_one()
+    session.execute(text(f"SET LOCAL statement_timeout = '{GUARD_STATEMENT_TIMEOUT}'"))
+    rows = session.execute(
+        text(
+            "SELECT workspace_id, count(*) FROM pkos_evidence WHERE visibility = 'private' "
+            "AND (CAST(:ws AS uuid) IS NULL OR workspace_id = CAST(:ws AS uuid)) "
+            "GROUP BY workspace_id ORDER BY count(*) DESC, workspace_id"
+        ),
+        {"ws": workspace_id},
+    ).all()
+    session.execute(
+        text("SELECT set_config('statement_timeout', :previous, true)"), {"previous": previous}
+    )
     return [(row[0], int(row[1])) for row in rows]
 
 
@@ -193,11 +199,13 @@ def _rebuild(session: Session, workspace_id: UUID) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     enabled = _announce()
-    with SessionFactory() as guard_session:
-        refused = _isolation_guard(guard_session, args, enabled=enabled)
-    if refused is not None:
-        return refused
     with SessionFactory() as session:
+        # The guard reads in the rebuild's own transaction, before any write
+        # -- no window between the check and the rebuild.
+        refused = _isolation_guard(session, args, enabled=enabled)
+        if refused is not None:
+            session.rollback()
+            return refused
         workspace_ids = _workspace_ids(session, args.workspace_id)
         if workspace_ids is None:
             print("rebuild_knowledge_projections: workspace not found", file=sys.stderr)

@@ -86,10 +86,13 @@ Per-table rules (a row is changed only when it is not already
                          confirm wrote -- the recommendation's owner or the
                          row's `created_by` (the confirming member, the
                          flag-off owner) -- is the owner changed; once an
-                         earlier run has logged the row and it is still
-                         `private`, only the recommendation's owner counts
-                         (the rule was applied once: an operator's owner
-                         fix or a transfer since STICKS). A row re-owned
+                         earlier run has applied this rule to the row
+                         (its log snapshot's `derived_rule`; an entry made
+                         while the source recommendation was
+                         `owner_not_mailbox_owner` does not count) and it
+                         is still `private`, only the recommendation's
+                         owner counts (the rule was applied once: an
+                         operator's owner fix or a transfer since STICKS). A row re-owned
                          since (an ownership transfer, member removal
                          moving it away, a manual fix) is made `private`
                          with its CURRENT owner and reported
@@ -1022,36 +1025,48 @@ def _source_decisions(
     return _recommendation_decisions(conn, workspace_id, sources)
 
 
+@dataclass(frozen=True)
+class _Earlier:
+    """One earlier run's log entry for a derived row."""
+
+    previous_owner: UUID | None
+    # Whether the derived-row rule itself decided it (snapshot key
+    # `derived_rule`); an entry without the key counts as True.
+    derived_rule: bool
+
+
 def _derived_history(
     conn: Connection, table: str, row_ids: list[UUID], history: History
-) -> dict[UUID, list[UUID | None]]:
-    """Row id -> the previous owners earlier runs logged for it (equality on
-    all three columns of the log's `(run_id, table_name, row_id)` unique
-    index)."""
-    earlier: dict[UUID, list[UUID | None]] = {}
+) -> dict[UUID, list[_Earlier]]:
+    """Row id -> what earlier runs logged for it (equality on all three
+    columns of the log's `(run_id, table_name, row_id)` unique index)."""
+    earlier: dict[UUID, list[_Earlier]] = {}
     runs = history.runs(conn)
     if not runs:
         return earlier
-    for row_id, previous_owner in conn.execute(
+    for row_id, previous_owner, rule in conn.execute(
         text(
-            "SELECT row_id, previous_owner_id FROM personal_visibility_backfill_log "
+            "SELECT row_id, previous_owner_id, previous_state -> 'derived_rule' "
+            "FROM personal_visibility_backfill_log "
             "WHERE run_id = ANY(:runs) AND table_name = :table AND row_id = ANY(:ids) "
             "AND (CAST(:before AS timestamptz) IS NULL OR at < CAST(:before AS timestamptz))"
         ),
         {"runs": runs, "table": table, "ids": row_ids, "before": history.before},
     ).all():
-        earlier.setdefault(row_id, []).append(previous_owner)
+        earlier.setdefault(row_id, []).append(_Earlier(previous_owner, rule is not False))
     return earlier
 
 
 def _derived_decision(
-    row: Mapping[str, Any], source: Decision | None, earlier: list[UUID | None]
+    row: Mapping[str, Any], source: Decision | None, earlier: list[_Earlier]
 ) -> Decision:
     """The rule for one derived row (see the module docstring). `earlier`:
-    previous owners earlier runs logged for it. A row an earlier run already
-    processed and that is still `private` has had the rule applied once:
-    its owner is no longer re-derived -- an operator's owner fix or a
-    transfer since sticks (reported `derived_owner_changed`)."""
+    what earlier runs logged for it. A row the rule was already applied to
+    by an earlier run (an entry the derived rule decided -- not one made
+    private while its source recommendation was unverified,
+    `owner_not_mailbox_owner`) and that is still `private`: its owner is no
+    longer re-derived -- an operator's owner fix or a transfer since sticks
+    (reported `derived_owner_changed`)."""
     if source is None:
         return Unresolved("derived_source_missing")
     if isinstance(source, Unresolved):  # never today: recommendations always get a Target
@@ -1059,7 +1074,7 @@ def _derived_decision(
     if source.reason is not None:
         # Never re-own to an owner the recommendation rule did not verify.
         return Target(row["owner_id"], "private", source.reason, keeps_owner=True)
-    processed = bool(earlier) and row["visibility"] == "private"
+    processed = row["visibility"] == "private" and any(e.derived_rule for e in earlier)
     confirm_owners = {source.owner_id} if processed else {source.owner_id, row["created_by"]}
     if row["owner_id"] not in confirm_owners:
         return Target(row["owner_id"], "private", "derived_owner_changed", keeps_owner=True)
@@ -1108,7 +1123,8 @@ def _derived_row_decisions(
         row_earlier = earlier.get(r["id"], [])
         decision = _derived_decision(r, sources[r["id"]], row_earlier)
         if isinstance(decision, Target) and decision.reason is None:
-            reowned = any(o != decision.owner_id for o in [r["owner_id"], *row_earlier])
+            owners = [r["owner_id"], *(e.previous_owner for e in row_earlier)]
+            reowned = any(o != decision.owner_id for o in owners)
             if reowned and decision.owner_id not in active:
                 decision = Target(decision.owner_id, "private", "owner_inactive")
         decisions[r["id"]] = decision
@@ -1255,6 +1271,16 @@ class _Change:
     previous_visibility: str
     target: Target
     grants: int
+    # Derived tables: the derived-row owner rule itself decided this change
+    # (logged as `derived_rule` in the snapshot; see `_derived_decision`).
+    derived_rule: bool = False
+
+
+# Decisions of the derived-row rule itself (not a verification failure of
+# the source recommendation, nor an unresolvable row).
+_DERIVED_RULE_REASONS: Final[frozenset[Reason | None]] = frozenset(
+    {None, "owner_inactive", "derived_owner_changed"}
+)
 
 
 def _changes(
@@ -1290,7 +1316,10 @@ def _changes(
                 UnresolvedRow(table, workspace_id, r["id"], decision.reason, n_grants)
             )
         if (r["owner_id"], r["visibility"]) != (decision.owner_id, decision.visibility) or n_grants:
-            changes.append(_Change(r["id"], r["owner_id"], r["visibility"], decision, n_grants))
+            rule = table in _DERIVED_TABLES and decision.reason in _DERIVED_RULE_REASONS
+            changes.append(
+                _Change(r["id"], r["owner_id"], r["visibility"], decision, n_grants, rule)
+            )
     return changes
 
 
@@ -1438,6 +1467,8 @@ def _log_changes(
                 c.target.visibility,
             )
             state = {**state, "version_bump": 1 if moved else 0}
+        if state is not None and table in _DERIVED_TABLES:
+            state = {**state, "derived_rule": c.derived_rule}
         rows.append(
             {
                 "id": uuid4(),
@@ -1767,7 +1798,8 @@ def _restore_page(
 def _restore_select(table: str, *, lock: bool) -> str:
     if table not in TABLES:
         raise ValueError("unknown table")
-    lock_clause = f" FOR UPDATE OF {table}" if lock else ""
+    # Locked in id order, as the backfill's batches lock.
+    lock_clause = f" ORDER BY {table}.id FOR UPDATE OF {table}" if lock else ""
     return (
         f"SELECT {table}.id, {table}.workspace_id, {table}.owner_id, "  # noqa: S608
         f"{table}.visibility{_EXTRA_COLUMNS[table]} FROM {table} "

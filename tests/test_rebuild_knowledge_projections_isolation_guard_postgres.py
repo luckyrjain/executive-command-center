@@ -360,8 +360,9 @@ def test_private_evidence_counts_are_largest_first_under_the_guard_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """QA2-3: the refusal lists the workspace with more private evidence
-    first, and the guard's read runs under its own 120 s statement timeout
-    (checked inside the transaction)."""
+    first, and the guard's read runs under a 120 s statement timeout
+    (checked inside the transaction), which is put back afterwards: the
+    guard runs inside the rebuild's own transaction."""
     _seed_evidence(workspace_id, accounts, source_type="gmail_sync", visibility="private")
     for _ in range(2):
         _seed_evidence(other_workspace_id, accounts, source_type="gmail_sync", visibility="private")
@@ -376,7 +377,12 @@ def test_private_evidence_counts_are_largest_first_under_the_guard_timeout(
             return result
 
         monkeypatch.setattr(session, "execute", spy)
+        before = original(text("SHOW statement_timeout")).scalar_one()
         counts = rebuild.private_evidence_counts(session, None)
+        # Same transaction as the rebuild: the session's own timeout is
+        # back for what follows.
+        assert original(text("SHOW statement_timeout")).scalar_one() == before
+        session.rollback()
     ours = [ws for ws, _n in counts if ws in (workspace_id, other_workspace_id)]
     assert ours == [other_workspace_id, workspace_id]
     assert dict(counts)[other_workspace_id] == 2 and dict(counts)[workspace_id] == 1

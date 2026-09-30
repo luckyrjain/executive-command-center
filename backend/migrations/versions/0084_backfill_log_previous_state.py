@@ -12,7 +12,11 @@ text itself. `--restore` then puts a row back only
 while those values are exactly what the backfill left -- an exact,
 clock-free check that replaces the earlier `updated_at` stamp and
 audit-time lookup. Log rows written before this revision keep a NULL
-snapshot and are restored by the owner/visibility compare-and-set alone.
+snapshot: on the snapshot tables (tasks, commitments, risks, email attention
+items) the restore cannot verify them and refuses them as
+`changed_since_backfill:no_snapshot` (restore by hand, docs/SETUP.md); on
+the other tables, which never have a snapshot, the owner/visibility
+compare-and-set alone decides.
 
 Operational note: `ADD COLUMN ... NULL` with no default is a metadata-only
 change in PostgreSQL -- instant, no table rewrite, only a brief ACCESS

@@ -91,7 +91,8 @@ assumes it.
   the workspaces with counts (top 10 plus the total). Nothing else triggers
   it: not the backfill log, and not narrowed (`shared_explicitly`) evidence,
   which a flag-off application already puts in shared search text. The
-  check is one read with a 120 s statement timeout; unscoped, it scans
+  check is one read at the start of the rebuild's own transaction (before
+  any write) with a 120 s statement timeout; unscoped, it scans
   `pkos_evidence` once. `--allow-without-isolation` overrides it with a
   warning.
 

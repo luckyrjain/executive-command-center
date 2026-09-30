@@ -1413,3 +1413,39 @@ def test_help_prints_the_exit_codes_once(capsys: pytest.CaptureFixture[str]) -> 
         backfill.main(["--help"])
     assert raised.value.code == 0
     assert capsys.readouterr().out.count("Exit codes") == 1
+
+
+def test_a_row_made_private_while_its_source_was_unverified_is_reowned_after_the_fix(
+    world: GmailSyncWorld,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    run_ids: list[UUID],
+) -> None:
+    """pr-review: run 1 finds A's recommendation owned by B (unverified,
+    simulated), so B's task is only made private with its current owner
+    (`owner_not_mailbox_owner`); that log entry is not the derived rule's
+    own decision (`derived_rule: false`). Once the operator fixes the
+    recommendation's owner, run 2 applies the rule: re-owned to A, not
+    reported."""
+    a, b, ws = world.a, world.b, world.workspace_id
+    rec = a.recommendation_ids[0]
+    task = _confirm(world, b.user_id, rec)
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE recommendations SET owner_id = :b WHERE id = :id"),
+            {"b": b.user_id, "id": rec},
+        )
+    _flag(monkeypatch, on=True)
+    _code, rows, _err, run_id = _run(capsys, run_ids, "--workspace-id", str(ws))
+    assert run_id is not None
+    assert _unresolved(rows)[("tasks", task)] == "owner_not_mailbox_owner"
+    assert _owner_vis("tasks", task) == (b.user_id, "private")
+    assert _log_state(run_id, "tasks", task)["derived_rule"] is False
+    with engine.begin() as conn:  # the operator's fix
+        conn.execute(
+            text("UPDATE recommendations SET owner_id = :a WHERE id = :id"),
+            {"a": a.user_id, "id": rec},
+        )
+    _code, rows, err, _ = _run(capsys, run_ids, "--workspace-id", str(ws))
+    assert ("tasks", task) not in _unresolved(rows), err
+    assert _owner_vis("tasks", task) == (a.user_id, "private")
