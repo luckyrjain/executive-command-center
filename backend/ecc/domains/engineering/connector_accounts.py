@@ -1574,11 +1574,11 @@ def _run_connector_sync(
         # providers this phase holds the WORKSPACE-WIDE shared membership
         # lock across `ensure_fresh_credential` -- a token-endpoint POST
         # (only when the access token has expired) of up to 10s. A
-        # concurrent member removal / role change waits on it and can fail
-        # with a 500 once its lock wait exceeds `STATEMENT_TIMEOUT_MS`
-        # (5s; retryable), and every other shared-lock writer in the
-        # workspace (callback, syncs, Gmail writes, transfers) queues
-        # behind that waiting removal meanwhile. Moving the refresh out of
+        # concurrent member removal / role change waits on it and gives up
+        # with a retryable 409 `MEMBERSHIP_CHANGE_BUSY` once its lock wait
+        # exceeds `MEMBERSHIP_CHANGE_LOCK_TIMEOUT_MS` (3s), and every other
+        # shared-lock writer in the workspace (callback, syncs, Gmail
+        # writes, transfers) queues behind that waiting removal meanwhile. Moving the refresh out of
         # the locked section is Spec B's phase restructuring.
         #
         # FX5 known limitation, same root cause: the `FOR UPDATE` on this
