@@ -148,14 +148,12 @@ def record_risk_review(
         # reviews has no independent ownership meaningful apart from the
         # risk it's about, matching claims.py's identical parent-boundary
         # pattern for pkos_nodes.
-        if not authz.authorize(
-            session, auth, resource_type="risks", resource_id=risk_id, action="read"
-        ):
-            raise HTTPException(status_code=404, detail="RISK_NOT_FOUND")
-        if not authz.authorize(
-            session, auth, resource_type="risks", resource_id=risk_id, action="write"
-        ):
-            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        #
+        # Lock the risk before authorizing: an ownership transfer that
+        # commits while this request waits on the row lock must be seen by
+        # the checks below, not by checks that ran against the pre-transfer
+        # row. Under READ COMMITTED each statement after the lock reads the
+        # committed post-change state.
         risk = (
             session.execute(
                 text(
@@ -169,6 +167,14 @@ def record_risk_review(
         )
         if risk is None:
             raise HTTPException(status_code=404, detail="RISK_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="risks", resource_id=risk_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="RISK_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="risks", resource_id=risk_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         if risk["archived_at"] is not None:
             raise HTTPException(status_code=409, detail="RISK_ARCHIVED")
         if risk["version"] != payload.expected_version:
