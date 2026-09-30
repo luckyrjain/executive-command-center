@@ -128,8 +128,10 @@ def _lock_and_authorize_pair(
     first_id, second_id = sorted((target_id, source_id), key=str)
     locked = {first_id: _lock_entity(session, auth, first_id)}
     locked[second_id] = _lock_entity(session, auth, second_id)
+    authorized: dict[UUID, dict[str, Any]] = {}
     for entity_id in (target_id, source_id):
-        if locked[entity_id] is None or not authz.authorize(
+        row = locked[entity_id]
+        if row is None or not authz.authorize(
             session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
         ):
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
@@ -137,7 +139,8 @@ def _lock_and_authorize_pair(
             session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-    return {entity_id: row for entity_id, row in locked.items() if row is not None}
+        authorized[entity_id] = row
+    return authorized
 
 
 def _rehome_aliases(
