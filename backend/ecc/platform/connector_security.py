@@ -781,7 +781,17 @@ def personal_data_share_guard(
 # `require_active_actor=True`, its `ai_runs`/`ai_run_steps` persist
 # (`ai_runtime/runtime._persist_terminal`) and recommendation insert
 # (`governance/recommendation_mutations.create_recommendation`, before its
-# idempotency lock); ownership transfer (`platform/authz_grants`).
+# idempotency lock); ownership transfer (`platform/authz_grants`); and
+# every authorized write transaction in `attention/*` (including
+# `meeting_prep`), through `authz.lock_membership_for_write`, which can
+# also re-check the caller's role under the lock (ADR-0014; other domains adopt
+# it module by module). Meeting-prep enrichment is the one inversion: its
+# session-scoped `held_idempotency_lock` (a different connection) is taken
+# before this lock, which it takes per write transaction so a removal never
+# waits on a model call. A cycle through it needs a same-user, same-key
+# request on the transaction-scoped idempotency lock plus a pending removal,
+# and Postgres cannot detect it across the two connections; the main
+# engine's statement timeout breaks it (a retryable 500, not a hang).
 #
 # FX5 (consent race): every Gmail write transaction above additionally
 # re-checks the mailbox owner's `email` consent under row locks, as its
