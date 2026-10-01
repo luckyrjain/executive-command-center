@@ -526,6 +526,21 @@ def revoke_policy_endpoint(
         if cached is not None:
             return cached
 
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        # (`revoke_policy` re-selects this row FOR UPDATE below:
+        # a no-op re-lock within this transaction.)
+        locked = session.execute(
+            text(
+                "SELECT id FROM automation_policies "
+                "WHERE workspace_id = :workspace_id AND id = :id FOR UPDATE"
+            ),
+            {"workspace_id": auth.workspace_id, "id": policy_id},
+        ).one_or_none()
+        if locked is None:
+            raise HTTPException(status_code=404, detail="POLICY_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="automation_policies", resource_id=policy_id, action="read"
         ):

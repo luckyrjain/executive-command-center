@@ -157,8 +157,8 @@ def archive_constraint(session: Session, auth: AuthContext, constraint_id: UUID)
     applies (e.g. its source task was completed). Returns False if the
     constraint doesn't exist for this workspace or is already archived.
     No `user_id =` filter here -- `archive_constraint_endpoint` (the only
-    HTTP caller) already authz.authorize()s (read+write) the constraint by
-    id before calling this, so ownership is established there; a
+    HTTP caller) locks the constraint and authz.authorize()s it (read+write)
+    before calling this, so ownership is established there; a
     different user in the same workspace still can't reach this far
     without passing that check first.
     """
@@ -285,22 +285,10 @@ def archive_constraint_endpoint(
     """
     now = datetime.now(UTC)
     with session.begin():
-        if not authz.authorize(
-            session,
-            auth,
-            resource_type="planning_constraints",
-            resource_id=constraint_id,
-            action="read",
-        ):
-            raise HTTPException(status_code=404, detail="PLANNING_CONSTRAINT_NOT_FOUND")
-        if not authz.authorize(
-            session,
-            auth,
-            resource_type="planning_constraints",
-            resource_id=constraint_id,
-            action="write",
-        ):
-            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
         current = (
             session.execute(
                 text(
@@ -317,6 +305,22 @@ def archive_constraint_endpoint(
         )
         if current is None:
             raise HTTPException(status_code=404, detail="PLANNING_CONSTRAINT_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="planning_constraints",
+            resource_id=constraint_id,
+            action="read",
+        ):
+            raise HTTPException(status_code=404, detail="PLANNING_CONSTRAINT_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="planning_constraints",
+            resource_id=constraint_id,
+            action="write",
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         if current["archived_at"] is not None:
             return PlanningConstraint.model_validate(dict(current))
         if not archive_constraint(session, auth, constraint_id):
