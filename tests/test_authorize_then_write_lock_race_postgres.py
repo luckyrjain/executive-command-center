@@ -39,7 +39,14 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-from lock_race_support import WAIT_SECONDS, RaceWorld, headers, race_world, row_snapshot
+from lock_race_support import (
+    WAIT_SECONDS,
+    RaceWorld,
+    headers,
+    holder_backend_pid,
+    race_world,
+    row_snapshot,
+)
 from sqlalchemy import Connection, text
 from sqlalchemy.exc import OperationalError
 
@@ -406,19 +413,22 @@ CASES: dict[str, Case] = {
 }
 
 
-def _lock_waiters(pattern: str) -> int:
-    """Backends in this database blocked on a lock in a statement touching
-    `pattern`'s tables -- any statement, not only `FOR UPDATE`, since pre-fix
-    code waits in a plain UPDATE or INSERT."""
+def _lock_waiters(pattern: str, *, holder_pid: int) -> int:
+    """Backends blocked *by `holder_pid`* (`pg_blocking_pids`) on a lock in
+    a statement touching `pattern`'s tables -- any statement, not only `FOR
+    UPDATE`, since pre-fix code waits in a plain UPDATE or INSERT. Scoped to
+    the holder so an unrelated waiter (another test sharing the database)
+    cannot release it early."""
     with engine.connect() as probe:
         return int(
             probe.execute(
                 text(
                     "SELECT count(*) FROM pg_stat_activity "
                     "WHERE datname = current_database() AND wait_event_type = 'Lock' "
+                    "AND pg_blocking_pids(pid) @> ARRAY[CAST(:holder AS integer)] "
                     "AND query ~* :pattern"
                 ),
-                {"pattern": f"\\m({pattern})\\M"},
+                {"holder": holder_pid, "pattern": f"\\m({pattern})\\M"},
             ).scalar_one()
         )
 
@@ -447,6 +457,7 @@ def _race(
         holder_tx = holder.begin()
         thread = threading.Thread(target=fire)
         try:
+            holder_pid = holder_backend_pid(holder)
             holder.execute(
                 text(f"SELECT id FROM {case.table} WHERE id = :id FOR UPDATE"),  # noqa: S608
                 {"id": s.row_id},
@@ -459,7 +470,10 @@ def _race(
                 )
             thread.start()
             deadline = time.monotonic() + WAIT_SECONDS
-            while thread.is_alive() and _lock_waiters(case.wait_on or case.table) < 1:
+            while (
+                thread.is_alive()
+                and _lock_waiters(case.wait_on or case.table, holder_pid=holder_pid) < 1
+            ):
                 if time.monotonic() > deadline:
                     raise AssertionError("request neither blocked nor finished")
                 time.sleep(0.05)
@@ -586,10 +600,11 @@ def _alias_locked_while_waiting_on_node(
     holder_tx = holder.begin()
     thread = threading.Thread(target=fire)
     try:
+        holder_pid = holder_backend_pid(holder)
         holder.execute(text("SELECT id FROM pkos_nodes WHERE id = :id FOR UPDATE"), {"id": node_id})
         thread.start()
         deadline = time.monotonic() + WAIT_SECONDS
-        while _lock_waiters("pkos_nodes") < 1:
+        while _lock_waiters("pkos_nodes", holder_pid=holder_pid) < 1:
             assert thread.is_alive(), "request finished without queueing on the node"
             assert time.monotonic() < deadline, "request never queued on the node"
             time.sleep(0.05)
