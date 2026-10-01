@@ -781,9 +781,10 @@ def personal_data_share_guard(
 # evidence write (`personal/gmail_action_detection`) and, opt-in via
 # `require_active_actor=True`, its `ai_runs`/`ai_run_steps` persist
 # (`ai_runtime/runtime._persist_terminal`) and recommendation insert
-# (`governance/recommendation_mutations.create_recommendation`, before its
-# idempotency lock); ownership transfer (`platform/authz_grants`); and
-# every authorized write transaction in the modules below, through
+# (`governance/recommendation_mutations.create_recommendation`, through
+# `authz.lock_membership_for_write` as for every caller, raising
+# `MembershipInactiveError` for an inactive actor); ownership transfer
+# (`platform/authz_grants`); and every authorized write transaction in the modules below, through
 # `authz.lock_membership_for_write`, which can also re-check the caller's
 # role under the lock (ADR-0014; adopted module by module, each set guarded
 # by its `tests/test_*_membership_lock_coverage.py`):
@@ -805,15 +806,18 @@ def personal_data_share_guard(
 #     demotion does not). Insight generation locks only its post-model
 #     insert. The Gmail OAuth callback keeps its locked membership check
 #     above and re-checks its `write` role after it. Background Gmail sync
-#     and detection keep the owner checks above.
-# Meeting-prep enrichment is the one inversion: its
-# session-scoped `held_idempotency_lock` (a different connection) is taken
-# before this lock, which it takes per write transaction so a removal never
-# waits on a model call. A cycle through it needs a same-user, same-key
-# request on the transaction-scoped idempotency lock plus a pending removal,
-# and Postgres cannot detect it across the two connections; the removal's
-# `lock_timeout` breaks it (a retryable 409 for the removal, not a hang),
-# with the main engine's statement timeout as the backstop.
+#     and detection keep the owner checks above;
+#   - `governance/*`, including `GET /recommendations/{id}`, which may
+#     expire the recommendation in the caller's name.
+# Meeting-prep enrichment and personal insight generation are the two
+# inversions: their session-scoped `held_idempotency_lock` (a different
+# connection) is taken before this lock, which they take per write
+# transaction so a removal never waits on a model call. A cycle through
+# either needs a same-user, same-key request on the transaction-scoped
+# idempotency lock plus a pending removal, and Postgres cannot detect it
+# across the two connections; the removal's `lock_timeout` breaks it (a
+# retryable 409 for the removal, not a hang), with the main engine's
+# statement timeout as the backstop.
 #
 # FX5 (consent race): every Gmail write transaction above additionally
 # re-checks the mailbox owner's `email` consent under row locks, as its
