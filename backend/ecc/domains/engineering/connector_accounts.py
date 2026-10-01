@@ -1566,9 +1566,9 @@ def _run_connector_sync(
     pre-checks itself, and passes `authorize_route` so the authoritative
     check (`_locked_connector_denial`) is re-run here in phase 1 on the
     locked account row, before anything is written or the adapter is
-    called. `_run_auto_backfill`'s call passes none: it has no separate
-    actor to authorize against, only the same one who just created the
-    connector account this call is for.
+    called. `_run_auto_backfill` passes it too, for the account's creator:
+    its resource types run one after another, and an ownership or grant
+    change that commits during one of them must stop the rest.
     """
     # --- Phase 1: validate, reserve the run, read the cursor -------------
     with session.begin():
@@ -2395,6 +2395,17 @@ def _run_auto_backfill(
                 now=datetime.now(UTC),
                 idempotency=None,
                 source="system",
+                # Re-authorize the creator on the locked row in every
+                # resource type's phase 1: these runs are sequential and
+                # each calls the provider, so an ownership, visibility,
+                # grant or role change that removes the creator's access
+                # and commits during one type's sync must stop the types
+                # after it, not let them keep running. A denial is
+                # a `SyncSkipped`, logged below like every other skip.
+                # The route label only reaches the personal-connector
+                # metric, and no `PERSONAL_PROVIDERS` member auto-
+                # backfills (`_AUTO_SYNC_RESOURCE_TYPES`).
+                authorize_route="sync",
             )
         except SyncSkipped as exc:
             _logger.info(

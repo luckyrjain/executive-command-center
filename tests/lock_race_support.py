@@ -186,11 +186,14 @@ def race(
     row_id: UUID,
     send: Callable[[TestClient], httpx.Response],
     transfer: bool,
+    mutate: Callable[[Connection], object] | None = None,
 ) -> tuple[httpx.Response, dict[str, Any]]:
     """Holds `table`'s `row_id` lock in a separate transaction (optionally
-    transferring the row to C there), calls `send` with a client signed in
-    as B, waits until that request is blocked on the lock, then commits.
-    Returns the response and the row as it was before the transfer."""
+    transferring the row to C there, and running `mutate` on that
+    connection -- e.g. to downgrade or revoke a grant), calls `send` with a
+    client signed in as B, waits until that request is blocked on the lock,
+    then commits. Returns the response and the row as it was before the
+    transfer."""
     client = TestClient(app)
     client.cookies.set("ecc_session", w.b_token)
     result: dict[str, Any] = {}
@@ -217,6 +220,8 @@ def race(
                     text(f"UPDATE {table} SET owner_id = :c WHERE id = :id"),  # noqa: S608
                     {"id": row_id, "c": w.c},
                 )
+            if mutate is not None:
+                mutate(holder)
             thread.start()
             wait_for_lock_waiter(table, holder_pid=holder_pid)
             holder_tx.commit()
