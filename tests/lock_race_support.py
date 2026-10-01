@@ -132,7 +132,8 @@ def headers(token: str) -> dict[str, str]:
 
 def lock_waiters(table: str, *, holder_pid: int) -> int:
     """Backends blocked *by `holder_pid`* (`pg_blocking_pids`) on a row
-    lock, in a locking read of `table`. Scoping to the holder means a
+    lock, in a locking read (`FOR UPDATE`/`FOR NO KEY UPDATE`/`FOR SHARE`)
+    of `table`. Scoping to the holder means a
     concurrent backend waiting on some other lock -- another test sharing
     the database, an unrelated row of the same table -- cannot satisfy the
     wait and let the holder commit before the request under test queues."""
@@ -146,7 +147,10 @@ def lock_waiters(table: str, *, holder_pid: int) -> int:
                     "AND pg_blocking_pids(pid) @> ARRAY[CAST(:holder AS integer)] "
                     "AND query ~* :pattern"
                 ),
-                {"holder": holder_pid, "pattern": f"FROM {table}\\s.*FOR (NO KEY )?UPDATE"},
+                {
+                    "holder": holder_pid,
+                    "pattern": f"FROM {table}\\s.*FOR (NO KEY UPDATE|UPDATE|SHARE)",
+                },
             ).scalar_one()
         )
 
