@@ -474,6 +474,42 @@ def test_callback_after_removal_never_revokes_another_members_live_grant(
     assert _count("connector_accounts", world.ws) == 1
 
 
+def test_callback_demoted_during_exchange_refuses_insufficient_role(world: RaceWorld) -> None:
+    """ADR-0014: the callback's only role gate (`require_role_action`) runs
+    before the OAuth round trip. C is demoted to viewer while the token
+    exchange is in flight; the persist transaction re-checks the role under
+    the membership lock and refuses: 403 INSUFFICIENT_ROLE, no connector
+    row, a `denied` refusal audit, and C's minted grant revoked."""
+    code, state = world.start_oauth(world.c, "c", world.mailbox("c"))
+    adapter = gmail_oauth_module._adapter
+    original = adapter.handle_oauth_callback
+
+    def demote_during_exchange(*args: Any, **kwargs: Any) -> Any:
+        authorization = original(*args, **kwargs)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE workspace_memberships SET role = 'viewer' "
+                    "WHERE workspace_id = :ws AND users_id = :u"
+                ),
+                {"ws": world.ws, "u": world.c},
+            )
+        return authorization
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(adapter, "handle_oauth_callback", demote_during_exchange)
+        callback = world.callback(world.c, code, state)
+
+    assert callback.status_code == 403, callback.text
+    assert _error_code(callback) == "INSUFFICIENT_ROLE"
+    assert _count("connector_accounts", world.ws) == 0
+    audits = _refusal_audits(world.ws)
+    assert len(audits) == 1
+    assert audits[0]["failure_code"] == "insufficient_role"
+    assert audits[0]["metadata"] == {"reason": "insufficient_role", "provider": "gmail"}
+    assert world.fake_google.revoked_tokens == [FakeGoogle.refresh_token("c")]
+
+
 def test_callback_membership_check_failure_still_revokes_the_minted_grant(
     world: RaceWorld,
 ) -> None:

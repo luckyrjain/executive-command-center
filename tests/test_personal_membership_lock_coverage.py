@@ -39,12 +39,21 @@ _ALLOWLIST: Counter[tuple[str, str]] = Counter(
         ("gmail_adapter.py", "_sync_messages"): 3,
         ("gmail_adapter.py", "_sync_history"): 3,
         ("gmail_adapter.py", "_process_message"): 1,
-        ("gmail_adapter.py", "resolve_or_create_person"): 1,
+        # Plus its `retry_session` re-read of the winning alias after a lost
+        # insert race, which writes nothing.
+        ("gmail_adapter.py", "resolve_or_create_person"): 2,
         # Also reached from the owner's own `GET .../threads/{id}` (the body
         # fetch tool): after the Google call it takes `lock_membership_shared`
         # first and re-checks the message owner's membership, storing
         # nothing (not a 403) if inactive -- the lock is already there.
         ("gmail_adapter.py", "fetch_and_store_body"): 1,
+        # The OAuth callback's persist transaction (`create_session`) starts
+        # with `require_active_members_locked` (the shared lock plus the
+        # caller's active-membership re-check, mapped to 403
+        # MEMBERSHIP_INACTIVE with the minted grant revoked), then re-checks
+        # the `write` role under it, because its only role gate ran before
+        # the consent screen.
+        ("gmail_oauth.py", "gmail_oauth_callback_endpoint"): 1,
     }
 )
 
