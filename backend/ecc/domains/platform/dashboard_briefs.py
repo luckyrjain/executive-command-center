@@ -514,9 +514,11 @@ def _generate(
     user_id: UUID,
     timezone: str,
     day: date,
-    *,
-    commit: bool = True,
 ) -> MorningBriefResponse:
+    """Writes the next brief version into the caller's open transaction;
+    the caller has already taken `authz.lock_membership_for_write` as its
+    first statement (ADR-0014) and commits. Pure SQL -- no network or
+    model call -- so it is safe under that lock."""
     generation_start = time_module.monotonic()
     now = datetime.now(UTC)
     session.execute(
@@ -640,10 +642,7 @@ def _generate(
         raise
     queue_lifecycle_event(session, "brief", "morning_brief.generated", "allowed")
     queue_brief_generated(session, time_module.monotonic() - generation_start)
-    response = _response(dict(row), False, None)
-    if commit:
-        session.commit()
-    return response
+    return _response(dict(row), False, None)
 
 
 @router.get("/dashboard/today", response_model=DashboardResponse)
@@ -677,6 +676,11 @@ def get_morning_brief(
     day: DateQuery = None,
 ) -> MorningBriefResponse:
     target = _target_date(day, auth.timezone)
+    # A read that can write (the lazy generation below, attributed to the
+    # caller), so it takes the membership lock like any write, first --
+    # before the brief lock (ADR-0014). The brief is the caller's own
+    # per-user data, so any active member may generate it, viewer included.
+    authz.lock_membership_for_write(session, auth, role_action="read")
     # Acquire the same per-(workspace,user,day) advisory lock _generate()
     # takes, before the existence check below -- otherwise two concurrent
     # GETs for a brief that doesn't exist yet can both see no row and both
@@ -709,7 +713,7 @@ def get_morning_brief(
         .one_or_none()
     )
     if row is None:
-        return _generate(
+        generated = _generate(
             request,
             session,
             auth.workspace_id,
@@ -717,6 +721,8 @@ def get_morning_brief(
             auth.timezone,
             target,
         )
+        session.commit()
+        return generated
     stale, reason = _brief_staleness(
         session,
         auth.workspace_id,
@@ -745,6 +751,9 @@ def refresh_morning_brief(
     # `{"action": ..., "payload": ...}` shape.
     request_hash = sha256(target.isoformat().encode()).hexdigest()
     now = datetime.now(UTC)
+    # First statement of the write transaction (ADR-0014). Per-user data:
+    # any active member may refresh their own brief, viewer included.
+    authz.lock_membership_for_write(session, auth, role_action="read")
     idempotency.lock_idempotency(session, auth, idempotency_key)
     try:
         cached = idempotency.load_cached(
@@ -769,7 +778,6 @@ def refresh_morning_brief(
         auth.user_id,
         auth.timezone,
         target,
-        commit=False,
     )
     idempotency.store_idempotency(
         session,
