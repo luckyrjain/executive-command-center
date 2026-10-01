@@ -46,7 +46,7 @@ export function personalErrorMessage(error: unknown): string {
     GMAIL_ACCOUNT_ALREADY_CONNECTED: 'This Google account is already connected in this workspace.',
     CONNECTOR_OWNED_BY_ANOTHER_MEMBER: 'Another member of this workspace has already connected this Google account, so you cannot connect it. Ask that member or a workspace admin if you need it here.',
     CONNECTOR_ACCOUNT_PERSIST_FAILED: 'Gmail could not be saved because of a server error. Nothing was connected -- try again.',
-    MEMBERSHIP_INACTIVE: 'Your membership in this workspace is no longer active, so this was stopped and nothing was saved. Ask a workspace owner if you think this is a mistake.',
+    MEMBERSHIP_INACTIVE: 'Your membership in this workspace is no longer active, so this was stopped. Ask a workspace owner if you think this is a mistake.',
     GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT: 'Use the email domain\'s disable action to disconnect Gmail, not the generic connector action.',
     CONNECTOR_NOT_FOUND: 'This connector no longer exists in this workspace.',
     CONNECTOR_DISCONNECTED: 'This connector is already disconnected.',

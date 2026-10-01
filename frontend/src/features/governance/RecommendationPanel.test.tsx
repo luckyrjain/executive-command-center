@@ -103,7 +103,9 @@ describe('recommendation presentation', () => {
     expect(message).toContain("came from a member's email")
     expect(message).toContain('email consent was withdrawn or their Gmail connection was disconnected')
     expect(message).toContain('can no longer be confirmed')
-    expect(message).toContain('the email owner would need to re-enable Email and reconnect Gmail')
+    expect(message).toContain('it may no longer be available')
+    // No remedy: a withdrawal's cascade already deleted the pending item.
+    expect(message).not.toMatch(/re-enable Email|reconnect Gmail/)
     expect(message).not.toContain('Email consent is not active.')
     expect(message).not.toContain('enable Email under Personal')
   })

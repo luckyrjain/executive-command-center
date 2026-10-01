@@ -139,10 +139,9 @@ export function recommendationErrorMessage(error: unknown): string {
     // confirmer's: 403 when that owner's email consent was withdrawn OR
     // their Gmail connector is disconnected (e.g. the owner was removed).
     // Re-enabling Email alone fixes neither (withdrawal already ran the
-    // cascade, and re-enabling does not reconnect Gmail), and the panel
-    // cannot tell whether the confirmer is the owner, so no remedy is
-    // offered beyond what the owner would need to do.
-    EMAIL_CONSENT_NOT_ACTIVE: "This recommendation came from a member's email, and that member's email consent was withdrawn or their Gmail connection was disconnected, so it can no longer be confirmed. To act on it, the email owner would need to re-enable Email and reconnect Gmail.",
+    // cascade, which deletes pending email recommendations, and re-enabling
+    // does not reconnect Gmail), so no remedy is offered.
+    EMAIL_CONSENT_NOT_ACTIVE: "This recommendation came from a member's email, and that member's email consent was withdrawn or their Gmail connection was disconnected, so it can no longer be confirmed, and it may no longer be available.",
   })
 }
 

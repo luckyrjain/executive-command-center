@@ -303,7 +303,9 @@ describe('GmailPanel', () => {
     renderPanel()
     fireEvent.click(await screen.findByRole('button', { name: 'Sync now' }))
 
-    expect(await screen.findByText(/Your membership in this workspace is no longer active/)).toBeTruthy()
+    expect(await screen.findByText(/Your membership in this workspace is no longer active, so this was stopped\./)).toBeTruthy()
+    // Sync may have committed messages before the stop: never claim nothing was saved.
+    expect(screen.queryByText(/nothing was saved/)).toBeNull()
     const connectorGets = () => fetch.mock.calls.filter(([input, init]) =>
       String(input).includes('/engineering/connectors') && (init?.method ?? 'GET').toUpperCase() === 'GET').length
     const syncRunGets = () => fetch.mock.calls.filter(([input, init]) =>
