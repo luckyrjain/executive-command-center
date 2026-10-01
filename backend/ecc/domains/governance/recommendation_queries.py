@@ -124,10 +124,12 @@ def get_recommendation(
     auth: AuthDep,
     session: SessionDep,
 ) -> RecommendationResponse:
+    # A read that can write (the expiry flip below, attributed to the
+    # caller), so it takes the membership lock like any write (ADR-0014).
+    authz.lock_membership_for_write(session, auth)
     visible = authz.authorize(
         session, auth, resource_type="recommendations", resource_id=recommendation_id, action="read"
     )
-    session.rollback()
     if not visible:
         raise HTTPException(status_code=404, detail="RECOMMENDATION_NOT_FOUND")
     row = expire_if_needed(

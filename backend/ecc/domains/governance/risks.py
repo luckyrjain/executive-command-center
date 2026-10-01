@@ -245,6 +245,7 @@ def create_risk(
     req_hash = request_hash(payload, "create")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="write")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session, auth, idempotency_key, req_hash, domain="risks", response_model=RiskResponse
