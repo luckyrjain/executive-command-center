@@ -1033,6 +1033,7 @@ def create_workflow_endpoint(
     req_hash = request_hash(payload, "create_workflow")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="write")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
@@ -1104,6 +1105,7 @@ def publish_workflow_endpoint(
     req_hash = request_hash(_EmptyBody(), f"publish:{version_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
@@ -1258,6 +1260,7 @@ def disable_workflow_endpoint(
     req_hash = request_hash(_EmptyBody(), f"disable:{version_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
