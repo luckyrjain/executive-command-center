@@ -246,8 +246,10 @@ def create_relationship(
         # is not reported here: `authorize()` below reports it exactly like a
         # row the caller cannot see, in the same read -> write -> target
         # order, so a 404 here cannot reveal whether a private target exists.
+        # NO KEY UPDATE, not UPDATE: this path writes only child rows (see
+        # claims.py's identical lock).
         for locked_id in sorted({entity_id, payload.to_entity_id}):
-            _get_entity_row(session, auth, locked_id, for_update=True)
+            _get_entity_row(session, auth, locked_id, for_no_key_update=True)
         # A relationship touches two entities -- the source (URL entity_id,
         # authorized read+write, the same two-phase shape every other
         # entity-scoped mutation in this domain uses) and the target

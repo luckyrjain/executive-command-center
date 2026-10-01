@@ -205,8 +205,11 @@ def create_claim(
         # The lock is on the subject entity (the authorization boundary
         # checked below), which also holds a transfer of it off until this
         # transaction commits. Entity before claim is the order
-        # entity_operations.split_operation locks in too.
-        if _get_entity_row(session, auth, entity_id, for_update=True) is None:
+        # entity_operations.split_operation locks in too. NO KEY UPDATE, not
+        # UPDATE: this path writes only child rows, and an UPDATE lock would
+        # block the FOR KEY SHARE of a child insert by a writer that holds a
+        # row this one cites (evidence deletion), closing a lock cycle.
+        if _get_entity_row(session, auth, entity_id, for_no_key_update=True) is None:
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
         # A claim's authorization boundary is its subject entity -- claims
         # have no independent ownership/visibility meaningful apart from
@@ -383,8 +386,11 @@ def supersede_claim(
         # The lock is on the subject entity (the authorization boundary
         # checked below), which also holds a transfer of it off until this
         # transaction commits. Entity before claim is the order
-        # entity_operations.split_operation locks in too.
-        if _get_entity_row(session, auth, entity_id, for_update=True) is None:
+        # entity_operations.split_operation locks in too. NO KEY UPDATE, not
+        # UPDATE: this path writes only child rows, and an UPDATE lock would
+        # block the FOR KEY SHARE of a child insert by a writer that holds a
+        # row this one cites (evidence deletion), closing a lock cycle.
+        if _get_entity_row(session, auth, entity_id, for_no_key_update=True) is None:
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"

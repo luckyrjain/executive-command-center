@@ -28,8 +28,20 @@ def get_entity_row(
     entity_id: UUID,
     *,
     for_update: bool = False,
+    for_no_key_update: bool = False,
 ) -> dict[str, Any] | None:
-    suffix = " FOR UPDATE" if for_update else ""
+    """`for_update` takes `FOR UPDATE`: for a caller that writes the entity
+    row. `for_no_key_update` takes `FOR NO KEY UPDATE`: for a caller that
+    only needs the row held steady (it is an authorization boundary, so an
+    ownership transfer must wait) while it writes child rows that reference
+    it. It still conflicts with a transfer's `FOR UPDATE`, but not with the
+    `FOR KEY SHARE` every foreign-key child insert takes, so it cannot close
+    a lock cycle with a writer that holds a row the child cites. That holds
+    only while those writers (evidence deletion) never take NO KEY UPDATE or
+    stronger on the entity themselves."""
+    if for_update and for_no_key_update:
+        raise ValueError("for_update and for_no_key_update are mutually exclusive")
+    suffix = " FOR UPDATE" if for_update else " FOR NO KEY UPDATE" if for_no_key_update else ""
     row = (
         session.execute(
             text(

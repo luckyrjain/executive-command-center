@@ -139,7 +139,7 @@ def lock_waiters(table: str) -> int:
                     "AND wait_event IN ('transactionid', 'tuple') "
                     "AND query ~* :pattern"
                 ),
-                {"pattern": f"FROM {table}\\s.*FOR UPDATE"},
+                {"pattern": f"FROM {table}\\s.*FOR (NO KEY )?UPDATE"},
             ).scalar_one()
         )
 
