@@ -519,6 +519,23 @@ def cancel_delegations_for_removed_member(
         )
 
 
+def _lock_order_key(ref: tuple[str, UUID]) -> tuple[str, int, UUID]:
+    """Sort key for `_lock_resources`: `(resource_type, resource_id)` order,
+    except that `entity_aliases` sorts directly after `pkos_nodes` instead
+    of before it. Member removal (`membership_removal.remove_member_
+    endpoint`, isolation on) locks the removed member's `pkos_nodes` and
+    only then updates their `entity_aliases`; a delegation naming one of
+    each, locked alias-first, deadlocks against it. `entity_operations`
+    merge/split/reverse also take nodes before aliases -- do not "simplify"
+    this back to plain alphabetical order. Every other table keeps plain
+    alphabetical order, the order `_grant_evidence` walks evidence in.
+    """
+    resource_type, resource_id = ref
+    if resource_type == "entity_aliases":
+        return ("pkos_nodes", 1, resource_id)
+    return (resource_type, 0, resource_id)
+
+
 def _lock_resources(
     session: Session,
     workspace_id: UUID,
@@ -532,13 +549,14 @@ def _lock_resources(
     transfers (`authz_grants`) lock the row, rewrite `owner_id` and do not
     bump `version`: a check run before such a transfer commits, followed by
     a write that merely waited behind it, would act on a resource the
-    caller can no longer see. Locked in one deterministic order so two
-    requests naming the same resources cannot deadlock. A missing row
+    caller can no longer see. Locked in one deterministic order
+    (`_lock_order_key`) so two requests naming the same resources, or one
+    racing member removal, cannot deadlock. A missing row
     locks nothing; the caller's `authorize()` then reports it (False).
     `SHARE` suffices when the caller only reads the rows (it still blocks a
     transfer's `FOR UPDATE`); `UPDATE` when it goes on to write them.
     """
-    for resource_type, resource_id in sorted(set(refs)):
+    for resource_type, resource_id in sorted(set(refs), key=_lock_order_key):
         authz.require_known_resource_type(resource_type)
         session.execute(
             text(
@@ -590,7 +608,8 @@ def _grant_evidence(
     # Lock before authorizing: a transfer of an evidence resource that
     # commits while this request waits on its row lock must be seen by the
     # re-check below, not granted to the recipient on a pre-transfer check.
-    # `_lock_resources` takes them in the same canonical order.
+    # `_lock_resources` takes them all up front (see `_lock_order_key`), so
+    # the order this loop walks them in no longer decides lock order.
     _lock_resources(
         session,
         workspace_id,
