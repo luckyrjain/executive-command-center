@@ -286,6 +286,22 @@ def merge_entities(
         )
         if candidate is None:
             raise HTTPException(status_code=404, detail="CANDIDATE_NOT_FOUND")
+        # The candidate is the merge's "a human confirmed this pair" gate, so
+        # the caller must be able to see it -- checked on the locked row, so
+        # an ownership transfer that committed while this request waited on
+        # the lock is seen here. Read only: a merge references the candidate
+        # but never writes it (the same reference-only check `create_
+        # relationship` gives its target). Before any status/pair check, so
+        # CANDIDATE_NOT_CONFIRMED / TARGET_NOT_IN_CANDIDATE_PAIR can't reveal
+        # a candidate the caller cannot read.
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="resolution_candidates",
+            resource_id=payload.candidate_id,
+            action="read",
+        ):
+            raise HTTPException(status_code=404, detail="CANDIDATE_NOT_FOUND")
         # API-SCHEMAS.md's mutation rules: "Resolution confirmation is a
         # human-confirmed identity operation, not a generic update" -- a
         # merge may only originate from a candidate a human has already
