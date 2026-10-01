@@ -798,7 +798,12 @@ def personal_data_share_guard(
 #   - `engineering/connector_accounts` endpoints and
 #     `engineering/decisions_incidents`. Connector create locks in both of
 #     its write transactions, never across `adapter.authorize()`. Sync
-#     keeps its own `require_active_members_locked` design above.
+#     keeps its own `require_active_members_locked` design above;
+#   - every caller write transaction in `personal/*`, with
+#     `role_action="read"` (the caller's own data: removal refuses,
+#     demotion does not). Insight generation locks only its post-model
+#     insert. Background Gmail sync and detection keep the owner checks
+#     above.
 # Meeting-prep enrichment is the one inversion: its
 # session-scoped `held_idempotency_lock` (a different connection) is taken
 # before this lock, which it takes per write transaction so a removal never
