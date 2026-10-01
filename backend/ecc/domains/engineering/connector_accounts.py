@@ -972,6 +972,7 @@ def create_connector_endpoint(
 
     # --- Phase 1: idempotency check, provider validation ------------------
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="write")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
@@ -1004,6 +1005,10 @@ def create_connector_endpoint(
         SessionFactory() as create_session,
         create_session.begin(),
     ):
+        # ADR-0014: the caller may have been demoted or removed while phase
+        # 2's adapter call ran; re-check the role under the membership lock
+        # before anything is written.
+        authz.lock_membership_for_write(create_session, auth, role_action="write")
         try:
             # A SAVEPOINT (`begin_nested`), not a second top-level
             # transaction -- the INSERT below must stay inside the SAME
@@ -2440,6 +2445,7 @@ def disable_connector_endpoint(
     # phase split for the identical class of risk.
     pending_revoke: tuple[ConnectorAdapter, ConnectorAccountContext] | None = None
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
 
         # `get_connector_account` moved ahead of `load_cached` (Loop 2
@@ -2712,7 +2718,9 @@ def get_metrics_endpoint(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
     the same mechanism, not a special case: a plain cross-site navigation
     cannot set a custom header, so it now gets a 403 instead of a write.
     """
-    authz.require_role_action(session, auth, "write")
+    # ADR-0014: the membership lock is the first statement of this
+    # autobegun write transaction and the role gate runs under it.
+    authz.lock_membership_for_write(session, auth, role_action="write")
     snapshots = compute_and_store_metrics(session, workspace_id=auth.workspace_id)
     session.commit()
     return MetricsListResponse(
@@ -2972,6 +2980,7 @@ def confirm_team_suggestion_endpoint(
     req_hash = request_hash(payload, "confirm_team_suggestion")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
@@ -3062,6 +3071,7 @@ def dismiss_team_suggestion_endpoint(
     req_hash = request_hash(payload, "dismiss_team_suggestion")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
@@ -3299,6 +3309,7 @@ def _assign_team[ResponseT: _TeamAssignedResponse](
     req_hash = request_hash(payload, f"{idempotency_action}:{entity_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
 
         # Lock before authorizing: an ownership transfer that commits while
