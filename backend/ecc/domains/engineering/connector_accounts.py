@@ -2980,7 +2980,7 @@ def confirm_team_suggestion_endpoint(
     req_hash = request_hash(payload, "confirm_team_suggestion")
     now = datetime.now(UTC)
     with session.begin():
-        authz.lock_membership_for_write(session, auth)
+        authz.lock_membership_for_write(session, auth, role_action="read")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
@@ -3071,7 +3071,7 @@ def dismiss_team_suggestion_endpoint(
     req_hash = request_hash(payload, "dismiss_team_suggestion")
     now = datetime.now(UTC)
     with session.begin():
-        authz.lock_membership_for_write(session, auth)
+        authz.lock_membership_for_write(session, auth, role_action="read")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session, auth, idempotency_key, req_hash, domain="engineering_connector_account"

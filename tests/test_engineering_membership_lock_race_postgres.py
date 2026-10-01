@@ -14,9 +14,10 @@ commits the write is refused and writes nothing. See
 
 `POST .../sync` already took the lock (Spec A S1.11); its cases pin that.
 The two team-suggestion bulk actions authorize per row and answer 200 with
-the refused rows in `skipped_unauthorized`, so a revoked caller gets a 200
-that updates nothing (and still stores its idempotency record); those are
-asserted locally rather than through `assert_refused`.
+the refused rows in `skipped_unauthorized`, so a demoted caller gets a 200
+that updates nothing (and still stores its idempotency record); that is
+asserted locally rather than through `assert_refused`. A removed caller is
+refused outright (`role_action="read"`), before any idempotency record.
 """
 
 from __future__ import annotations
@@ -261,15 +262,14 @@ CASES: dict[str, Case] = {
         row_refusals("WORK_ITEM_NOT_FOUND"),
     ),
     # A demoted caller is answered 200 with the row skipped (asserted in
-    # `test_team_suggestion_...` below); a removed one can no longer see the
-    # team entity.
+    # `test_team_suggestion_...` below); a removed one is refused outright.
     "team_suggestion_confirm": Case(
         _seed_suggestion,
         "POST",
         f"{_ENG}/team-suggestions/confirm",
         lambda ids: {"suggested_team_name": "Race Team", "team_entity_id": str(ids["team"])},
         200,
-        {"demote": None, "remove": (404, "TEAM_ENTITY_NOT_FOUND")},
+        {"demote": None, "remove": FORBIDDEN},
     ),
     "team_suggestion_dismiss": Case(
         _seed_suggestion,
@@ -277,6 +277,7 @@ CASES: dict[str, Case] = {
         f"{_ENG}/team-suggestions/dismiss",
         lambda _: {"suggested_team_name": "Race Team"},
         200,
+        {"demote": None, "remove": FORBIDDEN},
     ),
     "incident_create": Case(
         seed_nothing,
@@ -316,7 +317,6 @@ CASES: dict[str, Case] = {
 _SUGGESTION_SKIPS: list[tuple[str, Change]] = [
     ("team_suggestion_confirm", "demote"),
     ("team_suggestion_dismiss", "demote"),
-    ("team_suggestion_dismiss", "remove"),
 ]
 
 
