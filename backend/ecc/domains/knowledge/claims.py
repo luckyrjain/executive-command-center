@@ -187,6 +187,7 @@ def create_claim(
     req_hash = request_hash(payload, f"create:{entity_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
@@ -368,6 +369,7 @@ def supersede_claim(
     req_hash = request_hash(payload, f"supersede:{entity_id}:{claim_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,

@@ -210,6 +210,7 @@ def create_note(
     note_id = uuid4()
 
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="write")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session, auth, idempotency_key, req_hash, domain="notes", response_model=NoteResponse
@@ -356,6 +357,7 @@ def update_note(
     now = datetime.now(UTC)
 
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session, auth, idempotency_key, req_hash, domain="notes", response_model=NoteResponse
@@ -464,6 +466,7 @@ def _lifecycle(
     now = datetime.now(UTC)
 
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session, auth, idempotency_key, req_hash, domain="notes", response_model=NoteResponse

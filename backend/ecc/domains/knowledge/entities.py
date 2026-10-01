@@ -125,6 +125,7 @@ def create_entity_core(
     entity_id = uuid4()
     attributes = {"summary": payload.summary} if payload.summary is not None else {}
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="write")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,

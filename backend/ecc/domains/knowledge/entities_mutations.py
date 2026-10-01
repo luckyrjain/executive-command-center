@@ -62,6 +62,7 @@ def update_entity(
     req_hash = request_hash(payload, f"update:{entity_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
@@ -178,6 +179,7 @@ def _transition_action(
     req_hash = request_hash(payload, f"{action}:{entity_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
