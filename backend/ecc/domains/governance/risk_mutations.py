@@ -187,6 +187,7 @@ def update_risk(
     req_hash = request_hash(payload, f"update:{risk_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session, auth, idempotency_key, req_hash, domain="risks", response_model=RiskResponse
@@ -279,6 +280,7 @@ def _archive_action(
     req_hash = request_hash(payload, f"{action}:{risk_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session, auth, idempotency_key, req_hash, domain="risks", response_model=RiskResponse

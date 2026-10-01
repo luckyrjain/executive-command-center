@@ -41,8 +41,9 @@ from ecc.platform import authz
 from ecc.platform.connector_security import (
     EMAIL_RECOMMENDATION_TYPE,
     EmailConsentInactiveError,
+    MembershipInactiveError,
+    member_is_active,
     personal_derived_row_scope,
-    require_active_members_locked,
 )
 
 router = APIRouter(prefix="/api/v1/recommendations", tags=["recommendations"])
@@ -122,19 +123,25 @@ def create_recommendation(
     `write_guard` (FX5): called with `session` after the idempotency lock
     and before any row lock or write; whatever it raises propagates.
     """
-    authz.require_role_action(session, auth, "write")
+    digest = request_hash(payload, "generate")
+    # The role gate runs under the shared membership lock, taken before
+    # `_start`'s idempotency lock (lock order: membership -> idempotency ->
+    # rows), so a removal or demotion either committed before it (403) or
+    # waits for this transaction (ADR-0014).
+    try:
+        authz.lock_membership_for_write(session, auth, role_action="write")
+    except HTTPException:
+        # Spec A S1.11 (opt-in; the Gmail action-detection hook): an actor
+        # (the mailbox owner, who owns the row) who is no longer an active
+        # member raises `MembershipInactiveError`, ending the hook's batch.
+        # Still under the lock (the helper never rolls back).
+        if require_active_actor and not member_is_active(
+            session, workspace_id=auth.workspace_id, users_id=auth.user_id
+        ):
+            raise MembershipInactiveError from None
+        raise
     validate_action(payload.target_type, payload.proposed_action)
     is_create = payload.proposed_action.get("operation") == "create"
-    digest = request_hash(payload, "generate")
-    if require_active_actor:
-        # Spec A S1.11 (opt-in; the Gmail action-detection hook): the role
-        # check above is not locked -- re-check the actor (the mailbox
-        # owner, who owns the row) under the shared membership lock, taken
-        # before `_start`'s idempotency lock (lock order: membership ->
-        # idempotency -> rows). Inactive -> `MembershipInactiveError`.
-        require_active_members_locked(
-            session, workspace_id=auth.workspace_id, users_ids=[auth.user_id]
-        )
     cached = _start(session, auth, idempotency_key, digest)
     if cached is not None:
         return cached
@@ -322,6 +329,7 @@ def _transition(
     feedback_defer_until: datetime | None = None,
 ) -> RecommendationResponse:
     digest = request_hash(payload, action_name)
+    authz.lock_membership_for_write(session, auth)
     cached = _start(session, auth, idempotency_key, digest)
     if cached is not None:
         return cached
@@ -600,6 +608,7 @@ def confirm_recommendation(
     idempotency_key: IdempotencyHeader,
 ) -> RecommendationResponse:
     digest = request_hash(payload, "recommendation.confirm")
+    authz.lock_membership_for_write(session, auth)
     cached = _start(session, auth, idempotency_key, digest)
     if cached is not None:
         return cached
