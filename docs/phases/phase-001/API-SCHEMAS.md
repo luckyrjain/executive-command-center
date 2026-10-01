@@ -2,9 +2,9 @@
 id: PHASE-001-API-SCHEMAS
 title: Phase 1 API Schemas
 status: Approved for Implementation
-version: 1.1.0
+version: 1.2.0
 owner: Lucky Jain
-updated: 2026-09-28
+updated: 2026-10-01
 ---
 
 # Phase 1 API Schemas
@@ -75,10 +75,10 @@ Standalone meetings require all three API fields. Linked Meeting responses expos
 `GET /recommendations`, `GET /recommendations/{id}`, and actions `/publish`, `/confirm`, `/reject`, `/defer`, `/pin`. `GET /recommendations` accepts an optional `recommendation_type` query parameter, filtered server-side before `limit`/`cursor` pagination applies (Phase 10 Task 8 Loop 2 round 5 review: a domain-scoped embed of the shared review UI filtering client-side could otherwise miss its own items behind a workspace-wide backlog of other-typed recommendations).
 
 - `POST /recommendations` refuses `recommendation_type="email_action_detected"` with `422 VALIDATION_ERROR` (violation `loc` `["body","recommendation_type"]`): that type is reserved for the Gmail action-detection hook, which writes it private to the mailbox owner (Security Remediation Spec A S1.8).
-- Confirming an `operation="create"` recommendation that is personal data (an `email_action_detected` one) with `ECC_PERSONAL_DATA_ISOLATION` on creates its task/commitment/risk owned by the recommendation's owner and `private`; otherwise the created row is the actor's and workspace-visible, as a direct create is. So, with isolation on, a confirmer who is not the recommendation's owner (possible only for a personal recommendation still `workspace`-visible from before the flag) may be unable to read the row they just created, although the confirm response still returns its `target_id`.
+- Confirming an `operation="create"` recommendation that is personal data (an `email_action_detected` one) with `ECC_PERSONAL_DATA_ISOLATION` on creates its task/commitment/risk owned by the recommendation's owner and `private`; otherwise the created row is the actor's and workspace-visible, as a direct create is. So, with isolation on, a confirmer who is not the recommendation's owner (possible only for a personal recommendation still `workspace`-visible, or explicitly shared, from before the flag) may be unable to read the row they just created, although the confirm response still returns its `target_id`.
 - `POST /recommendations/{id}/publish` requires `expected_version`, is valid only from `proposed`, transitions to `pending_confirmation`, and returns the current recommendation.
 - `POST /recommendations/{id}/confirm` includes expected_recommendation_version and target expected_version. It is valid only from `pending_confirmation`; it atomically transitions to accepted, mutates the local target, transitions to executed, writes audit records and outbox events, then commits.
-- For an `email_action_detected` recommendation only, confirm first re-checks the recommendation owner's `email` domain consent and that they still have a non-disconnected Gmail connector, under the same row locks the Gmail consent-revocation cascade takes (Security Remediation FX5). If consent was withdrawn it returns `403 EMAIL_CONSENT_NOT_ACTIVE` with nothing written (no status change, no target created). A confirm that commits first is redacted by a revocation that follows it. Known limitation: while a Gmail sync of that owner is refreshing its OAuth token (up to 10s), this check can wait past the 5s statement timeout and return a generic `500` with nothing written -- retry after a few seconds.
+- For an `email_action_detected` recommendation only, confirm first re-checks the recommendation owner's `email` domain consent and that they still have a non-disconnected Gmail connector, under the same row locks the Gmail consent-revocation cascade takes (Security Remediation FX5). If consent was withdrawn it returns `403 EMAIL_CONSENT_NOT_ACTIVE` with nothing written (no status change, no target created). If an ownership transfer of the recommendation committed while the confirm waited for its row lock, it returns `409 RECOMMENDATION_OWNER_CHANGED` with nothing written; retrying re-checks the new owner's consent. A confirm that commits first is redacted by a revocation that follows it. Known limitation: while a Gmail sync of that owner is refreshing its OAuth token (up to 10s), this check can wait past the 5s statement timeout and return a generic `500` with nothing written -- retry after a few seconds.
 - Rejected, expired and superseded recommendations cannot execute.
 - Failures roll back the target and successful state transitions; a separate failed-attempt record may then be written.
 
@@ -101,4 +101,5 @@ Status codes: 200 query/update/lifecycle action, 201 create, 400 malformed, 401 
 
 | Version | Date | Summary | Author |
 |---|---|---|---|
+| 1.2.0 | 2026-10-01 | Security Remediation Spec A (T19): documented `409 RECOMMENDATION_OWNER_CHANGED` on email-recommendation confirm; the unreadable-created-row case also covers recommendations explicitly shared before the flag | Lucky Jain |
 | 1.1.0 | 2026-09-28 | Security Remediation FX5: `POST /recommendations/{id}/confirm` of an `email_action_detected` recommendation re-checks the owner's email consent (`403 EMAIL_CONSENT_NOT_ACTIVE`, nothing written); documented the token-refresh lock-wait limitation (generic `500`, retry after a few seconds) | Lucky Jain |
