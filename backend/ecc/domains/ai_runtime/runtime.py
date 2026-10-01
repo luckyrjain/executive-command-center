@@ -2418,6 +2418,19 @@ def cancel_run(run_id: UUID, auth: AuthDep, session: SessionDep, _csrf: CsrfDep)
     """
     now = datetime.now(UTC)
     with session.begin():
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        locked = session.execute(
+            text(
+                "SELECT id FROM ai_runs "
+                "WHERE workspace_id = :workspace_id AND id = :run_id FOR UPDATE"
+            ),
+            {"workspace_id": auth.workspace_id, "run_id": run_id},
+        ).one_or_none()
+        if locked is None:
+            raise HTTPException(status_code=404, detail="AI_RUN_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="ai_runs", resource_id=run_id, action="read"
         ):

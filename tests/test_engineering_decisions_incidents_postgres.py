@@ -52,6 +52,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.testclient import TestClient
 from identity_fixtures import create_identity
+from lock_race_support import wait_for_lock_waiter
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -560,11 +561,13 @@ def test_resolve_incident_concurrent_calls_never_lose_an_update(
     ... RETURNING version` guard actually prevents the lost-update
     correctness review found in the original read-then-blind-write
     implementation. Thread A is paused (via a monkeypatched `_get_incident`)
-    right after its own initial `existing` read -- the exact race window
-    the fix closes -- until thread B has fully resolved the incident.
-    Without the fix, thread A's stale `existing["version"] + 1` and its
-    unconditional `UPDATE ... WHERE id = :id` would silently overwrite
-    thread B's already-committed resolution.
+    right after its own initial `existing` read. That read now also takes
+    the row lock (lock-before-authorize), so thread B queues behind it and,
+    once A commits, reads the resolved row and answers 409 -- either way
+    exactly one call wins and no update is lost. (With the row lock
+    serializing the two calls, B's 409 now comes from the status check on
+    its locked read; the `AND status = 'open'` UPDATE guard stays as
+    defense in depth and is no longer the path this test exercises.)
     """
     client, _workspace_id, _user_id, token = engineering_test_context
     now = datetime.now(UTC)
@@ -576,9 +579,9 @@ def test_resolve_incident_concurrent_calls_never_lose_an_update(
     original_get_incident = decisions_incidents_module._get_incident
 
     def _paused_get_incident(
-        session: Session, workspace_id: UUID, inc_id: UUID
+        session: Session, workspace_id: UUID, inc_id: UUID, *, for_update: bool = False
     ) -> dict[str, Any] | None:
-        row = original_get_incident(session, workspace_id, inc_id)
+        row = original_get_incident(session, workspace_id, inc_id, for_update=for_update)
         if str(inc_id) == incident_id and not paused_once.is_set():
             paused_once.set()
             entered_read.set()
@@ -604,9 +607,12 @@ def test_resolve_incident_concurrent_calls_never_lose_an_update(
             future_a = pool.submit(_resolve, client_a)
             assert entered_read.wait(timeout=5), "thread A never reached its existing-row read"
             future_b = pool.submit(_resolve, client_b)
-            response_b = future_b.result(timeout=5)
+            # A holds the incident's row lock across its pause, so B queues
+            # on it rather than racing ahead; release A once B is waiting.
+            wait_for_lock_waiter("incidents")
             release.set()
             response_a = future_a.result(timeout=5)
+            response_b = future_b.result(timeout=5)
     finally:
         client_a.close()
         client_b.close()
@@ -1124,9 +1130,9 @@ def test_decide_decision_concurrent_calls_never_lose_an_update(
     original_get_decision = decisions_incidents_module._get_decision
 
     def _paused_get_decision(
-        session: Session, workspace_id: UUID, dec_id: UUID
+        session: Session, workspace_id: UUID, dec_id: UUID, *, for_update: bool = False
     ) -> dict[str, Any] | None:
-        row = original_get_decision(session, workspace_id, dec_id)
+        row = original_get_decision(session, workspace_id, dec_id, for_update=for_update)
         if str(dec_id) == decision_id and not paused_once.is_set():
             paused_once.set()
             entered_read.set()
@@ -1152,9 +1158,11 @@ def test_decide_decision_concurrent_calls_never_lose_an_update(
             future_a = pool.submit(_decide, client_a)
             assert entered_read.wait(timeout=5), "thread A never reached its existing-row read"
             future_b = pool.submit(_decide, client_b)
-            response_b = future_b.result(timeout=5)
+            # See the incident twin: B queues on A's row lock.
+            wait_for_lock_waiter("engineering_decisions")
             release.set()
             response_a = future_a.result(timeout=5)
+            response_b = future_b.result(timeout=5)
     finally:
         client_a.close()
         client_b.close()

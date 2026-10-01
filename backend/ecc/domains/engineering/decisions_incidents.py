@@ -261,13 +261,16 @@ def _decision_change_ids_by_decision(
     return result
 
 
-def _get_incident(session: Session, workspace_id: UUID, incident_id: UUID) -> dict[str, Any] | None:
+def _get_incident(
+    session: Session, workspace_id: UUID, incident_id: UUID, *, for_update: bool = False
+) -> dict[str, Any] | None:
+    suffix = " FOR UPDATE" if for_update else ""
     row = (
         session.execute(
             text(
                 "SELECT id, title, description, severity, status, detected_at, "
                 "resolved_at, version, created_at, updated_at FROM incidents "
-                "WHERE workspace_id = :workspace_id AND id = :id"
+                "WHERE workspace_id = :workspace_id AND id = :id" + suffix
             ),
             {"workspace_id": workspace_id, "id": incident_id},
         )
@@ -277,13 +280,16 @@ def _get_incident(session: Session, workspace_id: UUID, incident_id: UUID) -> di
     return dict(row) if row is not None else None
 
 
-def _get_decision(session: Session, workspace_id: UUID, decision_id: UUID) -> dict[str, Any] | None:
+def _get_decision(
+    session: Session, workspace_id: UUID, decision_id: UUID, *, for_update: bool = False
+) -> dict[str, Any] | None:
+    suffix = " FOR UPDATE" if for_update else ""
     row = (
         session.execute(
             text(
                 "SELECT id, title, description, rationale, status, decided_at, "
                 "version, created_at, updated_at FROM engineering_decisions "
-                "WHERE workspace_id = :workspace_id AND id = :id"
+                "WHERE workspace_id = :workspace_id AND id = :id" + suffix
             ),
             {"workspace_id": workspace_id, "id": decision_id},
         )
@@ -447,6 +453,13 @@ def resolve_incident_endpoint(
         if cached is not None:
             return IncidentResponse.model_validate(cached)
 
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        existing = _get_incident(session, auth.workspace_id, incident_id, for_update=True)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="INCIDENT_NOT_FOUND")
         # Two-phase read-then-write authz check (mirrors connector_
         # accounts.py's identical pattern): a plain membership-unaware
         # existence lookup followed by a single write-only authorize()
@@ -458,6 +471,8 @@ def resolve_incident_endpoint(
         # missing, or visibility=private) is uniformly reported as 404;
         # only once that has already confirmed the caller can see this
         # incident does a write-check failure reveal anything new via 403.
+        # (The locked lookup above leaks nothing: its 404 is the same one a
+        # failed read check gives, and it runs before any 403 can.)
         if not authz.authorize(
             session, auth, resource_type="incidents", resource_id=incident_id, action="read"
         ):
@@ -466,9 +481,6 @@ def resolve_incident_endpoint(
             session, auth, resource_type="incidents", resource_id=incident_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-        existing = _get_incident(session, auth.workspace_id, incident_id)
-        if existing is None:
-            raise HTTPException(status_code=404, detail="INCIDENT_NOT_FOUND")
         if existing["status"] == "resolved":
             raise HTTPException(status_code=409, detail="INCIDENT_ALREADY_RESOLVED")
         if payload.resolved_at < existing["detected_at"]:
@@ -684,6 +696,13 @@ def decide_decision_endpoint(
         if cached is not None:
             return DecisionResponse.model_validate(cached)
 
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        existing = _get_decision(session, auth.workspace_id, decision_id, for_update=True)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="DECISION_NOT_FOUND")
         # Two-phase read-then-write authz check -- see resolve_incident_
         # endpoint's identical comment for why plain existence-lookup then
         # write-only authorize() leaks existence to a suspended member.
@@ -703,9 +722,6 @@ def decide_decision_endpoint(
             action="write",
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-        existing = _get_decision(session, auth.workspace_id, decision_id)
-        if existing is None:
-            raise HTTPException(status_code=404, detail="DECISION_NOT_FOUND")
         if existing["status"] != "proposed":
             raise HTTPException(status_code=409, detail="DECISION_NOT_PROPOSED")
         # Mirrors resolve_incident_endpoint's identical `resolved_at <

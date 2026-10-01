@@ -489,6 +489,28 @@ def cancel_delegations_for_removed_member(
         )
 
 
+def _lock_resources(session: Session, workspace_id: UUID, refs: list[tuple[str, UUID]]) -> None:
+    """Row-locks (`FOR UPDATE`, workspace-scoped) every resource an
+    `authorize()` check below is about to be evaluated against, so the
+    check and the write that follows it see the same row. Ownership
+    transfers (`authz_grants`) lock the row, rewrite `owner_id` and do not
+    bump `version`: a check run before such a transfer commits, followed by
+    a write that merely waited behind it, would act on a resource the
+    caller can no longer see. Locked in one deterministic order so two
+    requests naming the same resources cannot deadlock. A missing row
+    locks nothing; the caller's `authorize()` then reports it (False).
+    """
+    for resource_type, resource_id in sorted(set(refs), key=lambda r: (r[0], str(r[1]))):
+        authz.require_known_resource_type(resource_type)
+        session.execute(
+            text(
+                f"SELECT 1 FROM {resource_type} "  # noqa: S608 -- resource_type allowlisted by require_known_resource_type
+                "WHERE workspace_id = :workspace_id AND id = :id FOR UPDATE"
+            ),
+            {"workspace_id": workspace_id, "id": resource_id},
+        )
+
+
 def _grant_evidence(
     session: Session,
     *,
@@ -519,7 +541,14 @@ def _grant_evidence(
     # `timezone` is a placeholder -- `authorize()`'s six-step decision never
     # reads it, so fetching the delegator's real one would be a wasted query.
     delegator_auth = AuthContext(workspace_id=workspace_id, user_id=granted_by, timezone="UTC")
-    for item in _evidence_for(session, delegation_id):
+    evidence = _evidence_for(session, delegation_id)
+    # Lock before authorizing: a transfer of an evidence resource that
+    # commits while this request waits on its row lock must be seen by the
+    # re-check below, not granted to the recipient on a pre-transfer check.
+    _lock_resources(
+        session, workspace_id, [(item.resource_type, item.resource_id) for item in evidence]
+    )
+    for item in evidence:
         authz.require_known_resource_type(item.resource_type)  # defense in depth
         if not authz.authorize(
             session,
@@ -652,6 +681,19 @@ def create_delegation_endpoint(
         )
         if payload.recipient_account_id == delegator_account_id:
             raise HTTPException(status_code=422, detail="CANNOT_DELEGATE_TO_SELF")
+
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        _lock_resources(
+            session,
+            auth.workspace_id,
+            [
+                (payload.obligation_type, payload.obligation_resource_id),
+                *((item.resource_type, item.resource_id) for item in payload.evidence),
+            ],
+        )
 
         if not authz.authorize(
             session,

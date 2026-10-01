@@ -15,6 +15,9 @@ from ecc.domains.knowledge.entity_lookup import (
 from ecc.domains.knowledge.entity_lookup import (
     entity_version as _entity_version,
 )
+from ecc.domains.knowledge.entity_lookup import (
+    get_entity_row as _get_entity_row,
+)
 from ecc.domains.knowledge.timeline import queue_timeline_entry
 from ecc.observability import queue_lifecycle_event
 from ecc.platform import audit_outbox, authz, cursor_pagination
@@ -234,6 +237,17 @@ def create_relationship(
         )
         if cached is not None:
             return cached
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row. Both endpoints are
+        # authorization boundaries, so both are locked -- in id order, so two
+        # concurrent creates of A->B and B->A cannot deadlock. A missing row
+        # is not reported here: `authorize()` below reports it exactly like a
+        # row the caller cannot see, in the same read -> write -> target
+        # order, so a 404 here cannot reveal whether a private target exists.
+        for locked_id in sorted({entity_id, payload.to_entity_id}):
+            _get_entity_row(session, auth, locked_id, for_update=True)
         # A relationship touches two entities -- the source (URL entity_id,
         # authorized read+write, the same two-phase shape every other
         # entity-scoped mutation in this domain uses) and the target
@@ -275,7 +289,16 @@ def create_relationship(
         # See claims.py's identical check: evidence that exists but is no
         # longer `available` (deleted, missing, permission_denied) cannot
         # back a new relationship either. Evidence the caller may not read
-        # (Spec A S1.14, flag-gated) is reported as not found.
+        # (Spec A S1.14, flag-gated) is reported as not found. Locked first
+        # (shared: it is only read) so a transfer of the evidence cannot
+        # commit between that read check and the edge that cites it.
+        session.execute(
+            text(
+                "SELECT 1 FROM pkos_evidence"
+                " WHERE workspace_id = :workspace_id AND id = :evidence_id FOR SHARE"
+            ),
+            {"workspace_id": auth.workspace_id, "evidence_id": payload.evidence_id},
+        )
         evidence_state = (
             session.execute(
                 text(
