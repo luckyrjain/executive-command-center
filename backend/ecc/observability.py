@@ -688,6 +688,7 @@ EnrollmentRefusedReason = Literal[
     "not_found",
     "access_denied",
     "membership_inactive",
+    "insufficient_role",
 ]
 PersonalDataSharePath = Literal["grant", "grant_preview", "transfer", "delegation_create"]
 RevokeSite = Literal[

@@ -130,6 +130,14 @@ _UNIQUE_EXTERNAL_ACCOUNT_CONSTRAINT = "uq_connector_accounts_workspace_provider_
 _PendingRevoke = tuple[ConnectorAccountContext, RevokeTokenKind, RevokeSite]
 
 
+class _RoleRefusal(Exception):
+    """The caller was demoted below `write` while the OAuth round trip ran
+    (ADR-0014): `require_role_action` ran before the consent screen, so the
+    role is re-checked under the membership lock before anything is
+    written. Raised and handled like `MembershipInactiveError`: rolled back
+    before any write, nothing queued, refused after `finally`."""
+
+
 class _OwnerRefusal(Exception):
     """The callback's Google account is already connected in this
     workspace by a DIFFERENT member (Spec A S1.2, threat T2). Raised inside
@@ -355,6 +363,7 @@ def gmail_oauth_callback_endpoint(
     committed = False
     owner_refusal: _OwnerRefusal | None = None
     membership_inactive = False
+    role_refused = False
     try:
         with SessionFactory() as create_session, create_session.begin():
             # Spec A S1.11: the caller may have been removed from the
@@ -387,6 +396,13 @@ def gmail_oauth_callback_endpoint(
                     )
                 )
                 raise
+            # ADR-0014: the endpoint's only role gate ran before the consent
+            # screen, so re-check it under the lock just taken.
+            role = authz.current_role(
+                create_session, workspace_id=auth.workspace_id, users_id=auth.user_id
+            )
+            if role is None or "write" not in authz.ROLE_PERMISSIONS[role]:
+                raise _RoleRefusal
             try:
                 with create_session.begin_nested():
                     create_session.execute(
@@ -737,6 +753,8 @@ def gmail_oauth_callback_endpoint(
         # Same shape as `_OwnerRefusal`: rolled back before any write,
         # nothing queued; handled below, after `finally`.
         membership_inactive = True
+    except _RoleRefusal:
+        role_refused = True
     finally:
         # `create_session` is fully closed by this point (the `with` block
         # above has already exited) -- no pooled connection or row lock is
@@ -765,6 +783,19 @@ def gmail_oauth_callback_endpoint(
             aggregate_id=None,
             status_code=403,
             detail="MEMBERSHIP_INACTIVE",
+        )
+    if role_refused:
+        # ADR-0014: demoted below `write` while the OAuth round trip was in
+        # flight; nothing was written.
+        _refuse_enrollment(
+            request,
+            auth,
+            minted,
+            reason="insufficient_role",
+            aggregate_type="connector_account_enrollment",
+            aggregate_id=None,
+            status_code=403,
+            detail="INSUFFICIENT_ROLE",
         )
     if owner_refusal is not None:
         # Spec A S1.2: under the default `global` scope the minted grant is
