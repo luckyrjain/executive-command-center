@@ -84,7 +84,7 @@ shape a Task 4 CI failure already caught in a different domain
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
@@ -406,12 +406,19 @@ def _expire_due(
     params: dict[str, Any] = {"workspace_id": workspace_id, "now": now}
     if account_id is not None:
         params["account_id"] = account_id
+    # Rows are locked in `id` order (the sub-select), not whatever order the
+    # UPDATE's plan scans them in: `lock_delegations_for_removed_member`
+    # locks an overlapping set of rows in `id` order, and two bulk lockers
+    # taking the same rows in different orders deadlock.
     expired_rows = (
         session.execute(
             text(
                 "UPDATE delegations SET status = 'expired', updated_at = :now "
+                "WHERE id IN (SELECT id FROM delegations "
                 "WHERE workspace_id = :workspace_id AND status = 'proposed' AND due_at < :now "
-                f"{clause}RETURNING id, delegator_account_id, recipient_account_id"  # noqa: S608 -- clause is a code literal; values bound
+                f"{clause}ORDER BY id FOR UPDATE) "  # noqa: S608 -- clause is a code literal; values bound
+                "AND status = 'proposed' AND due_at < :now "
+                "RETURNING id, delegator_account_id, recipient_account_id"
             ),
             params,
         )
@@ -439,6 +446,29 @@ def _expire_due(
             },
             now=now,
         )
+
+
+def lock_delegations_for_removed_member(
+    session: Session, *, workspace_id: UUID, account_id: UUID
+) -> None:
+    """Locks every `proposed`/`accepted` delegation naming `account_id`, for
+    `remove_member_endpoint` to take before it locks any resource row (the
+    isolation block's personal rows, then run cancellation -- see the lock
+    order comment at that call site) and before
+    `cancel_delegations_for_removed_member` updates them. Accept locks the
+    delegation, then its evidence resources, then inserts grants; removal
+    must take the delegation first too, or a removal holding a run that is
+    evidence on a delegation being accepted deadlocks against that accept.
+    """
+    session.execute(
+        text(
+            "SELECT id FROM delegations "
+            "WHERE workspace_id = :workspace_id AND status IN ('proposed', 'accepted') "
+            "AND (delegator_account_id = :account_id OR recipient_account_id = :account_id) "
+            "ORDER BY id FOR UPDATE"
+        ),
+        {"workspace_id": workspace_id, "account_id": account_id},
+    )
 
 
 def cancel_delegations_for_removed_member(
@@ -489,6 +519,36 @@ def cancel_delegations_for_removed_member(
         )
 
 
+def _lock_resources(
+    session: Session,
+    workspace_id: UUID,
+    refs: list[tuple[str, UUID]],
+    *,
+    mode: Literal["UPDATE", "SHARE"],
+) -> None:
+    """Row-locks (`FOR <mode>`, workspace-scoped) every resource an
+    `authorize()` check below is about to be evaluated against, so the
+    check and the write that follows it see the same row. Ownership
+    transfers (`authz_grants`) lock the row, rewrite `owner_id` and do not
+    bump `version`: a check run before such a transfer commits, followed by
+    a write that merely waited behind it, would act on a resource the
+    caller can no longer see. Locked in one deterministic order so two
+    requests naming the same resources cannot deadlock. A missing row
+    locks nothing; the caller's `authorize()` then reports it (False).
+    `SHARE` suffices when the caller only reads the rows (it still blocks a
+    transfer's `FOR UPDATE`); `UPDATE` when it goes on to write them.
+    """
+    for resource_type, resource_id in sorted(set(refs)):
+        authz.require_known_resource_type(resource_type)
+        session.execute(
+            text(
+                f"SELECT 1 FROM {resource_type} "  # noqa: S608 -- resource_type allowlisted by require_known_resource_type
+                f"WHERE workspace_id = :workspace_id AND id = :id FOR {mode}"
+            ),
+            {"workspace_id": workspace_id, "id": resource_id},
+        )
+
+
 def _grant_evidence(
     session: Session,
     *,
@@ -519,7 +579,26 @@ def _grant_evidence(
     # `timezone` is a placeholder -- `authorize()`'s six-step decision never
     # reads it, so fetching the delegator's real one would be a wasted query.
     delegator_auth = AuthContext(workspace_id=workspace_id, user_id=granted_by, timezone="UTC")
-    for item in _evidence_for(session, delegation_id):
+    # Canonical (type, id) order, not `_evidence_for`'s insertion order:
+    # two delegations naming the same private resources in different orders
+    # would otherwise lock them in different orders when accepted together,
+    # and deadlock.
+    evidence = sorted(
+        _evidence_for(session, delegation_id),
+        key=lambda item: (item.resource_type, item.resource_id),
+    )
+    # Lock before authorizing: a transfer of an evidence resource that
+    # commits while this request waits on its row lock must be seen by the
+    # re-check below, not granted to the recipient on a pre-transfer check.
+    # `_lock_resources` takes them in the same canonical order.
+    _lock_resources(
+        session,
+        workspace_id,
+        [(item.resource_type, item.resource_id) for item in evidence],
+        # The visibility-widening UPDATE below writes these rows.
+        mode="UPDATE",
+    )
+    for item in evidence:
         authz.require_known_resource_type(item.resource_type)  # defense in depth
         if not authz.authorize(
             session,
@@ -652,6 +731,21 @@ def create_delegation_endpoint(
         )
         if payload.recipient_account_id == delegator_account_id:
             raise HTTPException(status_code=422, detail="CANNOT_DELEGATE_TO_SELF")
+
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        _lock_resources(
+            session,
+            auth.workspace_id,
+            [
+                (payload.obligation_type, payload.obligation_resource_id),
+                *((item.resource_type, item.resource_id) for item in payload.evidence),
+            ],
+            # Creating a delegation only reads these rows.
+            mode="SHARE",
+        )
 
         if not authz.authorize(
             session,

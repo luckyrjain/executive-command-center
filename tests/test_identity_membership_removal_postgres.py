@@ -25,6 +25,8 @@ transfers`'s own authorization/validation surface.
 
 from __future__ import annotations
 
+import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -66,6 +68,9 @@ def _cleanup_workspace(workspace_id: UUID) -> None:
             "delegations",
             "resource_grants",
             "incidents",
+            "workflow_runs",
+            "workflow_versions",
+            "workflow_definitions",
             "event_outbox",
             "audit_events",
             "idempotency_records",
@@ -486,6 +491,332 @@ def test_remove_member_cancels_active_delegations_and_revokes_evidence_grants(
     assert "cancelled" in event_types_1
 
 
+def _chained_lock_waiters(holder_pid: int) -> int:
+    """Backends waiting on a lock held by `holder_pid` -- directly, or behind
+    a waiter that is (a second waiter on the same row blocks on the first
+    one's tuple lock, not on the holder)."""
+    with engine.connect() as probe:
+        return int(
+            probe.execute(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname = current_database() AND wait_event_type = 'Lock' "
+                    "AND (pg_blocking_pids(pid) @> ARRAY[CAST(:holder AS integer)] "
+                    "OR EXISTS (SELECT 1 FROM unnest(pg_blocking_pids(pid)) AS b(pid) "
+                    "WHERE pg_blocking_pids(b.pid) @> ARRAY[CAST(:holder AS integer)]))"
+                ),
+                {"holder": holder_pid},
+            ).scalar_one()
+        )
+
+
+def _describe(results: dict[str, Any], name: str) -> str:
+    if f"{name}_error" in results:
+        return f"{name} raised {results[f'{name}_error']!r}"
+    response = results.get(name)
+    return (
+        f"{name} returned {getattr(response, 'status_code', None)}: {getattr(response, 'text', '')}"
+    )
+
+
+def _race_two(
+    *,
+    lock_run_id: UUID | None = None,
+    lock_delegation_id: UUID | None = None,
+    first: tuple[str, Any],
+    second: tuple[str, Any],
+) -> dict[str, Any]:
+    """Holds a run (or delegation) row FOR UPDATE, fires `first`, waits until it is
+    queued behind the holder, fires `second`, waits until it is queued too,
+    then commits. A request that finishes instead of queueing fails the test
+    at once with its own response."""
+    results: dict[str, Any] = {}
+
+    def fire(name: str, send: Any) -> None:
+        try:
+            results[name] = send()
+        except BaseException as exc:  # surfaced on the main thread below
+            results[f"{name}_error"] = exc
+
+    threads = [threading.Thread(target=fire, args=request) for request in (first, second)]
+
+    def wait_queued(count: int) -> None:
+        deadline = time.monotonic() + 15
+        while _chained_lock_waiters(holder_pid) < count:
+            for (name, _), thread in zip((first, second), threads[:count], strict=False):
+                if not thread.is_alive():
+                    raise AssertionError(
+                        f"{name} finished instead of queueing: {_describe(results, name)}"
+                    )
+            if time.monotonic() > deadline:
+                raise AssertionError(f"expected {count} requests queued behind the holder")
+            time.sleep(0.05)
+
+    holder = engine.connect()
+    holder_tx = holder.begin()
+    try:
+        holder_pid = int(holder.execute(text("SELECT pg_backend_pid()")).scalar_one())
+        if lock_run_id is not None:
+            holder.execute(
+                text("SELECT id FROM workflow_runs WHERE id = :id FOR UPDATE"),
+                {"id": lock_run_id},
+            )
+        else:
+            holder.execute(
+                text("SELECT id FROM delegations WHERE id = :id FOR UPDATE"),
+                {"id": lock_delegation_id},
+            )
+        threads[0].start()
+        wait_queued(1)
+        threads[1].start()
+        wait_queued(2)
+        holder_tx.commit()
+    finally:
+        if holder_tx.is_active:
+            holder_tx.rollback()
+        holder.close()
+        for thread in threads:
+            if thread.ident is not None:  # a setup failure must not be masked
+                thread.join(timeout=15)
+    assert not any(thread.is_alive() for thread in threads), "a request never finished"
+    for name, _ in (first, second):
+        if f"{name}_error" in results:
+            raise results[f"{name}_error"]
+    return results
+
+
+def _seed_race_workflow(ctx: _MembershipContext, now: datetime) -> None:
+    """A workflow owned by the owner, so nothing about it blocks removal."""
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workflow_definitions (id, workspace_id, workflow_id, created_by, "
+                "created_at, updated_at) VALUES (:id, :ws, 'race.workflow', :owner, :now, :now)"
+            ),
+            {"id": uuid4(), "ws": ctx.workspace_id, "owner": ctx.owner.user_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO workflow_versions (id, workspace_id, workflow_id, version, graph, "
+                "definition_hash, status, created_by, updated_by, created_at, updated_at) "
+                "VALUES (:id, :ws, 'race.workflow', 1, '{}'::jsonb, :hash, 'active', "
+                ":owner, :owner, :now, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "ws": ctx.workspace_id,
+                "hash": "0" * 64,
+                "owner": ctx.owner.user_id,
+                "now": now,
+            },
+        )
+
+
+def _seed_run(ctx: _MembershipContext, *, created_by: UUID, visibility: str, now: datetime) -> UUID:
+    """A queued run owned by the owner (never blocks removal as an owned
+    resource); removal cancels it only when `created_by` is the member."""
+    run_id = uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workflow_runs (id, workspace_id, workflow_id, workflow_version, "
+                "status, queued_at, created_by, created_at, updated_at, owner_id, visibility) "
+                "VALUES (:id, :ws, 'race.workflow', 1, 'queued', :now, :by, :now, :now, "
+                ":owner, :visibility)"
+            ),
+            {
+                "id": run_id,
+                "ws": ctx.workspace_id,
+                "by": created_by,
+                "owner": ctx.owner.user_id,
+                "visibility": visibility,
+                "now": now,
+            },
+        )
+    return run_id
+
+
+def _seed_delegation(
+    ctx: _MembershipContext,
+    *,
+    status: str,
+    evidence: list[UUID],
+    now: datetime,
+    recipient: _Actor | None = None,
+    due_at: datetime | None = None,
+    delegation_id: UUID | None = None,
+) -> UUID:
+    """Owner -> `recipient` (member_b by default) delegation with `evidence`
+    runs, inserted in that order."""
+    delegation_id = delegation_id or uuid4()
+    recipient = recipient or ctx.member_b
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO delegations (id, workspace_id, delegator_account_id, "
+                "recipient_account_id, obligation_type, obligation_resource_id, "
+                "expected_outcome, due_at, status, created_at, updated_at) "
+                "VALUES (:id, :ws, :owner_account, :b_account, 'workflow_runs', :run, "
+                "'Race outcome', :due, :status, :now, :now)"
+            ),
+            {
+                "id": delegation_id,
+                "ws": ctx.workspace_id,
+                "owner_account": ctx.owner.account_id,
+                "b_account": recipient.account_id,
+                "run": evidence[0],
+                "due": due_at or now + timedelta(days=1),
+                "status": status,
+                "now": now,
+            },
+        )
+        for offset, run_id in enumerate(evidence):
+            connection.execute(
+                text(
+                    "INSERT INTO delegation_evidence (id, delegation_id, resource_type, "
+                    "resource_id, created_at) VALUES (:id, :d, 'workflow_runs', :run, :at)"
+                ),
+                {
+                    "id": uuid4(),
+                    "d": delegation_id,
+                    "run": run_id,
+                    "at": now + timedelta(seconds=offset),
+                },
+            )
+    return delegation_id
+
+
+def _remove_member_b(ctx: _MembershipContext) -> tuple[str, Any]:
+    return (
+        "removal",
+        lambda: ctx.owner.client.delete(
+            f"/api/v1/identity/workspaces/{ctx.workspace_id}/members/{ctx.member_b.user_id}",
+            headers=_headers(ctx.owner.token),
+        ),
+    )
+
+
+def test_remove_member_and_evidence_grant_revoke_do_not_deadlock(
+    membership_context: _MembershipContext,
+) -> None:
+    """Removal cancels the member's runs (locks `workflow_runs` rows) and
+    revokes their delegation evidence grants (updates `resource_grants`).
+    A grant revoke locks the resource, then the grant. Had removal updated
+    the grant first and then waited on the run, a revoke of an evidence
+    grant on that run (holding the run, waiting on the grant) deadlocked
+    against it.
+
+    The revoke queues on the run behind a holder first, then the removal;
+    the revoke gets the run first, so it succeeds and removal then finds the
+    grant already revoked. Neither may deadlock (a 500)."""
+    ctx = membership_context
+    now = datetime.now(UTC)
+    _seed_race_workflow(ctx, now)
+    run_id = _seed_run(ctx, created_by=ctx.member_b.user_id, visibility="workspace", now=now)
+    delegation_id = _seed_delegation(ctx, status="accepted", evidence=[run_id], now=now)
+    grant_id = uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO resource_grants (id, workspace_id, grantee_account_id, "
+                "resource_type, resource_id, actions, granted_by, created_at, delegation_id) "
+                "VALUES (:id, :ws, :b_account, 'workflow_runs', :run, ARRAY['read'], "
+                ":owner, :now, :d)"
+            ),
+            {
+                "id": grant_id,
+                "ws": ctx.workspace_id,
+                "b_account": ctx.member_b.account_id,
+                "run": run_id,
+                "owner": ctx.owner.user_id,
+                "now": now,
+                "d": delegation_id,
+            },
+        )
+    revoke_client = TestClient(app)
+    revoke_client.cookies.set("ecc_session", ctx.owner.token)
+    try:
+        results = _race_two(
+            lock_run_id=run_id,
+            first=(
+                "revoke",
+                lambda: revoke_client.delete(
+                    f"/api/v1/sharing/grants/{grant_id}", headers=_headers(ctx.owner.token)
+                ),
+            ),
+            second=_remove_member_b(ctx),
+        )
+    finally:
+        revoke_client.close()
+
+    assert results["removal"].status_code == 200, results["removal"].text
+    assert results["revoke"].status_code == 200, results["revoke"].text
+    with engine.connect() as connection:
+        run_status = connection.execute(
+            text("SELECT status FROM workflow_runs WHERE id = :id"), {"id": run_id}
+        ).scalar_one()
+        grant_revoked_at = connection.execute(
+            text("SELECT revoked_at FROM resource_grants WHERE id = :id"), {"id": grant_id}
+        ).scalar_one()
+    assert run_status == "cancelled"
+    assert grant_revoked_at is not None
+
+
+def test_remove_member_and_delegation_accept_do_not_deadlock(
+    membership_context: _MembershipContext,
+) -> None:
+    """Accept locks the delegation, then each private evidence resource (to
+    share it), then inserts grants. Removal must lock the member's
+    delegations before it cancels their runs: had it locked a run first and
+    then waited on the delegation, an accept holding the delegation and
+    waiting on that run deadlocked against it.
+
+    The accept is paused on its first evidence run (held by the holder)
+    while holding the delegation; the removal then queues. On release the
+    accept shares both runs and commits, then removal cancels the member's
+    run and the now-accepted delegation, revoking its grants."""
+    ctx = membership_context
+    now = datetime.now(UTC)
+    _seed_race_workflow(ctx, now)
+    paused_on = _seed_run(ctx, created_by=ctx.owner.user_id, visibility="private", now=now)
+    members_run = _seed_run(ctx, created_by=ctx.member_b.user_id, visibility="private", now=now)
+    delegation_id = _seed_delegation(
+        ctx, status="proposed", evidence=[paused_on, members_run], now=now
+    )
+
+    results = _race_two(
+        lock_run_id=paused_on,
+        first=(
+            "accept",
+            lambda: ctx.member_b.client.post(
+                f"/api/v1/delegations/{delegation_id}/accept",
+                headers=_headers(ctx.member_b.token, key=str(uuid4())),
+            ),
+        ),
+        second=_remove_member_b(ctx),
+    )
+
+    assert results["accept"].status_code == 200, results["accept"].text
+    assert results["removal"].status_code == 200, results["removal"].text
+    with engine.connect() as connection:
+        delegation_status = connection.execute(
+            text("SELECT status FROM delegations WHERE id = :id"), {"id": delegation_id}
+        ).scalar_one()
+        live_grants = connection.execute(
+            text(
+                "SELECT count(*) FROM resource_grants "
+                "WHERE delegation_id = :d AND revoked_at IS NULL"
+            ),
+            {"d": delegation_id},
+        ).scalar_one()
+        run_status = connection.execute(
+            text("SELECT status FROM workflow_runs WHERE id = :id"), {"id": members_run}
+        ).scalar_one()
+    assert delegation_status == "cancelled"
+    assert live_grants == 0
+    assert run_status == "cancelled"
+
+
 def test_remove_member_revokes_sessions(membership_context: _MembershipContext) -> None:
     ctx = membership_context
     removal = ctx.owner.client.delete(
@@ -599,3 +930,94 @@ def test_list_ownership_transfers_role_scoped(membership_context: _MembershipCon
         "/api/v1/ownership/transfers", headers=_headers(ctx.member_a.token)
     )
     assert transfer_id not in {t["id"] for t in uninvolved_view.json()["transfers"]}
+
+
+def test_remove_member_and_lazy_expiry_do_not_deadlock(
+    membership_context: _MembershipContext,
+) -> None:
+    """Removal locks the member's live delegations in `id` order. Listing
+    delegations lazily expires the caller's overdue proposed ones in one bulk
+    UPDATE; unless that also locks in `id` order it scans in physical order,
+    and two overdue delegations stored in the reverse of their `id` order
+    deadlocked the two.
+
+    The larger-id delegation is stored first. The holder locks it; the
+    listing queues on it first, then the removal (which by then holds the
+    smaller-id one). On release both must finish."""
+    ctx = membership_context
+    now = datetime.now(UTC)
+    _seed_race_workflow(ctx, now)
+    run_id = _seed_run(ctx, created_by=ctx.owner.user_id, visibility="workspace", now=now)
+    low, high = sorted([uuid4(), uuid4()])
+    overdue = now - timedelta(hours=1)
+    for delegation_id in (high, low):  # physical order: high first
+        _seed_delegation(
+            ctx,
+            status="proposed",
+            evidence=[run_id],
+            now=now,
+            due_at=overdue,
+            delegation_id=delegation_id,
+        )
+
+    results = _race_two(
+        lock_delegation_id=high,
+        first=(
+            "listing",
+            lambda: ctx.member_b.client.get(
+                "/api/v1/delegations", headers=_headers(ctx.member_b.token)
+            ),
+        ),
+        second=_remove_member_b(ctx),
+    )
+
+    assert results["listing"].status_code == 200, results["listing"].text
+    assert results["removal"].status_code == 200, results["removal"].text
+    with engine.connect() as connection:
+        statuses = set(
+            connection.execute(
+                text("SELECT status FROM delegations WHERE id = ANY(:ids)"),
+                {"ids": [low, high]},
+            ).scalars()
+        )
+    # Expired by the listing (it got the rows first), never left proposed.
+    assert statuses == {"expired"}
+
+
+def test_concurrent_accepts_of_shared_evidence_do_not_deadlock(
+    membership_context: _MembershipContext,
+) -> None:
+    """Two delegations naming the same two private runs, in opposite
+    orders, accepted at once. Each accept locks its delegation, then its
+    evidence rows to share them; unless both lock the evidence in one
+    canonical order they deadlock.
+
+    The holder locks the smaller-id run; the first accept (evidence listed
+    small-then-large) queues on it; the second (large-then-small) queues
+    behind. On release both must be accepted."""
+    ctx = membership_context
+    now = datetime.now(UTC)
+    _seed_race_workflow(ctx, now)
+    runs = sorted(
+        _seed_run(ctx, created_by=ctx.owner.user_id, visibility="private", now=now)
+        for _ in range(2)
+    )
+    to_a = _seed_delegation(ctx, status="proposed", evidence=runs, now=now, recipient=ctx.member_a)
+    to_b = _seed_delegation(
+        ctx, status="proposed", evidence=list(reversed(runs)), now=now, recipient=ctx.member_b
+    )
+
+    def accept(actor: _Actor, delegation_id: UUID) -> Any:
+        return actor.client.post(
+            f"/api/v1/delegations/{delegation_id}/accept",
+            headers=_headers(actor.token, key=str(uuid4())),
+        )
+
+    results = _race_two(
+        lock_run_id=runs[0],
+        first=("accept_a", lambda: accept(ctx.member_a, to_a)),
+        second=("accept_b", lambda: accept(ctx.member_b, to_b)),
+    )
+
+    assert results["accept_a"].status_code == 200, results["accept_a"].text
+    assert results["accept_b"].status_code == 200, results["accept_b"].text

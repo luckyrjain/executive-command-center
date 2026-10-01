@@ -133,9 +133,10 @@ PERSONAL_ROW_PREDICATES: Final[Mapping[str, str]] = MappingProxyType(
 # Share-refused like the personal data set (`is_personal_resource`) and never
 # blocking member removal (`authz._PERSONAL_ROWS_NOT_BLOCKING_REMOVAL`), but
 # deliberately a separate map: the T15 backfill and the T18 audit iterate
-# `PERSONAL_ROW_PREDICATES` with per-table owner rules (the backfill refuses
-# to run when that map names a table outside its `TABLES`), and neither has
-# a rule for derived rows. `personal_derived_row_scope` also stays on the
+# `PERSONAL_ROW_PREDICATES` with per-table owner rules, and derived rows need
+# their own (the backfill's derived-row rule, plan task FX2, reads this map
+# and `email_derived_sources_sql`; it refuses to run when either map names a
+# table outside its `TABLES`). `personal_derived_row_scope` also stays on the
 # personal data set only (a derived row is not a source of derived rows).
 #
 # Provenance is the executed recommendation itself: only
@@ -143,34 +144,41 @@ PERSONAL_ROW_PREDICATES: Final[Mapping[str, str]] = MappingProxyType(
 # email recommendation is redacted in place -- never deleted -- by the
 # Gmail revocation cascade, so no provenance column (and no backfill of
 # one) is needed, and rows confirmed while the flag was off are recognised
-# too. Those flag-off-era rows are still `workspace`-visible until the FX2
-# backfill rule makes them private (plan note N40): with the flag on they are
-# share-refused and no longer block removal, so ECC_PERSONAL_DATA_ISOLATION
-# must not be enabled until that backfill rule has shipped and the backfill
-# has run (rollout runbook). With the flag off (the default) nothing here
+# too. Those flag-off-era rows are still `workspace`-visible until the
+# backfill's derived-row rule (FX2, plan note N40) makes them private: with
+# the flag on they are share-refused and no longer block removal, so run
+# the backfill right after enabling ECC_PERSONAL_DATA_ISOLATION (it requires
+# the flag; rollout runbook). With the flag off (the default) nothing here
 # changes behaviour. `operation = 'create'` matters: a
 # non-create email recommendation records the pre-existing row it changed as
 # `target_id`. The type is a literal, not `:recommendation_type`, so the
 # partial index `ix_recommendations_email_derived_target` is provably usable
 # by generic (prepared) plans as well.
+#
+# `_EMAIL_DERIVED_SOURCE` (the recommendation-side conditions) is shared
+# with `email_derived_sources_sql` below, so the per-row fragment and the
+# per-batch set query cannot drift.
+_EMAIL_DERIVED_SOURCE = (
+    "derived_rec.recommendation_type = 'email_action_detected' "
+    "AND derived_rec.execution_result IS NOT NULL "
+    "AND derived_rec.execution_result ->> 'operation' = 'create' "
+    "AND derived_rec.execution_result ->> 'target_type' = '{target_type}'"
+)
 _EMAIL_DERIVED_TARGET_OF = (
     "EXISTS (SELECT 1 FROM recommendations derived_rec "
     "WHERE derived_rec.workspace_id = {table}.workspace_id "
     "AND (derived_rec.execution_result ->> 'target_id') = {table}.id::text "
-    "AND derived_rec.recommendation_type = 'email_action_detected' "
-    "AND derived_rec.execution_result IS NOT NULL "
-    "AND derived_rec.execution_result ->> 'operation' = 'create' "
-    "AND derived_rec.execution_result ->> 'target_type' = '{target_type}')"
+    "AND " + _EMAIL_DERIVED_SOURCE + ")"
+)
+# Derived table -> the `execution_result ->> 'target_type'` naming its rows.
+EMAIL_DERIVED_TARGET_TYPES: Final[Mapping[str, str]] = MappingProxyType(
+    {"tasks": "task", "commitments": "commitment", "risks": "risk"}
 )
 PERSONAL_DERIVED_PREDICATES: Final[Mapping[str, str]] = MappingProxyType(
     {
         **{
             table: _EMAIL_DERIVED_TARGET_OF.format(table=table, target_type=target_type)
-            for table, target_type in (
-                ("tasks", "task"),
-                ("commitments", "commitment"),
-                ("risks", "risk"),
-            )
+            for table, target_type in EMAIL_DERIVED_TARGET_TYPES.items()
         },
         # Accept/dismiss/defer feedback on an email recommendation, owned by
         # the member who gave it (`actor_id`, migration 0063). Confirming an
@@ -202,6 +210,30 @@ PERSONAL_DERIVED_PREDICATES: Final[Mapping[str, str]] = MappingProxyType(
         ),
     }
 )
+
+
+def email_derived_sources_sql(table: str) -> str:
+    """The recommendations that make rows of `table` (a key of
+    `EMAIL_DERIVED_TARGET_TYPES`) email-derived, as ONE uncorrelated set
+    query instead of the per-row `PERSONAL_DERIVED_PREDICATES[table]`
+    probe: `(recommendation_id, target_id)` for every recommendation
+    satisfying that fragment's recommendation-side conditions whose
+    `target_id` (text) is in `:target_ids`, in `:workspace_id`. Equality /
+    `= ANY` on all four keys of migration 0083's partial index
+    `ix_recommendations_email_derived_target` (the literal type proves it
+    applies), so it is one index scan per call. Used by the T15 backfill to
+    resolve a batch of derived rows' sources. Unknown `table` -> KeyError
+    (never reaches SQL)."""
+    target_type = EMAIL_DERIVED_TARGET_TYPES[table]
+    return (
+        "SELECT derived_rec.id AS recommendation_id, "
+        "derived_rec.execution_result ->> 'target_id' AS target_id "
+        "FROM recommendations derived_rec "
+        "WHERE derived_rec.workspace_id = :workspace_id "
+        "AND (derived_rec.execution_result ->> 'target_id') = ANY(:target_ids) "
+        "AND " + _EMAIL_DERIVED_SOURCE.format(target_type=target_type)
+    )
+
 
 _PERSONAL_PREDICATES: Final[dict[str, str]] = {
     table: f"SELECT EXISTS (SELECT 1 FROM {table} WHERE {table}.id = :id AND ({fragment}))"  # noqa: S608
@@ -749,7 +781,17 @@ def personal_data_share_guard(
 # `require_active_actor=True`, its `ai_runs`/`ai_run_steps` persist
 # (`ai_runtime/runtime._persist_terminal`) and recommendation insert
 # (`governance/recommendation_mutations.create_recommendation`, before its
-# idempotency lock); ownership transfer (`platform/authz_grants`).
+# idempotency lock); ownership transfer (`platform/authz_grants`); and
+# every authorized write transaction in `attention/*` (including
+# `meeting_prep`), through `authz.lock_membership_for_write`, which can
+# also re-check the caller's role under the lock (ADR-0014; other domains adopt
+# it module by module). Meeting-prep enrichment is the one inversion: its
+# session-scoped `held_idempotency_lock` (a different connection) is taken
+# before this lock, which it takes per write transaction so a removal never
+# waits on a model call. A cycle through it needs a same-user, same-key
+# request on the transaction-scoped idempotency lock plus a pending removal,
+# and Postgres cannot detect it across the two connections; the main
+# engine's statement timeout breaks it (a retryable 500, not a hang).
 #
 # FX5 (consent race): every Gmail write transaction above additionally
 # re-checks the mailbox owner's `email` consent under row locks, as its

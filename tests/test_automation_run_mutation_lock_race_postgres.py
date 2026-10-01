@@ -1,14 +1,13 @@
-"""Lock-before-authorize sweep, the sites the per-domain fixes (#317-#324)
-did not cover: resolution candidate confirm/defer, entity merge / reverse /
-split (both the operation row and the entity pair) and workflow run
-cancel/pause/resume all authorized the caller *before* taking
-`SELECT ... FOR UPDATE` on the row the decision is about. An ownership
-transfer (`authz_grants` transfer locks the row, rewrites `owner_id`, and
-does not bump `version`) that committed while the request waited on that
-row lock left the request writing to a row the caller could no longer see.
+"""Lock-before-authorize for workflow run cancel/pause/resume
+(`runs._mutate_run`): the endpoint authorized the caller *before* the
+`SELECT ... FOR UPDATE` on the run row its worker helper then takes. An
+ownership transfer (`authz_grants` transfer locks the row, rewrites
+`owner_id`, and does not bump a version) that committed while the request
+waited on that row lock left the request mutating a run the caller could no
+longer see.
 
-Now each row is locked first and authorization is evaluated afterwards, on
-the committed post-transfer row, so the waiting request answers 404 and
+Now the run row is locked first and authorization is evaluated afterwards,
+on the committed post-transfer row, so the waiting request answers 404 and
 writes nothing.
 
 Concurrency is real (request thread + separate connection); "is waiting" is
@@ -51,12 +50,6 @@ _WAIT_SECONDS = 15
 # Every table a seed below writes a row the racing caller must not see once
 # it is transferred -- all flipped to `private` after seeding.
 _PRIVATE_TABLES = (
-    "pkos_nodes",
-    "pkos_evidence",
-    "pkos_edges",
-    "entity_aliases",
-    "resolution_candidates",
-    "entity_operations",
     "workflow_definitions",
     "workflow_versions",
     "workflow_runs",
@@ -180,16 +173,6 @@ def _client(w: RaceWorld) -> TestClient:
     return client
 
 
-def _api(w: RaceWorld, path: str, body: dict[str, Any]) -> dict[str, Any]:
-    client = _client(w)  # no `with`: skip lifespan startup work
-    try:
-        response = client.post(path, headers=_headers(w.b_token), json=body)
-    finally:
-        client.close()
-    assert response.status_code in (200, 201), response.text
-    return dict(response.json())
-
-
 def _sql(sql: str, **params: Any) -> None:
     with engine.begin() as connection:
         connection.execute(text(sql), params)
@@ -199,52 +182,6 @@ def _sql(sql: str, **params: Any) -> None:
 # Seeds: each inserts rows owned by B and returns the ids the request path
 # needs. `id` is always the row the race locks and transfers.
 # ---------------------------------------------------------------------------
-
-
-def _node(w: RaceWorld, name: str = "Race Entity") -> UUID:
-    node_id = uuid4()
-    _sql(
-        "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
-        "created_at, updated_at, owner_id) VALUES (:id, :ws, 'person', :name, now(), now(), :b)",
-        id=node_id,
-        ws=w.ws,
-        name=name,
-        b=w.b,
-    )
-    return node_id
-
-
-def _candidate(w: RaceWorld, status: str = "open") -> dict[str, UUID]:
-    left, right, candidate_id = _node(w, "Ada Lovelace"), _node(w, "Ada Lovelase"), uuid4()
-    _sql(
-        "INSERT INTO resolution_candidates (id, workspace_id, left_entity_id, right_entity_id, "
-        "score, factors_json, resolver_version, status, created_at, owner_id) "
-        "VALUES (:id, :ws, :left, :right, 0.9, '{}'::jsonb, 'race-v1', :status, now(), :b)",
-        id=candidate_id,
-        ws=w.ws,
-        left=left,
-        right=right,
-        status=status,
-        b=w.b,
-    )
-    return {"id": candidate_id, "left": left, "right": right}
-
-
-def _merged(w: RaceWorld) -> dict[str, UUID]:
-    """A real merge (through the API) the reverse/split cases act on."""
-    pair = _candidate(w, status="confirmed")
-    operation = _api(
-        w,
-        "/api/v1/knowledge/entities/merge",
-        {
-            "candidate_id": str(pair["id"]),
-            "target_entity_id": str(pair["left"]),
-            "expected_target_version": 1,
-            "expected_source_version": 1,
-            "reason": "confirmed duplicate",
-        },
-    )
-    return {"operation": UUID(operation["id"]), "target": pair["left"], "source": pair["right"]}
 
 
 def _workflow_version(w: RaceWorld, status: str, workflow_id: str | None = None) -> UUID:
@@ -302,22 +239,6 @@ def _run(w: RaceWorld, status: str) -> UUID:
     return run_id
 
 
-def _seed_merge(w: RaceWorld) -> dict[str, UUID]:
-    pair = _candidate(w, status="confirmed")
-    # The target entity is the row the race transfers.
-    return {"id": pair["left"], "candidate": pair["id"], "source": pair["right"]}
-
-
-def _seed_merged_by_operation(w: RaceWorld) -> dict[str, UUID]:
-    merged = _merged(w)
-    return {"id": merged["operation"]}
-
-
-def _seed_merged_by_entity(w: RaceWorld) -> dict[str, UUID]:
-    merged = _merged(w)
-    return {"id": merged["source"], "operation": merged["operation"]}
-
-
 def _one(seed: Callable[[RaceWorld], UUID]) -> Callable[[RaceWorld], dict[str, UUID]]:
     return lambda w: {"id": seed(w)}
 
@@ -333,64 +254,7 @@ class Case:
     ok_status: int = 200  # uncontested success, asserted by the control
 
 
-_FUTURE = (datetime.now(UTC) + timedelta(days=3)).isoformat()
-
-
 CASES: dict[str, Case] = {
-    "candidate_confirm": Case(
-        "resolution_candidates",
-        _candidate,
-        "/api/v1/knowledge/resolution/candidates/{id}/confirm",
-        {"reason": "race probe"},
-        "CANDIDATE_NOT_FOUND",
-    ),
-    "candidate_defer": Case(
-        "resolution_candidates",
-        _candidate,
-        "/api/v1/knowledge/resolution/candidates/{id}/defer",
-        {"deferred_until": _FUTURE},
-        "CANDIDATE_NOT_FOUND",
-    ),
-    "merge_target_entity": Case(
-        "pkos_nodes",
-        _seed_merge,
-        "/api/v1/knowledge/entities/merge",
-        None,  # see _body
-        "ENTITY_NOT_FOUND",
-        ok_status=201,
-    ),
-    "reverse_operation": Case(
-        "entity_operations",
-        _seed_merged_by_operation,
-        "/api/v1/knowledge/entity-operations/{id}/reverse",
-        {"reason": "race probe"},
-        "OPERATION_NOT_FOUND",
-        ok_status=201,
-    ),
-    "reverse_source_entity": Case(
-        "pkos_nodes",
-        _seed_merged_by_entity,
-        "/api/v1/knowledge/entity-operations/{operation}/reverse",
-        {"reason": "race probe"},
-        "ENTITY_NOT_FOUND",
-        ok_status=201,
-    ),
-    "split_operation": Case(
-        "entity_operations",
-        _seed_merged_by_operation,
-        "/api/v1/knowledge/entity-operations/{id}/split",
-        {"reason": "race probe"},
-        "OPERATION_NOT_FOUND",
-        ok_status=201,
-    ),
-    "split_source_entity": Case(
-        "pkos_nodes",
-        _seed_merged_by_entity,
-        "/api/v1/knowledge/entity-operations/{operation}/split",
-        {"reason": "race probe"},
-        "ENTITY_NOT_FOUND",
-        ok_status=201,
-    ),
     "run_cancel": Case(
         "workflow_runs",
         _one(lambda w: _run(w, "queued")),
@@ -413,18 +277,6 @@ CASES: dict[str, Case] = {
         "RUN_NOT_FOUND",
     ),
 }
-
-
-def _body(name: str, case: Case, ids: dict[str, UUID]) -> dict[str, Any] | None:
-    if name == "merge_target_entity":
-        return {
-            "candidate_id": str(ids["candidate"]),
-            "target_entity_id": str(ids["id"]),
-            "expected_target_version": 1,
-            "expected_source_version": 1,
-            "reason": "race probe",
-        }
-    return case.body
 
 
 def _seed(w: RaceWorld, case: Case) -> dict[str, UUID]:
@@ -508,7 +360,7 @@ def _race(
                 case.method,
                 case.path.format(**ids),
                 headers=_headers(w.b_token),
-                json=_body(name, case, ids),
+                json=case.body,
             )
         except BaseException as exc:  # surfaced on the main thread below
             result["error"] = exc

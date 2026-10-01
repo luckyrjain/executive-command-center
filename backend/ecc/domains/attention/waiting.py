@@ -248,6 +248,7 @@ def create_waiting_link(
     now = datetime.now(UTC)
     link_id = uuid4()
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="write")
         idempotency.lock_idempotency(session, auth, idempotency_key)
         cached = idempotency.load_cached(
             session,
@@ -462,6 +463,7 @@ def patch_waiting_link(
     request_hash = idempotency.request_hash(payload, f"patch:{link_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         idempotency.lock_idempotency(session, auth, idempotency_key)
         cached = idempotency.load_cached(
             session,
@@ -646,6 +648,7 @@ def _terminate(
 ) -> WaitingLink:
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
