@@ -47,6 +47,7 @@ from gmail_sync_fixtures import (
     gmail_sync_harness,
 )
 from identity_fixtures import create_identity
+from lock_race_support import holder_backend_pid
 from sqlalchemy import event, text
 from sqlalchemy.exc import OperationalError
 
@@ -236,18 +237,23 @@ def _in_thread(call: Callable[[], httpx.Response]) -> _Call:
     return _Call(thread=thread, result=result)
 
 
-def _lock_waiters(query_pattern: str) -> int:
-    """Backends of this database blocked on a row lock (`transactionid` /
-    `tuple` wait) whose current statement matches `query_pattern`."""
+def _lock_waiters(query_pattern: str, *, holder_pid: int) -> int:
+    """Backends of this database blocked *by `holder_pid`*
+    (`pg_blocking_pids`) on a row lock (`transactionid` / `tuple` wait)
+    whose current statement matches `query_pattern`. Scoped to the holder so
+    an unrelated waiter (another test sharing the database) cannot satisfy
+    the wait."""
     with engine.connect() as probe:
         return int(
             probe.execute(
                 text(
                     "SELECT count(*) FROM pg_stat_activity "
                     "WHERE datname = current_database() AND wait_event_type = 'Lock' "
-                    "AND wait_event IN ('transactionid', 'tuple') AND query ~* :pattern"
+                    "AND wait_event IN ('transactionid', 'tuple') "
+                    "AND pg_blocking_pids(pid) @> ARRAY[CAST(:holder AS integer)] "
+                    "AND query ~* :pattern"
                 ),
-                {"pattern": query_pattern},
+                {"holder": holder_pid, "pattern": query_pattern},
             ).scalar_one()
         )
 
@@ -680,10 +686,12 @@ def test_cascade_waits_for_an_in_flight_message_write_then_purges_it(
     connector = world.connect(world.c, "c")
     entered, release = threading.Event(), threading.Event()
     original = gmail_adapter_module._insert_message_if_new
+    writer_pid: list[int] = []  # the paused write transaction's backend
 
     def paused_insert(*args: Any, **kwargs: Any) -> Any:
         inserted = original(*args, **kwargs)
         if not entered.is_set():
+            writer_pid.append(holder_backend_pid(args[0].connection()))
             entered.set()
             release.wait(timeout=_WAIT_SECONDS)
         return inserted
@@ -695,7 +703,7 @@ def test_cascade_waits_for_an_in_flight_message_write_then_purges_it(
             assert entered.wait(timeout=_WAIT_SECONDS), "sync never reached its message write"
             disable = _in_thread(lambda: world.disable_email(world.c))
             _wait_until(
-                lambda: _lock_waiters(_CASCADE_LOCK) > 0,
+                lambda: _lock_waiters(_CASCADE_LOCK, holder_pid=writer_pid[0]) > 0,
                 disable,
                 "the cascade waits on the connector row lock",
             )
@@ -733,17 +741,23 @@ def test_writer_blocked_by_an_in_flight_cascade_sees_the_withdrawal(world: Conse
     connector = world.connect(world.c, "c")
     locked, release = threading.Event(), threading.Event()
     original_lock = gmail_revocation_module._lock_owner_gmail_connectors
+    cascade_pid: list[int] = []  # the paused cascade's backend
     disabled: dict[str, _Call] = {}
     original_resolve = gmail_adapter_module.resolve_or_create_person
 
     def paused_lock(*args: Any, **kwargs: Any) -> Any:
         rows = original_lock(*args, **kwargs)
+        cascade_pid.append(holder_backend_pid(args[0].connection()))
         locked.set()
         release.wait(timeout=_WAIT_SECONDS)
         return rows
 
     def release_when_writer_waits() -> None:
-        _wait_until(lambda: _lock_waiters(_WRITER_LOCK) > 0, None, "the writer waits")
+        _wait_until(
+            lambda: _lock_waiters(_WRITER_LOCK, holder_pid=cascade_pid[0]) > 0,
+            None,
+            "the writer waits",
+        )
         release.set()
 
     def start_disable_then_resolve(**kwargs: Any) -> UUID:
@@ -1089,9 +1103,11 @@ def test_confirm_in_flight_serializes_with_the_cascade_and_ends_redacted(
     rec_id, version = _pending_email_recommendation(world)
     entered, release = threading.Event(), threading.Event()
     original = recommendation_mutations_module.execute_target
+    confirm_pid: list[int] = []  # the paused confirm transaction's backend
 
     def paused_execute(*args: Any, **kwargs: Any) -> Any:
         result = original(*args, **kwargs)
+        confirm_pid.append(holder_backend_pid(args[0].connection()))
         entered.set()
         release.wait(timeout=_WAIT_SECONDS)
         return result
@@ -1103,7 +1119,10 @@ def test_confirm_in_flight_serializes_with_the_cascade_and_ends_redacted(
             assert entered.wait(timeout=_WAIT_SECONDS), "confirm never reached execute_target"
             disable = _in_thread(lambda: world.disable_email(world.c))
             _wait_until(
-                lambda: _lock_waiters(r"FROM personal_domains.*FOR UPDATE") > 0,
+                lambda: _lock_waiters(
+                    r"FROM personal_domains.*FOR UPDATE", holder_pid=confirm_pid[0]
+                )
+                > 0,
                 disable,
                 "the disable waits on the email domain row",
             )
@@ -1151,6 +1170,7 @@ def test_cascade_redacts_a_row_confirmed_while_its_delete_waited(world: ConsentW
     rec_id, _version = _pending_email_recommendation(world)
     with engine.connect() as holder:
         with holder.begin():
+            holder_pid = holder_backend_pid(holder)
             holder.execute(
                 text("SELECT id FROM recommendations WHERE id = :id FOR UPDATE"), {"id": rec_id}
             )
@@ -1160,7 +1180,7 @@ def test_cascade_redacts_a_row_confirmed_while_its_delete_waited(world: ConsentW
             )
             disable = _in_thread(lambda: world.disable_email(world.c))
             _wait_until(
-                lambda: _lock_waiters(r"DELETE FROM recommendations") > 0,
+                lambda: _lock_waiters(r"DELETE FROM recommendations", holder_pid=holder_pid) > 0,
                 disable,
                 "the cascade's recommendation DELETE waits on the row",
             )
@@ -1189,10 +1209,12 @@ def test_writer_cascade_and_removal_together_do_not_deadlock(world: ConsentWorld
     connector = world.connect(world.c, "c")
     entered, release = threading.Event(), threading.Event()
     original = gmail_adapter_module._insert_message_if_new
+    writer_pid: list[int] = []  # the paused write transaction's backend
 
     def paused_insert(*args: Any, **kwargs: Any) -> Any:
         inserted = original(*args, **kwargs)
         if not entered.is_set():
+            writer_pid.append(holder_backend_pid(args[0].connection()))
             entered.set()
             release.wait(timeout=_WAIT_SECONDS)
         return inserted
@@ -1203,7 +1225,11 @@ def test_writer_cascade_and_removal_together_do_not_deadlock(world: ConsentWorld
         try:
             assert entered.wait(timeout=_WAIT_SECONDS), "sync never reached its message write"
             disable = _in_thread(lambda: world.disable_email(world.c))
-            _wait_until(lambda: _lock_waiters(_CASCADE_LOCK) > 0, disable, "cascade waits")
+            _wait_until(
+                lambda: _lock_waiters(_CASCADE_LOCK, holder_pid=writer_pid[0]) > 0,
+                disable,
+                "cascade waits",
+            )
             removal = _in_thread(lambda: world.remove(actor=world.a, target=world.c))
             _wait_until(lambda: _membership_lock_waiters(world.ws) > 0, removal, "removal waits")
         finally:
