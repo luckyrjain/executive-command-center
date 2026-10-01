@@ -3443,7 +3443,10 @@ def cancel_runs_for_removed_member(session: Session, *, workspace_id: UUID, user
         session.execute(
             text(
                 "SELECT id FROM workflow_runs WHERE workspace_id = :workspace_id "
-                "AND created_by = :users_id AND NOT (status = ANY(:terminal_statuses))"
+                "AND created_by = :users_id AND NOT (status = ANY(:terminal_statuses)) "
+                # `cancel_run` locks each row in turn: `id` order, the same
+                # order `kill_switches` parks runs in, or the two deadlock.
+                "ORDER BY id"
             ),
             {
                 "workspace_id": workspace_id,
