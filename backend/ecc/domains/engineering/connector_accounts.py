@@ -2294,7 +2294,8 @@ def _connector_read_refused_unlocked(
     lock, and so without queueing behind (and timing) a sync that holds the
     row. It runs right after the membership lock (ADR-0014: that lock comes
     first in every engineering write transaction), which is workspace-wide
-    and shared: it waits only on a member removal, never on another writer.
+    and shared: it waits only on a pending member removal (and so,
+    transitively, on the writers that removal waits for), never on this row.
     `True` means refuse with that 404.
 
     `_locked_connector_denial` still decides on the locked row: anything may
@@ -3362,7 +3363,8 @@ def _assign_team[ResponseT: _TeamAssignedResponse](
         # a nonexistent id) gets its 404 before taking the idempotency or
         # row lock, so never queues behind -- or times -- a writer holding
         # the row. (The membership lock above is workspace-wide and shared;
-        # it waits only on a member removal, never on another writer.) The
+        # it waits only on a pending member removal -- and so, transitively,
+        # on the writers that removal waits for -- never on this row.) The
         # read/write checks after the row lock below still decide.
         if not authz.authorize(
             session, auth, resource_type=table, resource_id=entity_id, action="read"
