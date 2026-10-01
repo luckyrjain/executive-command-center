@@ -51,6 +51,7 @@ import pytest
 from identity_fixtures import create_identity
 from membership_lock_race_support import membership_waiters
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
 from ecc.auth import AuthContext
 from ecc.config import get_settings
@@ -998,3 +999,67 @@ def test_scheduled_fire_waits_on_membership_lock_and_rechecks_the_creator(
     else:
         assert [type(o) for o in mine] == [automation_scheduler.TriggerFired]
         assert runs == 1
+
+
+def test_fire_transaction_db_error_defers_the_trigger_without_stopping_the_tick(
+    scheduler_test_context: tuple[UUID, UUID], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fire transaction that fails with an `OperationalError` (e.g. its
+    membership-lock wait hitting the statement timeout behind a long
+    removal) rolls back whole and is reported as `TriggerFireDeferred`:
+    no run, anchor unchanged, and the tick still fires the next due trigger
+    instead of raising. The next tick fires the deferred occurrence."""
+    workspace_id, user_id = scheduler_test_context
+    workflow_id = f"test.sched-deferred.{uuid4().hex}"
+    _publish_workflow(workspace_id, user_id, workflow_id)
+    triggers = [
+        _create_schedule_trigger(
+            workspace_id, user_id, workflow_id, schedule_expression="0 * * * *", timezone="UTC"
+        )
+        for _ in range(2)
+    ]
+    for trigger in triggers:
+        _set_created_at(trigger.id, datetime(2026, 3, 1, 0, 0, tzinfo=UTC))
+    tick_now = datetime(2026, 3, 1, 1, 30, tzinfo=UTC)
+    original = automation_scheduler.lock_membership_shared
+    failed: list[bool] = []
+
+    def time_out_once(session: Any, ws: UUID) -> None:
+        if ws == workspace_id and not failed:
+            failed.append(True)
+            raise OperationalError("SELECT pg_advisory_xact_lock_shared", {}, Exception("timeout"))
+        original(session, ws)
+
+    monkeypatch.setattr(automation_scheduler, "lock_membership_shared", time_out_once)
+    outcomes = automation_scheduler.run_scheduler_once(SessionFactory, now=tick_now)
+    mine = {
+        o.trigger_id: type(o)
+        for o in outcomes
+        if getattr(o, "trigger_id", None) in {t.id for t in triggers}
+    }
+    assert sorted(mine.values(), key=lambda t: t.__name__) == [
+        automation_scheduler.TriggerFireDeferred,
+        automation_scheduler.TriggerFired,
+    ]
+    deferred = next(
+        t for t, kind in mine.items() if kind is automation_scheduler.TriggerFireDeferred
+    )
+    with engine.connect() as connection:
+        assert (
+            connection.execute(
+                text("SELECT last_fired_at FROM triggers WHERE id = :id"), {"id": deferred}
+            ).scalar_one()
+            is None
+        )
+        assert (
+            connection.execute(
+                text("SELECT count(*) FROM workflow_runs WHERE trigger_ref = :ref"),
+                {"ref": f"schedule:{deferred}"},
+            ).scalar_one()
+            == 0
+        )
+
+    retry = automation_scheduler.run_scheduler_once(SessionFactory, now=tick_now)
+    assert [type(o) for o in retry if getattr(o, "trigger_id", None) == deferred] == [
+        automation_scheduler.TriggerFired
+    ]

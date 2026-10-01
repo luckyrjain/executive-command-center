@@ -188,6 +188,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from ecc.observability import record_schedule_lag
@@ -333,6 +334,21 @@ class TriggerRaceLost:
     trigger_id: UUID
 
 
+@dataclass(frozen=True, slots=True)
+class TriggerFireDeferred:
+    """This trigger was due, but its fire transaction failed with a database
+    `OperationalError` -- most likely its shared membership-lock wait hit
+    the statement timeout behind a long member removal (ADR-0014), or the
+    connection dropped. The transaction rolled back whole: no run was
+    enqueued and the anchor did not advance, so the next tick fires this
+    occurrence again. Reported instead of raised, so one busy workspace
+    neither skips the rest of the tick's triggers nor stops the worker.
+    """
+
+    trigger_id: UUID
+    workspace_id: UUID
+
+
 TriggerEvaluationOutcome = (
     TriggerNotDue
     | TriggerFired
@@ -342,6 +358,7 @@ TriggerEvaluationOutcome = (
     | TriggerFireFailedRateLimited
     | TriggerMisfireSkipped
     | TriggerRaceLost
+    | TriggerFireDeferred
 )
 
 
@@ -511,36 +528,44 @@ def run_scheduler_once(
         # Both writes still land in the same transaction/commit as before
         # when this instance does win, preserving the original durability
         # guarantee (module docstring's durability section).
-        with session_factory() as session:
-            # Shared membership lock FIRST (ADR-0014; before the trigger row
-            # lock below), so `enqueue_run`'s check that the trigger's
-            # creator is still an active member cannot be overtaken: a
-            # removal that already committed is seen there, and one that
-            # starts later waits for this commit and then cancels the queued
-            # run (`cancel_runs_for_removed_member`). Without it, a removal
-            # committing between that check and this commit would leave a
-            # run queued for a removed member that nothing cancels.
-            lock_membership_shared(session, trigger.workspace_id)
-            won_race = triggers_module.mark_trigger_fired(
-                session,
-                trigger.workspace_id,
-                trigger.id,
-                decision.new_anchor,
-                expected_last_fired_at=trigger.last_fired_at,
-            )
-            if not won_race:
-                session.commit()
-                outcomes.append(TriggerRaceLost(trigger_id=trigger.id))
-                continue
+        try:
+            with session_factory() as session:
+                # Shared membership lock FIRST (ADR-0014; before the trigger row
+                # lock below), so `enqueue_run`'s check that the trigger's
+                # creator is still an active member cannot be overtaken: a
+                # removal that already committed is seen there, and one that
+                # starts later waits for this commit and then cancels the queued
+                # run (`cancel_runs_for_removed_member`). Without it, a removal
+                # committing between that check and this commit would leave a
+                # run queued for a removed member that nothing cancels.
+                lock_membership_shared(session, trigger.workspace_id)
+                won_race = triggers_module.mark_trigger_fired(
+                    session,
+                    trigger.workspace_id,
+                    trigger.id,
+                    decision.new_anchor,
+                    expected_last_fired_at=trigger.last_fired_at,
+                )
+                if not won_race:
+                    session.commit()
+                    outcomes.append(TriggerRaceLost(trigger_id=trigger.id))
+                    continue
 
-            run = worker_module.enqueue_run(
-                session,
-                trigger.workspace_id,
-                trigger.created_by,
-                workflow_id=trigger.workflow_id,
-                trigger_ref=f"schedule:{trigger.id}",
+                run = worker_module.enqueue_run(
+                    session,
+                    trigger.workspace_id,
+                    trigger.created_by,
+                    workflow_id=trigger.workflow_id,
+                    trigger_ref=f"schedule:{trigger.id}",
+                )
+                session.commit()
+        except OperationalError:
+            # The fire transaction rolled back (see `TriggerFireDeferred`);
+            # retry this occurrence on the next tick.
+            outcomes.append(
+                TriggerFireDeferred(trigger_id=trigger.id, workspace_id=trigger.workspace_id)
             )
-            session.commit()
+            continue
 
         # Task 6 observability: schedule lag -- how late this tick actually
         # fired relative to the occurrence it resolves, regardless of
