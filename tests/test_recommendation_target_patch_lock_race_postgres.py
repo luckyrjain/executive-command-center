@@ -52,7 +52,7 @@ def world(monkeypatch: pytest.MonkeyPatch) -> Iterator[RaceWorld]:
         yield w
 
 
-def _wait_for_update_or_lock(table: str) -> None:
+def _wait_for_update_or_lock(table: str, *, holder_pid: int) -> None:
     deadline = time.monotonic() + lock_race_support.WAIT_SECONDS
     while True:
         with engine.connect() as probe:
@@ -61,9 +61,14 @@ def _wait_for_update_or_lock(table: str) -> None:
                     "SELECT count(*) FROM pg_stat_activity "
                     "WHERE datname = current_database() AND wait_event_type = 'Lock' "
                     "AND wait_event IN ('transactionid', 'tuple') "
+                    "AND pg_blocking_pids(pid) @> ARRAY[CAST(:holder AS integer)] "
                     "AND (query ~* :lock OR query ~* :update)"
                 ),
-                {"lock": f"FROM {table}\\s.*FOR UPDATE", "update": f"UPDATE {table}\\s"},
+                {
+                    "holder": holder_pid,
+                    "lock": f"FROM {table}\\s.*FOR UPDATE",
+                    "update": f"UPDATE {table}\\s",
+                },
             ).scalar_one()
         if waiting >= 1:
             return

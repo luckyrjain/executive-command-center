@@ -9,8 +9,9 @@ can no longer see.
 
 `race()` reproduces that interleaving for real: a separate connection locks
 the row (optionally rewriting `owner_id` to C), the request is fired on a
-thread, the harness waits until `pg_stat_activity` shows the request blocked
-on a row lock, then commits. Fixed code locks first and authorizes against
+thread, the harness waits until `pg_blocking_pids` shows the request blocked
+on a row lock held by that connection (not on some unrelated backend's
+lock), then commits. Fixed code locks first and authorizes against
 the committed post-transfer row, so the request answers 404 and writes
 nothing.
 """
@@ -129,7 +130,12 @@ def headers(token: str) -> dict[str, str]:
     }
 
 
-def lock_waiters(table: str) -> int:
+def lock_waiters(table: str, *, holder_pid: int) -> int:
+    """Backends blocked *by `holder_pid`* (`pg_blocking_pids`) on a row
+    lock, in a locking read of `table`. Scoping to the holder means a
+    concurrent backend waiting on some other lock -- another test sharing
+    the database, an unrelated row of the same table -- cannot satisfy the
+    wait and let the holder commit before the request under test queues."""
     with engine.connect() as probe:
         return int(
             probe.execute(
@@ -137,16 +143,21 @@ def lock_waiters(table: str) -> int:
                     "SELECT count(*) FROM pg_stat_activity "
                     "WHERE datname = current_database() AND wait_event_type = 'Lock' "
                     "AND wait_event IN ('transactionid', 'tuple') "
+                    "AND pg_blocking_pids(pid) @> ARRAY[CAST(:holder AS integer)] "
                     "AND query ~* :pattern"
                 ),
-                {"pattern": f"FROM {table}\\s.*FOR (NO KEY )?UPDATE"},
+                {"holder": holder_pid, "pattern": f"FROM {table}\\s.*FOR (NO KEY )?UPDATE"},
             ).scalar_one()
         )
 
 
-def wait_for_lock_waiter(table: str) -> None:
+def holder_backend_pid(connection: Connection) -> int:
+    return int(connection.execute(text("SELECT pg_backend_pid()")).scalar_one())
+
+
+def wait_for_lock_waiter(table: str, *, holder_pid: int) -> None:
     deadline = time.monotonic() + WAIT_SECONDS
-    while lock_waiters(table) < 1:
+    while lock_waiters(table, holder_pid=holder_pid) < 1:
         if time.monotonic() > deadline:
             raise AssertionError(f"mutation never blocked on the {table} row lock")
         time.sleep(0.05)
@@ -191,6 +202,7 @@ def race(
         holder_tx = holder.begin()
         thread = threading.Thread(target=fire)
         try:
+            holder_pid = holder_backend_pid(holder)
             holder.execute(
                 text(f"SELECT id FROM {table} WHERE id = :id FOR UPDATE"),  # noqa: S608
                 {"id": row_id},
@@ -202,7 +214,7 @@ def race(
                     {"id": row_id, "c": w.c},
                 )
             thread.start()
-            wait_for_lock_waiter(table)
+            wait_for_lock_waiter(table, holder_pid=holder_pid)
             holder_tx.commit()
         finally:
             if holder_tx.is_active:
