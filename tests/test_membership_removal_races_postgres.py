@@ -746,6 +746,46 @@ def test_detection_recommendation_not_written_after_removal_before_insert(
     assert _count("recommendations", world.ws) == 0
 
 
+def test_detection_recommendation_waits_for_inflight_removal_then_refuses(
+    world: RaceWorld,
+) -> None:
+    """The hook-path race the A-2 test above cannot reach: C's removal is IN
+    FLIGHT (holding the exclusive membership lock, paused mid-transaction)
+    when detection reaches `create_recommendation`. The hook waits on the
+    membership lock; once the removal commits, it refuses and no
+    recommendation is written. This pins the end-to-end behaviour: the
+    hook's FX5 consent re-check (row locks the removal also takes) is a
+    second guard, so it alone does not isolate `create_recommendation`'s
+    own lock -- `test_governance_membership_lock_race_postgres.py` does."""
+    connector = world.connect(world.c, "c")
+    reached, proceed = threading.Event(), threading.Event()
+    original = recommendation_mutations_module.request_hash
+
+    def pause_then_hash(*args: Any, **kwargs: Any) -> Any:
+        if not reached.is_set():
+            reached.set()
+            proceed.wait(timeout=_WAIT_SECONDS)
+        return original(*args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(recommendation_mutations_module, "request_hash", pause_then_hash)
+        sync = _in_thread(lambda: world.sync(world.c, connector))
+        try:
+            assert reached.wait(timeout=_WAIT_SECONDS), "detection never reached the hook"
+            with _removal_paused_in_locked_section(world, actor=world.a, target=world.c) as removal:
+                proceed.set()
+                _wait_for_membership_lock_waiter(world.ws, sync)
+                removal.release.set()
+        finally:
+            proceed.set()
+            sync.join()
+
+    assert removal.call.response.status_code == 200, removal.call.response.text
+    assert sync.response.status_code == 201, sync.response.text
+    assert _count("ai_runs", world.ws, "owner_id = :u", u=world.c) == 1
+    assert _count("recommendations", world.ws) == 0
+
+
 def _message_fetches(world: RaceWorld, fmt: str) -> list[FakeGmailMessage]:
     """C's mailbox messages fetched from the fake Gmail API with
     `format=<fmt>`, in request order."""
