@@ -41,6 +41,7 @@ import pytest
 from fastapi.testclient import TestClient
 from lock_race_support import WAIT_SECONDS, RaceWorld, headers, race_world, row_snapshot
 from sqlalchemy import Connection, text
+from sqlalchemy.exc import OperationalError
 
 from ecc.config import get_settings
 from ecc.database import engine
@@ -90,6 +91,7 @@ def world() -> Iterator[RaceWorld]:
             "retrieval_documents",
             "embedding_projections",
             "pkos_edges",
+            "entity_aliases",
             "pkos_evidence",
             "pkos_nodes",
             "incidents",
@@ -539,3 +541,157 @@ def test_write_waiting_on_lock_without_transfer_still_proceeds(
     assert response.status_code == case.ok_status, response.text
     if name == "delegation_accept":
         assert _side_effect_counts(world.ws)["resource_grants"] == 1
+
+
+def _seed_alias(
+    conn: Connection, w: RaceWorld, now: datetime, node_id: UUID, evidence_id: UUID
+) -> UUID:
+    alias_id = uuid4()
+    conn.execute(
+        text(
+            "INSERT INTO entity_aliases (id, workspace_id, entity_id, alias_type, "
+            "normalized_value, source_id, created_at, updated_at, owner_id, visibility) "
+            "VALUES (:id, :ws, :node, 'email', :value, :ev, :now, :now, :b, 'workspace')"
+        ),
+        {
+            "id": alias_id,
+            "ws": w.ws,
+            "node": node_id,
+            "value": f"race-{alias_id}@example.com",
+            "ev": evidence_id,
+            "now": now,
+            "b": w.b,
+        },
+    )
+    return alias_id
+
+
+def _alias_locked_while_waiting_on_node(
+    w: RaceWorld, *, node_id: UUID, alias_id: UUID, path: str, body: dict[str, Any], token: str
+) -> tuple[bool, httpx.Response]:
+    """Holds `node_id` locked, sends the request (which names the node and
+    `alias_id`), waits until it queues on the node, then reports whether it
+    already holds a lock on the alias -- and its eventual response."""
+    client = TestClient(app)
+    client.cookies.set("ecc_session", token)
+    result: dict[str, Any] = {}
+
+    def fire() -> None:
+        try:
+            result["response"] = client.post(path, headers=headers(token), json=body)
+        except BaseException as exc:  # surfaced on the main thread below
+            result["error"] = exc
+
+    holder = engine.connect()
+    holder_tx = holder.begin()
+    thread = threading.Thread(target=fire)
+    try:
+        holder.execute(text("SELECT id FROM pkos_nodes WHERE id = :id FOR UPDATE"), {"id": node_id})
+        thread.start()
+        deadline = time.monotonic() + WAIT_SECONDS
+        while _lock_waiters("pkos_nodes") < 1:
+            assert thread.is_alive(), "request finished without queueing on the node"
+            assert time.monotonic() < deadline, "request never queued on the node"
+            time.sleep(0.05)
+        with engine.connect() as probe, probe.begin():
+            try:
+                probe.execute(
+                    text("SELECT id FROM entity_aliases WHERE id = :id FOR UPDATE NOWAIT"),
+                    {"id": alias_id},
+                )
+                alias_locked = False
+            except OperationalError as exc:
+                # Only "lock not available" means the request holds it; any
+                # other error (e.g. a statement timeout) is a real failure.
+                if getattr(exc.orig, "sqlstate", None) != "55P03":
+                    raise
+                alias_locked = True
+        holder_tx.commit()
+    finally:
+        if holder_tx.is_active:
+            holder_tx.rollback()
+        holder.close()
+        if thread.ident is not None:
+            thread.join(timeout=WAIT_SECONDS)
+        client.close()
+    assert not thread.is_alive(), "request never finished"
+    if "error" in result:
+        raise result["error"]
+    return alias_locked, result["response"]
+
+
+def _node_and_alias(conn: Connection, w: RaceWorld, now: datetime) -> tuple[UUID, UUID]:
+    node_id = _seed_node(conn, w, now, visibility="workspace")
+    evidence_id = _seed_evidence(conn, w, now, node_id)
+    return node_id, _seed_alias(conn, w, now, node_id, evidence_id)
+
+
+def test_accept_locks_a_node_before_its_alias(world: RaceWorld) -> None:
+    """Member removal locks the removed member's `pkos_nodes`, then updates
+    their `entity_aliases`. An accept naming one of each must take them in
+    that same order, or the two deadlock: while it waits on the node it
+    must not already hold the alias (plain alphabetical order would)."""
+    now = datetime.now(UTC)
+    with engine.begin() as conn:
+        incident_id = _seed_incident(conn, world, now)
+        node_id, alias_id = _node_and_alias(conn, world, now)
+        delegation_id = _seed_delegation(conn, world, now, incident_id)
+        for resource_type, resource_id in (("pkos_nodes", node_id), ("entity_aliases", alias_id)):
+            conn.execute(
+                text(
+                    "INSERT INTO delegation_evidence (id, delegation_id, resource_type, "
+                    "resource_id, created_at) VALUES (:id, :delegation, :type, :rid, :now)"
+                ),
+                {
+                    "id": uuid4(),
+                    "delegation": delegation_id,
+                    "type": resource_type,
+                    "rid": resource_id,
+                    "now": now,
+                },
+            )
+        token = _a_token(conn, world, now)
+
+    alias_locked, response = _alias_locked_while_waiting_on_node(
+        world,
+        node_id=node_id,
+        alias_id=alias_id,
+        path=f"/api/v1/delegations/{delegation_id}/accept",
+        body={},
+        token=token,
+    )
+
+    assert not alias_locked, "accept locked the alias before the node"
+    assert response.status_code == 200, response.text
+
+
+def test_create_locks_a_node_before_its_alias(world: RaceWorld) -> None:
+    """The create-side twin (`FOR SHARE` there, which still conflicts with
+    removal's alias UPDATE)."""
+    now = datetime.now(UTC)
+    with engine.begin() as conn:
+        incident_id = _seed_incident(conn, world, now)
+        node_id, alias_id = _node_and_alias(conn, world, now)
+        recipient = _account_id(conn, world, world.a)
+
+    alias_locked, response = _alias_locked_while_waiting_on_node(
+        world,
+        node_id=node_id,
+        alias_id=alias_id,
+        path="/api/v1/delegations",
+        body={
+            "recipient_account_id": str(recipient),
+            "obligation_type": "incidents",
+            "obligation_resource_id": str(incident_id),
+            "expected_outcome": "Race outcome",
+            "due_at": (now + timedelta(days=1)).isoformat(),
+            "evidence": [
+                {"resource_type": "entity_aliases", "resource_id": str(alias_id)},
+                {"resource_type": "pkos_nodes", "resource_id": str(node_id)},
+            ],
+        },
+        token=world.b_token,
+    )
+
+    assert not alias_locked, "create locked the alias before the node"
+    assert response.status_code == 201, response.text
