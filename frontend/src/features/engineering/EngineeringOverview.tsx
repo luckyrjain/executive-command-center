@@ -2,6 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 
 import { apiRequest } from '../../api/client'
 import { apiErrorMessage } from '../../api/errorMessage'
+import { withoutPersonalProviders } from './personalProviders'
 import type {
   ConnectorAccountListResponse,
   DecisionListResponse,
@@ -54,7 +55,8 @@ export default function EngineeringOverview({ onNavigate }: { onNavigate: (view:
     retry: 1,
   })
 
-  const connectorList = connectors.data?.connectors ?? []
+  // Personal providers (Gmail) never appear in engineering views (Spec A S1.8(e)).
+  const connectorList = withoutPersonalProviders(connectors.data?.connectors ?? [])
   // `disable_connector_endpoint` never deletes a connector_accounts row, it
   // only flips status to 'disconnected' -- such rows persist in `GET
   // /connectors` forever, so they must be excluded from both counts below:

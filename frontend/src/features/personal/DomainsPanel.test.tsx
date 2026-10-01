@@ -111,4 +111,17 @@ describe('DomainsPanel', () => {
     fireEvent.click(within(habitsRow).getByRole('button', { name: 'Enable' }))
     expect(await screen.findByText(/A different request was already recorded/)).toBeTruthy()
   })
+
+  it('shows the generic personal-data 403 copy for INSUFFICIENT_ROLE, never Gmail-connect wording', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      if (String(input).includes('/enable')) return response({ error: { code: 'INSUFFICIENT_ROLE', message: 'Insufficient Role' } }, 403)
+      return response({ domains: [] })
+    }))
+    renderPanel()
+
+    const habitsRow = (await screen.findByText('Habits')).closest('li')!
+    fireEvent.click(within(habitsRow).getByRole('button', { name: 'Enable' }))
+    expect(await screen.findByText('You are not permitted to manage personal data in this workspace.')).toBeTruthy()
+    expect(screen.queryByText(/connecting Gmail/)).toBeNull()
+  })
 })

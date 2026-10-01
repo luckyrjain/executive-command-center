@@ -1,12 +1,19 @@
 import { apiErrorMessage } from '../../api/errorMessage'
 
+/** `RESOURCE_TYPE_NOT_GRANTABLE` (400) covers both a resource type that is
+ * never shareable and a single row in the personal data set (Spec A S1.3,
+ * FX3): the member's personal data and the tasks, commitments and risks
+ * derived from their email. That refusal applies to every caller, the row's
+ * own owner included, on grant, ownership transfer and delegation. */
+const NOT_GRANTABLE_MESSAGE = 'This item can\'t be shared, transferred or delegated. Personal data, and tasks, commitments and risks created from a member\'s email, stay private to that member -- no one can share or transfer them, including their owner.'
+
 /** Mirrors `features/personal/errors.ts`'s own shape -- one mapping
  * function for every error code the `ecc.platform.authz` sharing router
  * can return, rather than repeating a switch per call site.
  */
 export function sharingErrorMessage(error: unknown): string {
   return apiErrorMessage(error, {
-    RESOURCE_TYPE_NOT_GRANTABLE: 'This kind of resource cannot be shared.',
+    RESOURCE_TYPE_NOT_GRANTABLE: NOT_GRANTABLE_MESSAGE,
     RESOURCE_NOT_FOUND: 'That resource does not exist, or you cannot see it.',
     GRANTEE_NOT_FOUND: 'That account is not an active member of this workspace.',
     GRANT_REQUIRES_NARROW_VISIBILITY: 'This resource is visible to the whole workspace today. Preview again and confirm narrowing before sharing.',
@@ -54,7 +61,7 @@ export function collaborationErrorMessage(error: unknown): string {
     RECIPIENT_NOT_FOUND: 'That account is not an active member of this workspace.',
     CANNOT_DELEGATE_TO_SELF: 'You cannot delegate to yourself.',
     DUE_AT_IN_PAST: 'The due date must be in the future.',
-    RESOURCE_TYPE_NOT_GRANTABLE: 'This kind of resource cannot be shared or transferred.',
+    RESOURCE_TYPE_NOT_GRANTABLE: NOT_GRANTABLE_MESSAGE,
     RESOURCE_NOT_FOUND: 'That resource does not exist, or you cannot see it.',
     NOTIFICATION_NOT_FOUND: 'This notification no longer exists.',
     INSUFFICIENT_ROLE: 'You are not permitted to do that.',

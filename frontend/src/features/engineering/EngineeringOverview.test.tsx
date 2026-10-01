@@ -161,6 +161,23 @@ describe('EngineeringOverview', () => {
     expect(await screen.findByText('1 connected. All healthy.')).toBeTruthy()
   })
 
+  it('does not count a Gmail connector as connected or needing attention -- personal providers are not engineering sources', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/connectors')) {
+        return response({
+          connectors: [
+            { id: 'c1', provider: 'github', external_account_id: 'x', display_name: 'Acme', granted_scopes: [], status: 'active', status_detail: null, last_synced_at: null, last_error: null, disconnected_at: null, version: 1, created_at: '2026-07-01T00:00:00Z', updated_at: '2026-07-01T00:00:00Z' },
+            { id: 'g1', provider: 'gmail', external_account_id: 'owner@example.test', display_name: 'owner@example.test', granted_scopes: [], status: 'permission_lost', status_detail: null, last_synced_at: null, last_error: null, disconnected_at: null, version: 1, created_at: '2026-07-01T00:00:00Z', updated_at: '2026-07-01T00:00:00Z' },
+          ],
+        })
+      }
+      return emptyResponseFor(url)
+    }))
+    renderOverview()
+    expect(await screen.findByText('1 connected. All healthy.')).toBeTruthy()
+  })
+
   it('surfaces a connector-list load failure as an alert', async () => {
     vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
       const url = String(input)

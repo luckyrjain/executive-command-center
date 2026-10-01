@@ -595,7 +595,83 @@ describe('ConnectorHealthPanel', () => {
 
     await screen.findByText('Acme GitHub')
     fireEvent.click(screen.getByRole('button', { name: 'Disconnect' }))
-    expect(await screen.findByText('This connector no longer exists in this workspace.')).toBeTruthy()
+    expect(await screen.findByText('This connector no longer exists in this workspace, or you do not have access to it.')).toBeTruthy()
+  })
+
+  it('never lists a Gmail connector -- personal providers live only in the Personal area', async () => {
+    stubFetch(
+      [connector(), connector({ id: 'gmail-1', provider: 'gmail', display_name: 'owner@example.test', external_account_id: 'owner@example.test' })],
+      [{ id: 'run-g', connector_account_id: 'gmail-1', run_type: 'backfill', status: 'failed', items_processed: 0, error_summary: 'gmail run detail', started_at: '2026-07-27T00:00:00Z', completed_at: null }],
+    )
+    renderPanel()
+
+    expect(await screen.findByText('Acme GitHub')).toBeTruthy()
+    expect(screen.queryByText('owner@example.test')).toBeNull()
+    expect(screen.queryByText('gmail run detail')).toBeNull()
+  })
+
+  it('shows the empty state when the only connector is a Gmail one', async () => {
+    stubFetch([connector({ id: 'gmail-1', provider: 'gmail', display_name: 'owner@example.test' })])
+    renderPanel()
+
+    expect(await screen.findByText('No connectors are configured for this workspace yet.')).toBeTruthy()
+    expect(screen.queryByText('owner@example.test')).toBeNull()
+  })
+
+  function stubCreateFailure(code: string, status: number) {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if ((init?.method ?? 'GET').toUpperCase() === 'POST') return response({ error: { code, message: code } }, status)
+      if (String(input).includes('/sync-runs')) return response({ sync_runs: [] })
+      return response({ connectors: [] })
+    }))
+  }
+
+  async function submitGithubCreate() {
+    await screen.findByText('No connectors are configured for this workspace yet.')
+    clickContinue()
+    fireEvent.change(screen.getByLabelText('Personal access token'), { target: { value: 'tok' } })
+    clickContinue()
+    clickConnect()
+  }
+
+  it('words a 404 CONNECTOR_NOT_FOUND on connect as a hidden earlier connection, not "no longer exists" (reconnect refusal)', async () => {
+    stubCreateFailure('CONNECTOR_NOT_FOUND', 404)
+    renderPanel()
+    await submitGithubCreate()
+
+    expect(await screen.findByText(/This account was connected before in this workspace, and you do not have access to that connection/)).toBeTruthy()
+    expect(screen.queryByText(/no longer exists/)).toBeNull()
+  })
+
+  it('words a 403 INSUFFICIENT_ROLE on connect as a permission refusal naming both causes', async () => {
+    stubCreateFailure('INSUFFICIENT_ROLE', 403)
+    renderPanel()
+    await submitGithubCreate()
+
+    expect(await screen.findByText(/You do not have permission to connect this account/)).toBeTruthy()
+    expect(screen.getByText(/this account was connected before by someone else/)).toBeTruthy()
+  })
+
+  it('words a 403 INSUFFICIENT_ROLE on a listed connector\'s sync as a change refusal', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if ((init?.method ?? 'GET').toUpperCase() === 'POST') return response({ error: { code: 'INSUFFICIENT_ROLE', message: 'Insufficient Role' } }, 403)
+      if (url.includes('/sync-runs')) return response({ sync_runs: [] })
+      return response({ connectors: [connector()] })
+    }))
+    renderPanel()
+
+    await screen.findByText('Acme GitHub')
+    fireEvent.click(screen.getByRole('button', { name: 'Start sync' }))
+    expect(await screen.findByText('You do not have permission to change this connector.')).toBeTruthy()
+  })
+
+  it('maps CONNECTOR_ACCOUNT_PERSIST_FAILED on connect to a readable sentence', async () => {
+    stubCreateFailure('CONNECTOR_ACCOUNT_PERSIST_FAILED', 500)
+    renderPanel()
+    await submitGithubCreate()
+
+    expect(await screen.findByText(/could not be saved because of a server error/)).toBeTruthy()
   })
 
   it('splits the create wizard and the connected-accounts list under their own headings', async () => {
