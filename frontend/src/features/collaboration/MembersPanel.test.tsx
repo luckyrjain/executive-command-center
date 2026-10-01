@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import MembersPanel from './MembersPanel'
+import MembersPanel, { MEMBERSHIP_BUSY_RETRY_DELAY_MS } from './MembersPanel'
 import type { Invitation, Member, Workspace } from './types'
 
 function response(body: unknown, status = 200) {
@@ -124,6 +124,94 @@ describe('MembersPanel', () => {
       expect.stringContaining('/members/user-1'),
       expect.objectContaining({ method: 'PATCH' }),
     ))
+  })
+
+  it('retries a role change once after the server reports the membership lock busy', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      let attempts = 0
+      const fetch = stubFetch({
+        members: [member()],
+        onPatch: () => {
+          attempts += 1
+          return attempts === 1
+            ? response({ error: { code: 'MEMBERSHIP_CHANGE_BUSY', message: 'Membership Change Busy' } }, 409)
+            : response(member({ role: 'admin' }))
+        },
+      })
+      renderPanel()
+      await screen.findByText('Ada')
+
+      fireEvent.change(screen.getByLabelText('Role for Ada'), { target: { value: 'admin' } })
+      await waitFor(() => expect(attempts).toBe(1))
+      await vi.advanceTimersByTimeAsync(MEMBERSHIP_BUSY_RETRY_DELAY_MS)
+      await waitFor(() => expect(attempts).toBe(2))
+      expect(fetch.mock.calls.filter(([, init]) => init?.method === 'PATCH')).toHaveLength(2)
+      expect(screen.queryByRole('alert')).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('shows a try-again message when the membership lock stays busy after the retry', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      let attempts = 0
+      stubFetch({
+        members: [member()],
+        onDelete: () => {
+          attempts += 1
+          return response({ error: { code: 'MEMBERSHIP_CHANGE_BUSY', message: 'Membership Change Busy' } }, 409)
+        },
+      })
+      renderPanel()
+      await screen.findByText('Ada')
+
+      fireEvent.click(screen.getByRole('button', { name: 'Remove' }))
+      fireEvent.click(await screen.findByRole('button', { name: 'Confirm removal' }))
+      await waitFor(() => expect(attempts).toBe(1))
+      await vi.advanceTimersByTimeAsync(MEMBERSHIP_BUSY_RETRY_DELAY_MS)
+      expect(await screen.findByText(/busy finishing other changes/)).toBeTruthy()
+      // Exactly one automatic retry, never a loop.
+      await vi.advanceTimersByTimeAsync(MEMBERSHIP_BUSY_RETRY_DELAY_MS * 3)
+      expect(attempts).toBe(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps Cancel disabled while a busy removal waits to retry, since the retry cannot be stopped', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      let attempts = 0
+      stubFetch({
+        members: [member()],
+        onDelete: () => {
+          attempts += 1
+          return attempts === 1
+            ? response({ error: { code: 'MEMBERSHIP_CHANGE_BUSY', message: 'Membership Change Busy' } }, 409)
+            : response({
+              user_id: 'user-1',
+              export: { account_id: 'account-1', email: 'a@example.test', display_name: 'Ada', role: 'member', joined_at: '2026-01-01T00:00:00Z', removed_at: '2026-01-02T00:00:00Z' },
+            })
+        },
+      })
+      renderPanel()
+      await screen.findByText('Ada')
+
+      fireEvent.click(screen.getByRole('button', { name: 'Remove' }))
+      fireEvent.click(await screen.findByRole('button', { name: 'Confirm removal' }))
+      await waitFor(() => expect(attempts).toBe(1))
+      const cancel = screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement
+      expect(cancel.disabled).toBe(true)
+
+      await vi.advanceTimersByTimeAsync(MEMBERSHIP_BUSY_RETRY_DELAY_MS)
+      await waitFor(() => expect(attempts).toBe(2))
+      // The retried removal's outcome reaches the panel (not silently lost).
+      expect(await screen.findByText(/Removed Ada/)).toBeTruthy()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('requires confirmation before removing a member', async () => {
