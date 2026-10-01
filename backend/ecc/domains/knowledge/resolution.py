@@ -711,22 +711,10 @@ def _decide_candidate(
         )
         if cached is not None:
             return cached
-        if not authz.authorize(
-            session,
-            auth,
-            resource_type="resolution_candidates",
-            resource_id=candidate_id,
-            action="read",
-        ):
-            raise HTTPException(status_code=404, detail="CANDIDATE_NOT_FOUND")
-        if not authz.authorize(
-            session,
-            auth,
-            resource_type="resolution_candidates",
-            resource_id=candidate_id,
-            action="write",
-        ):
-            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
         current = (
             session.execute(
                 text(
@@ -744,6 +732,22 @@ def _decide_candidate(
         )
         if current is None:
             raise HTTPException(status_code=404, detail="CANDIDATE_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="resolution_candidates",
+            resource_id=candidate_id,
+            action="read",
+        ):
+            raise HTTPException(status_code=404, detail="CANDIDATE_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="resolution_candidates",
+            resource_id=candidate_id,
+            action="write",
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         # Found in the fourth whole-phase review: re-verify the caller can
         # still read both entities this candidate names, not just once at
         # `create_candidate`'s own proposal time -- see `list_candidates`'
@@ -889,22 +893,10 @@ def defer_candidate(
             return cached
         if payload.deferred_until <= now:
             raise HTTPException(status_code=422, detail="DEFER_UNTIL_MUST_BE_FUTURE")
-        if not authz.authorize(
-            session,
-            auth,
-            resource_type="resolution_candidates",
-            resource_id=candidate_id,
-            action="read",
-        ):
-            raise HTTPException(status_code=404, detail="CANDIDATE_NOT_FOUND")
-        if not authz.authorize(
-            session,
-            auth,
-            resource_type="resolution_candidates",
-            resource_id=candidate_id,
-            action="write",
-        ):
-            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
         current = (
             session.execute(
                 text(
@@ -922,6 +914,22 @@ def defer_candidate(
         )
         if current is None:
             raise HTTPException(status_code=404, detail="CANDIDATE_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="resolution_candidates",
+            resource_id=candidate_id,
+            action="read",
+        ):
+            raise HTTPException(status_code=404, detail="CANDIDATE_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="resolution_candidates",
+            resource_id=candidate_id,
+            action="write",
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         # See `_decide_candidate`'s identical re-check for the full
         # reasoning (fourth whole-phase review).
         for entity_id in (current["left_entity_id"], current["right_entity_id"]):
