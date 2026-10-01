@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.domains.knowledge.embeddings import queue_embedding
+from ecc.domains.knowledge.embeddings import defer_embedding, embed_after_commit
 from ecc.domains.knowledge.entity_lookup import ENTITY_FIELDS as _ENTITY_FIELDS
 from ecc.domains.knowledge.entity_lookup import get_entity_row as _get_row
 from ecc.domains.knowledge.retrieval import queue_retrieval_document
@@ -124,7 +124,7 @@ def create_entity_core(
     now = datetime.now(UTC)
     entity_id = uuid4()
     attributes = {"summary": payload.summary} if payload.summary is not None else {}
-    with session.begin():
+    with embed_after_commit(session), session.begin():
         authz.lock_membership_for_write(session, auth, role_action="write")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
@@ -198,7 +198,7 @@ def create_entity_core(
             1,
             now,
         )
-        queue_embedding(session, auth.workspace_id, entity_id, now)
+        defer_embedding(session, auth.workspace_id, entity_id)
         store_idempotency(
             session,
             auth,
