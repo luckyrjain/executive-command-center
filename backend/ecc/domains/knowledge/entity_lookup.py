@@ -13,7 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext
-from ecc.domains.knowledge.embeddings import queue_embedding
+from ecc.domains.knowledge.embeddings import defer_embedding
 from ecc.domains.knowledge.retrieval import queue_retrieval_document
 
 ENTITY_FIELDS = """
@@ -93,11 +93,13 @@ def refresh_projections(
     """Re-derive an entity's retrieval_document/embedding after a write that
     doesn't go through claims.py's/relationships.py's own mutation
     endpoints (e.g. entity_operations.py's split, which moves data between
-    entities via direct UPDATE)."""
+    entities via direct UPDATE). The embedding is deferred until the
+    caller's transaction commits, so the caller's transaction must be
+    wrapped in `embeddings.embed_after_commit`."""
     fields = entity_retrieval_fields(session, auth, entity_id)
     if fields is not None:
         kind, canonical_name, summary, version = fields
         queue_retrieval_document(
             session, auth.workspace_id, entity_id, kind, canonical_name, summary, version, now
         )
-        queue_embedding(session, auth.workspace_id, entity_id, now)
+        defer_embedding(session, auth.workspace_id, entity_id)
