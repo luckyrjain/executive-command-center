@@ -17,6 +17,7 @@ sequential per-resource-type syncs. See `lock_race_support` for the harness.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -537,16 +538,21 @@ def test_mutation_waiting_on_row_lock_with_unchanged_grant_still_proceeds(
 
 
 def _transfer_on_first_backfill(spy: _SpyAdapter, w: RaceWorld, account_id: UUID) -> None:
-    """Commits an ownership transfer from inside the first resource type's
-    provider call -- phase 2, with no lock held -- the window between one
-    resource type's sync and the next."""
+    """Commits a change that removes the creator's access from inside the
+    first resource type's provider call -- phase 2, with no lock held -- the
+    window between one resource type's sync and the next: the connector is
+    transferred to C and narrowed to `shared_explicitly` (a transfer alone
+    leaves a `workspace` connector writable by any member)."""
     original = spy.backfill
 
     def backfill(*args: Any, **kwargs: Any) -> SyncOutcome:
         if not spy.calls:
             with engine.begin() as connection:
                 connection.execute(
-                    text("UPDATE connector_accounts SET owner_id = :c WHERE id = :id"),
+                    text(
+                        "UPDATE connector_accounts "
+                        "SET owner_id = :c, visibility = 'shared_explicitly' WHERE id = :id"
+                    ),
                     {"c": w.c, "id": account_id},
                 )
         return original(*args, **kwargs)
@@ -569,20 +575,25 @@ def test_auto_backfill_rechecks_authorization_before_each_resource_type(
     world: RaceWorld,
     spies: dict[str, _SpyAdapter],
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     transfer: bool,
 ) -> None:
     """GitHub auto-backfills three resource types one after another. A
-    transfer that commits during the first must stop the other two (each
-    phase 1 re-authorizes the creator on the locked row); without one, all
-    three run (control)."""
+    change that removes the creator's access, committed during the first,
+    must stop the other two (each phase 1 re-authorizes the creator on the
+    locked row); without one, all three run (control). The connector starts
+    `workspace`-visible and owned by its creator, as `create_connector_
+    endpoint` writes it."""
     monkeypatch.setenv(_FLAG, "false")
     get_settings.cache_clear()
     with engine.begin() as connection:
         account_id = _seed_connector(
-            connection, world, datetime.now(UTC), provider="github", visibility="private"
+            connection, world, datetime.now(UTC), provider="github", visibility="workspace"
         )
     if transfer:
         _transfer_on_first_backfill(spies["github"], world, account_id)
+
+    caplog.set_level(logging.INFO, logger=connector_accounts_module.__name__)
 
     connector_accounts_module._run_auto_backfill(
         workspace_id=world.ws,
@@ -596,3 +607,15 @@ def test_auto_backfill_rechecks_authorization_before_each_resource_type(
     expected_runs = 1 if transfer else len(resource_types)
     assert spies["github"].calls == ["backfill"] * expected_runs
     assert _sync_run_count(account_id) == expected_runs
+    # The later types were refused by the re-check, not skipped for some
+    # other reason (sync in progress, inactive membership).
+    skipped = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("auto-backfill skipped")
+    ]
+    assert skipped == [
+        f"auto-backfill skipped provider=github resource_type={resource_type} "
+        f"account_id={account_id} code=CONNECTOR_NOT_FOUND"
+        for resource_type in (resource_types[1:] if transfer else ())
+    ]

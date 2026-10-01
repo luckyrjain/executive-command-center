@@ -2397,10 +2397,10 @@ def _run_auto_backfill(
                 source="system",
                 # Re-authorize the creator on the locked row in every
                 # resource type's phase 1: these runs are sequential and
-                # each calls the provider, so an ownership transfer, a
-                # visibility change or a grant revocation that commits
-                # during one type's sync must stop the types after it,
-                # not let them keep running as the creator. A denial is
+                # each calls the provider, so an ownership, visibility,
+                # grant or role change that removes the creator's access
+                # and commits during one type's sync must stop the types
+                # after it, not let them keep running. A denial is
                 # a `SyncSkipped`, logged below like every other skip.
                 # The route label only reaches the personal-connector
                 # metric, and no `PERSONAL_PROVIDERS` member auto-
