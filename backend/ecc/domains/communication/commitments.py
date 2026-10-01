@@ -337,6 +337,7 @@ def create_commitment(
     now = datetime.now(UTC)
 
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="write")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
@@ -485,6 +486,7 @@ def _mutate_commitment(
     req_hash = request_hash(payload, f"update:{commitment_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
@@ -753,6 +755,7 @@ def _lifecycle(
     request_id, correlation_id = _request_ids(request)
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,

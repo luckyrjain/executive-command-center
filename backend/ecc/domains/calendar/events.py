@@ -222,6 +222,7 @@ def create_calendar_event(
     now = datetime.now(UTC)
     event_id = uuid4()
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="write")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
@@ -366,6 +367,7 @@ def update_calendar_event(
     req_hash = request_hash(payload, f"update:{event_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
@@ -478,6 +480,7 @@ def _lifecycle(
     req_hash = request_hash(payload, f"{action}:{event_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
