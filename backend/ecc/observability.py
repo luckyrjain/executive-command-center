@@ -571,11 +571,10 @@ def queue_brief_generated(session: Session, duration_seconds: float) -> None:
     """Defer a morning-brief generation-duration sample the same way
     ``queue_lifecycle_event`` defers lifecycle-event counters: computed and
     queued inside the generating transaction, but only ever flushed if that
-    transaction actually commits. ``dashboard_briefs._generate`` can be
-    called with its own ``session.commit()`` or wrapped by a caller that
-    commits later after further writes (idempotency-record persistence) --
-    either way, this must never record a duration sample for a brief that
-    ends up rolled back.
+    transaction actually commits. ``dashboard_briefs._generate`` never
+    commits itself; its caller commits, possibly after further writes
+    (idempotency-record persistence) -- either way, this must never record
+    a duration sample for a brief that ends up rolled back.
     """
     session.info.setdefault("_pending_brief_durations", []).append(duration_seconds)
 

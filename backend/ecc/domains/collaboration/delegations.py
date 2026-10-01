@@ -719,6 +719,9 @@ def create_delegation_endpoint(
         personal_data_share_guard(auth, request, path="delegation_create") as refusal,
         session.begin(),
     ):
+        # Re-checks `require_active_role` in-transaction (ADR-0014); the
+        # role gate proper is `authorize(..., "write")` on the obligation.
+        authz.lock_membership_for_write(session, auth, role_action="read")
         idempotency.lock_idempotency(session, auth, idempotency_key)
         cached = idempotency.load_cached(
             session, auth, idempotency_key, request_hash, domain="collaboration_delegations"
@@ -900,6 +903,9 @@ def list_delegations_endpoint(
 ) -> DelegationListResponse:
     role = authz.require_active_role(session, auth)
     now = datetime.now(UTC)
+    # No membership lock (ADR-0014): the only write here is lazy expiry,
+    # a time-based system transition (actor NULL) that is correct whoever
+    # triggers it, so no write depends on the caller's role.
     with session.begin():
         account_id = _account_id_for(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
         params: dict[str, Any] = {"workspace_id": auth.workspace_id, "limit": limit + 1}
@@ -955,6 +961,9 @@ def get_delegation_endpoint(
 ) -> DelegationResponse:
     role = authz.require_active_role(session, auth)
     now = datetime.now(UTC)
+    # No membership lock (ADR-0014): the only write here is lazy expiry,
+    # a time-based system transition (actor NULL) that is correct whoever
+    # triggers it, so no write depends on the caller's role.
     with session.begin():
         account_id = _account_id_for(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
         row = _get_delegation(session, auth.workspace_id, delegation_id)
@@ -979,6 +988,8 @@ def accept_delegation_endpoint(
     request_hash = idempotency.request_hash(_EmptyBody(), f"accept:{delegation_id}")
     now = datetime.now(UTC)
     with session.begin():
+        # Party-gated, not role-gated: any active member (ADR-0014).
+        authz.lock_membership_for_write(session, auth, role_action="read")
         idempotency.lock_idempotency(session, auth, idempotency_key)
         cached = idempotency.load_cached(
             session, auth, idempotency_key, request_hash, domain="collaboration_delegations"
@@ -1083,6 +1094,8 @@ def reject_delegation_endpoint(
     request_hash = idempotency.request_hash(_EmptyBody(), f"reject:{delegation_id}")
     now = datetime.now(UTC)
     with session.begin():
+        # Party-gated, not role-gated: any active member (ADR-0014).
+        authz.lock_membership_for_write(session, auth, role_action="read")
         idempotency.lock_idempotency(session, auth, idempotency_key)
         cached = idempotency.load_cached(
             session, auth, idempotency_key, request_hash, domain="collaboration_delegations"
@@ -1167,6 +1180,8 @@ def revoke_delegation_endpoint(
     request_hash = idempotency.request_hash(_EmptyBody(), f"revoke:{delegation_id}")
     now = datetime.now(UTC)
     with session.begin():
+        # Party-gated, not role-gated: any active member (ADR-0014).
+        authz.lock_membership_for_write(session, auth, role_action="read")
         idempotency.lock_idempotency(session, auth, idempotency_key)
         cached = idempotency.load_cached(
             session, auth, idempotency_key, request_hash, domain="collaboration_delegations"
@@ -1260,6 +1275,8 @@ def complete_delegation_endpoint(
     request_hash = idempotency.request_hash(_EmptyBody(), f"complete:{delegation_id}")
     now = datetime.now(UTC)
     with session.begin():
+        # Party-gated, not role-gated: any active member (ADR-0014).
+        authz.lock_membership_for_write(session, auth, role_action="read")
         idempotency.lock_idempotency(session, auth, idempotency_key)
         cached = idempotency.load_cached(
             session, auth, idempotency_key, request_hash, domain="collaboration_delegations"
