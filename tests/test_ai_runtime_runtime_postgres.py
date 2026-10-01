@@ -51,6 +51,7 @@ import json
 import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import new
@@ -1138,6 +1139,78 @@ def test_execute_run_email_detect_action_prompt_injection_cannot_dispatch_out_of
 # `OllamaCallFailed`/`RunBudgetExceeded` does so only via the retry path,
 # never the primary call.
 # ---------------------------------------------------------------------------
+
+
+def test_tool_handlers_cover_every_dispatchable_tool_and_match_active_rows() -> None:
+    """Drift guard for `_TOOL_HANDLERS`: every tool a task port can dispatch
+    has a bound handler, and every `active` `tool_definitions` row the
+    migrations seeded names exactly that handler -- so the sink-side binding
+    never silently disables a real tool."""
+    eligible = {name for port in TASK_PORTS.values() for name in port.eligible_tools}
+    assert eligible <= set(runtime_module._TOOL_HANDLERS)
+    assert set(runtime_module._TOOL_INPUT_MODELS) == set(runtime_module._TOOL_HANDLERS)
+
+    with engine.connect() as connection:
+        rows = connection.execute(
+            text("SELECT name, handler_ref FROM tool_definitions WHERE status = 'active'")
+        ).all()
+    assert rows
+    for name, handler_ref in rows:
+        module_name, func_name = runtime_module._TOOL_HANDLERS[name]
+        assert handler_ref == f"{module_name}:{func_name}"
+        assert callable(runtime_module._resolve_handler(name, handler_ref))
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "handler_ref"),
+    [
+        ("attention.get_item", "os:system"),
+        ("attention.get_item", "ecc.domains.knowledge.tools:get_entity_tool"),
+        ("attention.get_item", "ecc.domains.attention.tools:get_item_tool_x"),
+        ("attention.get_item", "ecc.domains.attention.tools"),
+        ("unknown.tool", "ecc.domains.attention.tools:get_item_tool"),
+    ],
+)
+def test_resolve_handler_refuses_handler_ref_not_bound_to_tool_name(
+    tool_name: str, handler_ref: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    imported: list[str] = []
+    monkeypatch.setattr(runtime_module, "import_module", lambda name: imported.append(name))
+
+    assert runtime_module._resolve_handler(tool_name, handler_ref) is None
+    assert imported == []
+
+
+def test_dispatch_tool_with_tampered_handler_ref_fails_without_importing(
+    run_context: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An allowlisted tool whose active row's `handler_ref` was tampered
+    with (bypassing the immutability trigger, e.g. direct DB access) is
+    refused as `tool_not_registered`; the row's module is never imported."""
+    real = runtime_module.ai_tools.get_active_tool
+
+    def tampered(session, name):  # noqa: ANN001
+        tool_def = real(session, name)
+        assert tool_def is not None
+        return replace(tool_def, handler_ref="os:system")
+
+    imported: list[str] = []
+    monkeypatch.setattr(runtime_module.ai_tools, "get_active_tool", tampered)
+    monkeypatch.setattr(runtime_module, "import_module", lambda name: imported.append(name))
+
+    with SessionFactory() as session:
+        result = runtime_module._dispatch_tool(
+            session,
+            run_context["auth"],
+            tool_name="attention.get_item",
+            tool_input={"attention_item_id": str(uuid4())},
+            eligible_tools=("attention.get_item",),
+        )
+
+    assert result == runtime_module.ToolDispatchFailed(
+        tool_name="attention.get_item", reason="tool_not_registered"
+    )
+    assert imported == []
 
 
 def test_execute_run_primary_call_timeout_fails_run_gracefully(run_context: dict) -> None:
