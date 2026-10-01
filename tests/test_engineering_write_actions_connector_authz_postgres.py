@@ -525,6 +525,9 @@ def test_member_run_naming_another_members_private_connector_fails_after_self_ap
         finished = automation_worker.process_claimed_run(session, reclaimed, registry, "worker-b")
     assert finished.status == "failed"
     assert transport.calls == 0
+    with SessionFactory() as session:
+        steps = automation_worker.list_run_steps(session, ws.workspace_id, queued.id)
+    assert [step.error_class for step in steps] == ["WriteActionRejected"]
 
 
 def test_transfer_committing_during_the_lock_wait_is_seen_by_the_authorization(
