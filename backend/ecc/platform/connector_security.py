@@ -780,7 +780,8 @@ def personal_data_share_guard(
 # `resolve_or_create_person`, `fetch_and_store_body`); action detection's
 # evidence write (`personal/gmail_action_detection`) and, opt-in via
 # `require_active_actor=True`, its `ai_runs`/`ai_run_steps` persist
-# (`ai_runtime/runtime._persist_terminal`) and recommendation insert
+# (`ai_runtime/runtime._persist_terminal`; personal insight generation
+# opts in too) and recommendation insert
 # (`governance/recommendation_mutations.create_recommendation`, through
 # `authz.lock_membership_for_write` as for every caller, raising
 # `MembershipInactiveError` for an inactive actor); ownership transfer
