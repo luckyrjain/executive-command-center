@@ -28,6 +28,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -42,8 +43,9 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 from ecc.config import get_settings
-from ecc.database import engine
+from ecc.database import STATEMENT_TIMEOUT_MS, engine
 from ecc.main import app
+from ecc.platform.connector_security import membership_mutation_lock_key
 
 settings = get_settings()
 pytestmark = pytest.mark.skipif(
@@ -1021,3 +1023,106 @@ def test_concurrent_accepts_of_shared_evidence_do_not_deadlock(
 
     assert results["accept_a"].status_code == 200, results["accept_a"].text
     assert results["accept_b"].status_code == 200, results["accept_b"].text
+
+
+# ---------------------------------------------------------------------------
+# Busy membership lock (ADR-0014): removal / role change give up with a
+# retryable 409 instead of dying on the statement timeout
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _shared_membership_lock_held(workspace_id: UUID) -> Iterator[None]:
+    """Holds the SHARED membership advisory lock on a separate connection --
+    what any in-flight authorized write (e.g. a long `regenerate_attention`)
+    holds -- until the block exits."""
+    with engine.connect() as holder:
+        holder.execute(
+            text("SELECT pg_advisory_xact_lock_shared(hashtextextended(:lock_key, 0))"),
+            {"lock_key": membership_mutation_lock_key(workspace_id)},
+        )
+        try:
+            yield
+        finally:
+            holder.rollback()
+
+
+def _assert_membership_change_busy(response: Any, elapsed: float) -> None:
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "MEMBERSHIP_CHANGE_BUSY"
+    assert int(response.headers["Retry-After"]) >= 1
+    # Gave up on its own `lock_timeout`, well before the statement timeout.
+    assert elapsed < STATEMENT_TIMEOUT_MS / 1000 - 0.5, elapsed
+
+
+def _membership_row(workspace_id: UUID, user_id: UUID) -> tuple[str, str]:
+    with engine.begin() as connection:
+        row = connection.execute(
+            text(
+                "SELECT role, status FROM workspace_memberships "
+                "WHERE workspace_id = :workspace_id AND users_id = :user_id"
+            ),
+            {"workspace_id": workspace_id, "user_id": user_id},
+        ).one()
+    return row.role, row.status
+
+
+def _audit_event_count(workspace_id: UUID) -> int:
+    with engine.begin() as connection:
+        return int(
+            connection.execute(
+                text("SELECT count(*) FROM audit_events WHERE workspace_id = :workspace_id"),
+                {"workspace_id": workspace_id},
+            ).scalar_one()
+        )
+
+
+def test_patch_role_returns_busy_while_a_write_holds_the_membership_lock(
+    membership_context: _MembershipContext,
+) -> None:
+    ctx = membership_context
+    audits_before = _audit_event_count(ctx.workspace_id)
+    with _shared_membership_lock_held(ctx.workspace_id):
+        started = time.monotonic()
+        response = ctx.owner.client.patch(
+            f"/api/v1/identity/workspaces/{ctx.workspace_id}/members/{ctx.member_a.user_id}",
+            json={"role": "admin"},
+            headers=_headers(ctx.owner.token),
+        )
+        elapsed = time.monotonic() - started
+
+    _assert_membership_change_busy(response, elapsed)
+    assert _membership_row(ctx.workspace_id, ctx.member_a.user_id) == ("member", "active")
+    assert _audit_event_count(ctx.workspace_id) == audits_before
+
+    # Retrying once the lock is free succeeds.
+    retry = ctx.owner.client.patch(
+        f"/api/v1/identity/workspaces/{ctx.workspace_id}/members/{ctx.member_a.user_id}",
+        json={"role": "admin"},
+        headers=_headers(ctx.owner.token),
+    )
+    assert retry.status_code == 200, retry.text
+
+
+def test_remove_member_returns_busy_while_a_write_holds_the_membership_lock(
+    membership_context: _MembershipContext,
+) -> None:
+    ctx = membership_context
+    audits_before = _audit_event_count(ctx.workspace_id)
+    with _shared_membership_lock_held(ctx.workspace_id):
+        started = time.monotonic()
+        response = ctx.owner.client.delete(
+            f"/api/v1/identity/workspaces/{ctx.workspace_id}/members/{ctx.member_b.user_id}",
+            headers=_headers(ctx.owner.token),
+        )
+        elapsed = time.monotonic() - started
+
+    _assert_membership_change_busy(response, elapsed)
+    assert _membership_row(ctx.workspace_id, ctx.member_b.user_id) == ("member", "active")
+    assert _audit_event_count(ctx.workspace_id) == audits_before
+
+    retry = ctx.owner.client.delete(
+        f"/api/v1/identity/workspaces/{ctx.workspace_id}/members/{ctx.member_b.user_id}",
+        headers=_headers(ctx.owner.token),
+    )
+    assert retry.status_code == 200, retry.text

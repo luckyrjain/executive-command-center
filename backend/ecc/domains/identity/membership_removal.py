@@ -95,13 +95,15 @@ from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from psycopg import errors as pg_errors
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.config import get_settings
-from ecc.database import SessionFactory, get_session
+from ecc.database import STATEMENT_TIMEOUT_MS, SessionFactory, get_session
 from ecc.domains.automation.worker import cancel_runs_for_removed_member
 from ecc.domains.collaboration.delegations import (
     cancel_delegations_for_removed_member,
@@ -126,6 +128,15 @@ _logger = logging.getLogger("ecc.domains.identity.membership_removal")
 
 router = APIRouter(prefix="/api/v1/identity", tags=["identity"])
 SessionDep = Annotated[Session, Depends(get_session)]
+
+# ADR-0014: every authorized write in the workspace holds the SHARED side of
+# the membership lock for its whole transaction, so the EXCLUSIVE wait below
+# can outlast `STATEMENT_TIMEOUT_MS` (e.g. behind a long
+# `regenerate_attention`). Giving up on a shorter `lock_timeout` turns that
+# into a clean, retryable 409 instead of a statement-timeout 500. Kept 2s
+# under the statement timeout so the lock wait always fails first.
+MEMBERSHIP_CHANGE_LOCK_TIMEOUT_MS = STATEMENT_TIMEOUT_MS - 2_000
+MEMBERSHIP_CHANGE_RETRY_AFTER_SECONDS = 2
 
 
 class MemberResponse(BaseModel):
@@ -491,6 +502,30 @@ def _revoke_after_removal(pending: list[_PendingRemovalRevoke]) -> None:
         revoke_guarded(gmail_revocation._adapter, context, provider=entry.provider, site="removal")
 
 
+def _lock_membership_exclusive(session: Session, *, workspace_id: UUID) -> None:
+    """Takes the workspace's membership advisory lock EXCLUSIVELY, waiting
+    at most `MEMBERSHIP_CHANGE_LOCK_TIMEOUT_MS`; raises a retryable 409
+    `MEMBERSHIP_CHANGE_BUSY` (the caller's `session.begin()` rolls back, so
+    nothing is written) if in-flight writers still hold it. The timeout is
+    reset right after, so it never applies to the row locks taken later in
+    the same transaction."""
+    session.execute(text(f"SET LOCAL lock_timeout = {MEMBERSHIP_CHANGE_LOCK_TIMEOUT_MS}"))
+    try:
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {"lock_key": membership_mutation_lock_key(workspace_id)},
+        )
+    except OperationalError as exc:
+        if not isinstance(exc.orig, pg_errors.LockNotAvailable):
+            raise
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="MEMBERSHIP_CHANGE_BUSY",
+            headers={"Retry-After": str(MEMBERSHIP_CHANGE_RETRY_AFTER_SECONDS)},
+        ) from None
+    session.execute(text("SET LOCAL lock_timeout TO DEFAULT"))
+
+
 def _is_sole_active_owner(session: Session, *, workspace_id: UUID, users_id: UUID) -> bool:
     other_owners = session.execute(
         text(
@@ -579,10 +614,7 @@ def update_member_role_endpoint(
         # technique `attention.py`'s `regenerate_attention` already uses for
         # its own cross-statement race -- closes it without a `SELECT ...
         # FOR UPDATE` across an unbounded number of owner rows.
-        session.execute(
-            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-            {"lock_key": membership_mutation_lock_key(auth.workspace_id)},
-        )
+        _lock_membership_exclusive(session, workspace_id=auth.workspace_id)
         member = _member_row(session, workspace_id=auth.workspace_id, user_id=user_id)
         if member is None or member["status"] != "active":
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="MEMBER_NOT_FOUND")
@@ -664,10 +696,7 @@ def remove_member_endpoint(
     with session.begin():
         # See `update_member_role_endpoint`'s own comment on this same lock:
         # closes the identical concurrent-owner-removal race for `DELETE`.
-        session.execute(
-            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-            {"lock_key": membership_mutation_lock_key(auth.workspace_id)},
-        )
+        _lock_membership_exclusive(session, workspace_id=auth.workspace_id)
         member = _member_row(session, workspace_id=auth.workspace_id, user_id=user_id)
         if member is None or member["status"] != "active":
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="MEMBER_NOT_FOUND")
