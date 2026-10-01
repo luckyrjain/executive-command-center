@@ -60,9 +60,14 @@ _MEMBERSHIP_LOCKS = text(
     "AND l.classid::bigint = ((k.h >> 32) & 4294967295) "
     "AND l.objid::bigint = (k.h & 4294967295)"
 )
+# Open write transactions on the knowledge projection tables, so an
+# unrelated idle-in-transaction backend (another test, a pool) can't count.
 _OPEN_TRANSACTIONS = text(
-    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
-    "AND pid <> pg_backend_pid() AND state LIKE 'idle in transaction%'"
+    "SELECT count(DISTINCT a.pid) FROM pg_stat_activity a "
+    "JOIN pg_locks l ON l.pid = a.pid JOIN pg_class c ON c.oid = l.relation "
+    "WHERE a.datname = current_database() AND a.pid <> pg_backend_pid() "
+    "AND a.state LIKE 'idle in transaction%' AND a.backend_xid IS NOT NULL "
+    "AND c.relname IN ('pkos_nodes', 'retrieval_documents', 'embedding_projections')"
 )
 
 
@@ -189,14 +194,16 @@ def _projection(ws: UUID, entity_id: UUID) -> dict[str, Any] | None:
 
 
 def test_probe_detects_a_held_membership_lock(world: RaceWorld) -> None:
-    """The lock probe is not vacuous: it sees the membership lock while a
-    connection holds it."""
+    """The probes are not vacuous: they see the membership lock and an open
+    write transaction on a knowledge table while a connection holds them."""
     provider = ProbingProvider(world.ws)
     with engine.connect() as holder, holder.begin():
         holder.execute(
             text("SELECT pg_advisory_xact_lock_shared(hashtextextended(:key, 0))"),
             {"key": provider.key},
         )
+        holder.execute(text("SELECT txid_current()"))  # a write transaction has an xid
+        holder.execute(text("SELECT 1 FROM retrieval_documents WHERE false"))
         provider.embed(["probe"])
     assert provider.calls[0]["membership_locks"] == 1
     assert provider.calls[0]["open_transactions"] >= 1
