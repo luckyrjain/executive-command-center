@@ -10,7 +10,9 @@ longer see (and, for sync, calling the provider with its credential).
 
 Now each write transaction locks the row first and authorizes afterwards,
 on the committed post-transfer row, so the waiting request answers 404 and
-writes nothing. See `lock_race_support` for the harness.
+writes nothing. The same re-check covers a grant downgraded to read-only
+(403) or revoked (404) while the request waits, and the auto-backfill's
+sequential per-resource-type syncs. See `lock_race_support` for the harness.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ import pytest
 from lock_race_support import RaceWorld, headers, race, race_world, row_snapshot
 from sqlalchemy import Connection, text
 
+from ecc import observability
 from ecc.config import get_settings
 from ecc.database import engine
 from ecc.domains.engineering import connector_accounts as connector_accounts_module
@@ -32,6 +35,7 @@ from ecc.domains.engineering.connectors import (
     ConnectorAccountContext,
     ConnectorAuthorization,
     ConnectorRegistry,
+    PermissionState,
     SyncOutcome,
 )
 from ecc.domains.engineering.crypto import encrypt_credential
@@ -88,7 +92,7 @@ class _SpyAdapter:
     ) -> SyncOutcome:
         raise NotImplementedError
 
-    def refresh_permissions(self, account: ConnectorAccountContext) -> str:
+    def refresh_permissions(self, account: ConnectorAccountContext) -> PermissionState:
         self.calls.append("refresh_permissions")
         return "active"
 
@@ -101,6 +105,7 @@ def world() -> Iterator[RaceWorld]:
     with race_world(
         "Connector Accounts Lock Race",
         (
+            "resource_grants",
             "sync_cursors",
             "sync_runs",
             "repositories",
@@ -114,7 +119,7 @@ def world() -> Iterator[RaceWorld]:
 @pytest.fixture
 def spies(monkeypatch: pytest.MonkeyPatch) -> dict[str, _SpyAdapter]:
     registry = ConnectorRegistry()
-    by_provider = {provider: _SpyAdapter(provider) for provider in ("sandbox", "gmail")}
+    by_provider = {provider: _SpyAdapter(provider) for provider in ("sandbox", "gmail", "github")}
     for adapter in by_provider.values():
         registry.register(adapter)
     monkeypatch.setattr(connector_accounts_module, "connector_registry", registry)
@@ -128,7 +133,13 @@ def _reset_settings() -> Iterator[None]:
 
 
 def _seed_connector(
-    conn: Connection, w: RaceWorld, now: datetime, *, provider: str, visibility: str
+    conn: Connection,
+    w: RaceWorld,
+    now: datetime,
+    *,
+    provider: str,
+    visibility: str,
+    owner: UUID | None = None,
 ) -> UUID:
     account_id = uuid4()
     conn.execute(
@@ -138,7 +149,7 @@ def _seed_connector(
             "created_by, updated_by, created_at, updated_at, owner_id, visibility) "
             "VALUES (:id, :ws, :provider, :external, 'Race connector', "
             "ARRAY['contents:read'], :credential, 'active', 1, :b, :b, :now, :now, "
-            ":b, :visibility)"
+            ":owner, :visibility)"
         ),
         {
             "id": account_id,
@@ -147,6 +158,7 @@ def _seed_connector(
             "external": f"race-{account_id}",
             "credential": encrypt_credential("race-credential"),
             "b": w.b,
+            "owner": owner or w.b,
             "now": now,
             "visibility": visibility,
         },
@@ -154,7 +166,15 @@ def _seed_connector(
     return account_id
 
 
-def _seed_projection(conn: Connection, w: RaceWorld, now: datetime, table: str) -> UUID:
+def _seed_projection(
+    conn: Connection,
+    w: RaceWorld,
+    now: datetime,
+    table: str,
+    *,
+    owner: UUID | None = None,
+    visibility: str = "private",
+) -> UUID:
     connector_id = _seed_connector(conn, w, now, provider="sandbox", visibility="workspace")
     row_id = uuid4()
     title_column = "name" if table == "repositories" else "title"
@@ -164,7 +184,7 @@ def _seed_projection(conn: Connection, w: RaceWorld, now: datetime, table: str) 
             f"external_id, {title_column}, source_url, observed_at, created_at, updated_at, "
             "owner_id, visibility) "
             "VALUES (:id, :ws, :connector_id, 'github', :external, 'Race row', "
-            "'https://example.invalid/race', :now, :now, :now, :b, 'private')"
+            "'https://example.invalid/race', :now, :now, :now, :owner, :visibility)"
         ),
         {
             "id": row_id,
@@ -172,7 +192,8 @@ def _seed_projection(conn: Connection, w: RaceWorld, now: datetime, table: str) 
             "connector_id": connector_id,
             "external": f"race-{row_id}",
             "now": now,
-            "b": w.b,
+            "owner": owner or w.b,
+            "visibility": visibility,
         },
     )
     return row_id
@@ -187,6 +208,12 @@ class Case:
     ok_status: int
     seed: Callable[[Connection, RaceWorld, datetime], UUID]
     personal_isolation: bool = False
+    # The no-transfer control needs a provider call that succeeds; a Gmail
+    # sync refreshes an OAuth credential first, which this stand-in lacks.
+    control: bool = True
+    # `ecc_connector_access_denied_total{provider, route}` the transfer case
+    # must increment (the personal-connector owner layer); None: no change.
+    denied_metric: tuple[str, str] | None = None
 
 
 _CONNECTORS = "/api/v1/engineering/connectors/{id}"
@@ -221,6 +248,21 @@ CASES: dict[str, Case] = {
         200,
         lambda c, w, now: _seed_connector(c, w, now, provider="gmail", visibility="workspace"),
         personal_isolation=True,
+        denied_metric=("gmail", "disable"),
+    ),
+    # Sync's fast-fail pre-check passes (B still owns the row then); only
+    # phase 1's re-check of the personal-connector owner layer on the
+    # locked row refuses it.
+    "sync_personal_gmail": Case(
+        "connector_accounts",
+        _CONNECTORS + "/sync",
+        {"run_type": "incremental", "resource_type": "message"},
+        "CONNECTOR_NOT_FOUND",
+        201,
+        lambda c, w, now: _seed_connector(c, w, now, provider="gmail", visibility="workspace"),
+        personal_isolation=True,
+        control=False,
+        denied_metric=("gmail", "sync"),
     ),
     "repository_team": Case(
         "repositories",
@@ -261,7 +303,14 @@ def _prepare(world: RaceWorld, case: Case, monkeypatch: pytest.MonkeyPatch) -> U
         return case.seed(connection, world, datetime.now(UTC))
 
 
-def _run(w: RaceWorld, case: Case, row_id: UUID, *, transfer: bool) -> tuple[Any, Any]:
+def _run(
+    w: RaceWorld,
+    case: Case,
+    row_id: UUID,
+    *,
+    transfer: bool,
+    mutate: Callable[[Connection], object] | None = None,
+) -> tuple[Any, Any]:
     return race(
         w,
         table=case.table,
@@ -270,7 +319,12 @@ def _run(w: RaceWorld, case: Case, row_id: UUID, *, transfer: bool) -> tuple[Any
             case.path.format(id=row_id), headers=headers(w.b_token), json=case.body
         ),
         transfer=transfer,
+        mutate=mutate,
     )
+
+
+def _denied_counts() -> dict[tuple[str, ...], float]:
+    return dict(observability.connector_access_denied_total._values)
 
 
 @pytest.mark.parametrize("name", list(CASES))
@@ -283,6 +337,7 @@ def test_mutation_waiting_on_row_lock_rechecks_authorization(
     case = CASES[name]
     row_id = _prepare(world, case, monkeypatch)
     counts_before = _side_effect_counts(world.ws)
+    denied_before = _denied_counts()
 
     response, before = _run(world, case, row_id, transfer=True)
 
@@ -293,10 +348,15 @@ def test_mutation_waiting_on_row_lock_rechecks_authorization(
     assert {provider: spy.calls for provider, spy in spies.items()} == {
         "sandbox": [],
         "gmail": [],
+        "github": [],
     }
+    expected_denied = dict(denied_before)
+    if case.denied_metric is not None:
+        expected_denied[case.denied_metric] = expected_denied.get(case.denied_metric, 0.0) + 1
+    assert _denied_counts() == expected_denied
 
 
-@pytest.mark.parametrize("name", list(CASES))
+@pytest.mark.parametrize("name", [name for name, case in CASES.items() if case.control])
 def test_mutation_waiting_on_row_lock_without_transfer_still_proceeds(
     world: RaceWorld,
     spies: dict[str, _SpyAdapter],
@@ -320,3 +380,219 @@ def test_mutation_waiting_on_row_lock_without_transfer_still_proceeds(
         assert after["version"] == before["version"] + 1
     else:
         assert after["team_assignment_version"] == before["team_assignment_version"] + 1
+
+
+# --- grant changes while the request waits ------------------------------------
+#
+# The row belongs to C and is `shared_explicitly` with B through a read+write
+# grant, so B passes every check made before the lock. While B's request
+# waits on the row lock the holder downgrades the grant to read-only (B can
+# still see the row: 403) or revokes it (B cannot: 404).
+
+_GRANT_CASES: dict[str, Case] = {
+    "sync": Case(
+        "connector_accounts",
+        _CONNECTORS + "/sync",
+        {"run_type": "incremental", "resource_type": "repository"},
+        "CONNECTOR_NOT_FOUND",
+        201,
+        lambda c, w, now: _seed_connector(
+            c, w, now, provider="sandbox", visibility="shared_explicitly", owner=w.c
+        ),
+    ),
+    "disable": Case(
+        "connector_accounts",
+        _CONNECTORS + "/disable",
+        None,
+        "CONNECTOR_NOT_FOUND",
+        200,
+        lambda c, w, now: _seed_connector(
+            c, w, now, provider="sandbox", visibility="shared_explicitly", owner=w.c
+        ),
+    ),
+    "repository_team": Case(
+        "repositories",
+        "/api/v1/engineering/repositories/{id}/team",
+        _TEAM_BODY,
+        "REPOSITORY_NOT_FOUND",
+        200,
+        lambda c, w, now: _seed_projection(
+            c, w, now, "repositories", owner=w.c, visibility="shared_explicitly"
+        ),
+    ),
+    "work_item_team": Case(
+        "engineering_work_items",
+        "/api/v1/engineering/work-items/{id}/team",
+        _TEAM_BODY,
+        "WORK_ITEM_NOT_FOUND",
+        200,
+        lambda c, w, now: _seed_projection(
+            c, w, now, "engineering_work_items", owner=w.c, visibility="shared_explicitly"
+        ),
+    ),
+}
+
+
+def _insert_grant(
+    conn: Connection, w: RaceWorld, table: str, row_id: UUID, actions: list[str]
+) -> UUID:
+    grant_id = uuid4()
+    conn.execute(
+        text(
+            "INSERT INTO resource_grants (id, workspace_id, grantee_account_id, "
+            "resource_type, resource_id, actions, granted_by, created_at) "
+            "SELECT :id, :ws, account_id, :table, :row_id, :actions, :c, now() "
+            "FROM users WHERE id = :b"
+        ),
+        {
+            "id": grant_id,
+            "ws": w.ws,
+            "table": table,
+            "row_id": row_id,
+            "actions": actions,
+            "c": w.c,
+            "b": w.b,
+        },
+    )
+    return grant_id
+
+
+def _revoke(grant_id: UUID) -> Callable[[Connection], object]:
+    def mutate(conn: Connection) -> object:
+        return conn.execute(
+            text("UPDATE resource_grants SET revoked_at = now() WHERE id = :id"),
+            {"id": grant_id},
+        )
+
+    return mutate
+
+
+def _downgrade_to_read(
+    w: RaceWorld, case: Case, row_id: UUID, grant_id: UUID
+) -> Callable[[Connection], object]:
+    def mutate(conn: Connection) -> object:
+        _revoke(grant_id)(conn)
+        return _insert_grant(conn, w, case.table, row_id, ["read"])
+
+    return mutate
+
+
+def _prepare_granted(
+    world: RaceWorld, case: Case, monkeypatch: pytest.MonkeyPatch
+) -> tuple[UUID, UUID]:
+    row_id = _prepare(world, case, monkeypatch)
+    with engine.begin() as connection:
+        grant_id = _insert_grant(connection, world, case.table, row_id, ["read", "write"])
+    return row_id, grant_id
+
+
+@pytest.mark.parametrize("change", ["loses_write", "revoked"])
+@pytest.mark.parametrize("name", list(_GRANT_CASES))
+def test_mutation_waiting_on_row_lock_rechecks_a_changed_grant(
+    world: RaceWorld,
+    spies: dict[str, _SpyAdapter],
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    change: str,
+) -> None:
+    case = _GRANT_CASES[name]
+    row_id, grant_id = _prepare_granted(world, case, monkeypatch)
+    counts_before = _side_effect_counts(world.ws)
+    if change == "loses_write":
+        mutate, status, code = (
+            _downgrade_to_read(world, case, row_id, grant_id),
+            403,
+            ("INSUFFICIENT_ROLE"),
+        )
+    else:
+        mutate, status, code = _revoke(grant_id), 404, case.not_found
+
+    response, before = _run(world, case, row_id, transfer=False, mutate=mutate)
+
+    assert response.status_code == status, response.text
+    assert response.json()["error"]["code"] == code
+    assert row_snapshot(case.table, row_id) == before
+    assert _side_effect_counts(world.ws) == counts_before
+    assert all(spy.calls == [] for spy in spies.values())
+
+
+@pytest.mark.parametrize("name", list(_GRANT_CASES))
+def test_mutation_waiting_on_row_lock_with_unchanged_grant_still_proceeds(
+    world: RaceWorld,
+    spies: dict[str, _SpyAdapter],
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> None:
+    """Control: the read+write grant alone lets B through the same wait --
+    the 403/404 above come from the grant change, not the setup."""
+    case = _GRANT_CASES[name]
+    row_id, _grant_id = _prepare_granted(world, case, monkeypatch)
+
+    response, _before = _run(world, case, row_id, transfer=False)
+
+    assert response.status_code == case.ok_status, response.text
+
+
+# --- auto-backfill -------------------------------------------------------------
+
+
+def _transfer_on_first_backfill(spy: _SpyAdapter, w: RaceWorld, account_id: UUID) -> None:
+    """Commits an ownership transfer from inside the first resource type's
+    provider call -- phase 2, with no lock held -- the window between one
+    resource type's sync and the next."""
+    original = spy.backfill
+
+    def backfill(*args: Any, **kwargs: Any) -> SyncOutcome:
+        if not spy.calls:
+            with engine.begin() as connection:
+                connection.execute(
+                    text("UPDATE connector_accounts SET owner_id = :c WHERE id = :id"),
+                    {"c": w.c, "id": account_id},
+                )
+        return original(*args, **kwargs)
+
+    spy.backfill = backfill  # type: ignore[method-assign]
+
+
+def _sync_run_count(account_id: UUID) -> int:
+    with engine.connect() as connection:
+        return int(
+            connection.execute(
+                text("SELECT count(*) FROM sync_runs WHERE connector_account_id = :id"),
+                {"id": account_id},
+            ).scalar_one()
+        )
+
+
+@pytest.mark.parametrize("transfer", [True, False])
+def test_auto_backfill_rechecks_authorization_before_each_resource_type(
+    world: RaceWorld,
+    spies: dict[str, _SpyAdapter],
+    monkeypatch: pytest.MonkeyPatch,
+    transfer: bool,
+) -> None:
+    """GitHub auto-backfills three resource types one after another. A
+    transfer that commits during the first must stop the other two (each
+    phase 1 re-authorizes the creator on the locked row); without one, all
+    three run (control)."""
+    monkeypatch.setenv(_FLAG, "false")
+    get_settings.cache_clear()
+    with engine.begin() as connection:
+        account_id = _seed_connector(
+            connection, world, datetime.now(UTC), provider="github", visibility="private"
+        )
+    if transfer:
+        _transfer_on_first_backfill(spies["github"], world, account_id)
+
+    connector_accounts_module._run_auto_backfill(
+        workspace_id=world.ws,
+        user_id=world.b,
+        timezone="UTC",
+        account_id=account_id,
+        provider="github",
+    )
+
+    resource_types = connector_accounts_module._AUTO_SYNC_RESOURCE_TYPES["github"]
+    expected_runs = 1 if transfer else len(resource_types)
+    assert spies["github"].calls == ["backfill"] * expected_runs
+    assert _sync_run_count(account_id) == expected_runs
