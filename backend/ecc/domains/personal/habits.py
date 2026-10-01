@@ -42,6 +42,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
+from ecc.platform import authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 from .domains import (
@@ -207,6 +208,7 @@ def create_goal_endpoint(
     req_hash = request_hash(payload, "create_goal")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="read")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(session, auth, idempotency_key, req_hash, domain="personal_goal")
         if cached is not None:
@@ -307,6 +309,7 @@ def create_routine_endpoint(
     req_hash = request_hash(payload, "create_routine")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="read")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(session, auth, idempotency_key, req_hash, domain="personal_routine")
         if cached is not None:
@@ -392,6 +395,7 @@ def create_check_in_endpoint(
     req_hash = request_hash(payload, "create_check_in")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="read")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(session, auth, idempotency_key, req_hash, domain="personal_check_in")
         if cached is not None:
@@ -547,6 +551,9 @@ def list_insights_endpoint(auth: AuthDep, session: SessionDep) -> InsightListRes
     """
     now = datetime.now(UTC)
     with session.begin():
+        # A read that writes (the gap-insight upserts below, owned by the
+        # caller), so it takes the membership lock like any write.
+        authz.lock_membership_for_write(session, auth, role_action="read")
         for insight in _compute_gap_insights(session, auth):
             session.execute(
                 text(
@@ -611,6 +618,7 @@ def dismiss_insight_endpoint(
 ) -> InsightResponse:
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="read")
         row = (
             session.execute(
                 text(
@@ -673,6 +681,7 @@ def feedback_insight_endpoint(
     req_hash = request_hash(payload, f"feedback_insight:{insight_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="read")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session, auth, idempotency_key, req_hash, domain="personal_insight_feedback"

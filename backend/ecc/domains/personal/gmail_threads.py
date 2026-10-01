@@ -104,6 +104,7 @@ from ecc.database import get_session
 from ecc.domains.ai_runtime.tools import ToolNotFound
 from ecc.domains.engineering.connector_accounts import get_encrypted_credential
 from ecc.domains.engineering.crypto import decrypt_credential
+from ecc.platform import authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 from ecc.platform.request_models import EmptyBody as _EmptyBody
 
@@ -320,6 +321,7 @@ def forget_thread_endpoint(
     req_hash = request_hash(_EmptyBody(), f"forget_thread:{thread_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="read")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(session, auth, idempotency_key, req_hash, domain="gmail_thread_forget")
         if cached is not None:
