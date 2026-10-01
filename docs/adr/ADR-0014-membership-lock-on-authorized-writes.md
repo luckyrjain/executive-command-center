@@ -37,6 +37,7 @@ Each row is one adoption change. The race tests share `tests/membership_lock_rac
 | `attention/*`, `attention/meeting_prep` | `test_attention_membership_lock_race_postgres.py` | `test_attention_membership_lock_coverage.py` | Enrichment locks per write transaction, never across the model call. |
 | `planning/tasks`, `communication/commitments` | `test_tasks_commitments_membership_lock_race_postgres.py` | `test_tasks_commitments_membership_lock_coverage.py` | Creates pass `role_action="write"`. The shared write helpers (`insert_task`, `lifecycle_write`, ...) run inside their caller's transaction, so the caller locks. |
 | `calendar/events`, `scheduling/meetings` | `test_calendar_scheduling_membership_lock_race_postgres.py` | `test_calendar_scheduling_membership_lock_coverage.py` | Event and meeting creates (standalone and event-linked) pass `role_action="write"`. No exceptions. |
+| `automation/*`, `ai_runtime/prompts` | `test_automation_prompts_membership_lock_race_postgres.py` | `test_automation_prompts_membership_lock_coverage.py` | Creates and kill switches pass `role_action="write"`. `activate_policy` locks, then re-checks owner/admin inside the transaction. The worker, scheduler and `local_adapters` sessions have no caller and stay unlocked, so no adapter call runs under the lock. |
 
 ## Consequences
 
