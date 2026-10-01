@@ -63,6 +63,22 @@ _SIDE_EFFECT_TABLES = (
 
 
 @pytest.fixture
+def isolation(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[bool], None]]:
+    """Call with `True` to turn `ECC_PERSONAL_DATA_ISOLATION` on for the test."""
+
+    def enable(on: bool) -> None:
+        if on:
+            monkeypatch.setenv("ECC_PERSONAL_DATA_ISOLATION", "true")
+            get_settings.cache_clear()
+
+    try:
+        yield enable
+    finally:
+        monkeypatch.undo()
+        get_settings.cache_clear()
+
+
+@pytest.fixture
 def world() -> Iterator[RaceWorld]:
     with race_world(
         "Authorize Then Write Lock Race",
@@ -177,15 +193,25 @@ def _seed_node(conn: Connection, w: RaceWorld, now: datetime, *, visibility: str
     return node_id
 
 
-def _seed_evidence(conn: Connection, w: RaceWorld, now: datetime, node_id: UUID) -> UUID:
+def _seed_evidence(
+    conn: Connection, w: RaceWorld, now: datetime, node_id: UUID, *, visibility: str = "workspace"
+) -> UUID:
     evidence_id = uuid4()
     conn.execute(
         text(
             "INSERT INTO pkos_evidence (id, workspace_id, node_id, source_type, source_ref, "
             "sha256, captured_at, owner_id, visibility) "
-            "VALUES (:id, :ws, :node, 'manual', 'race-ref', :sha, :now, :b, 'workspace')"
+            "VALUES (:id, :ws, :node, 'manual', 'race-ref', :sha, :now, :b, :visibility)"
         ),
-        {"id": evidence_id, "ws": w.ws, "node": node_id, "sha": "0" * 64, "now": now, "b": w.b},
+        {
+            "id": evidence_id,
+            "ws": w.ws,
+            "node": node_id,
+            "sha": "0" * 64,
+            "now": now,
+            "b": w.b,
+            "visibility": visibility,
+        },
     )
     return evidence_id
 
@@ -243,6 +269,9 @@ class Case:
     # waiting query): pre-fix code waits in a plain UPDATE of the row, or --
     # for an edge -- in the INSERT's foreign-key check on the locked node.
     wait_on: str = ""
+    # `ECC_PERSONAL_DATA_ISOLATION` on: the flag that makes cited evidence
+    # an authorization boundary (`authz.cited_evidence_readable`).
+    isolation: bool = False
 
 
 def _incident(conn: Connection, w: RaceWorld, now: datetime) -> Seeded:
@@ -286,6 +315,18 @@ def _relationship_target(conn: Connection, w: RaceWorld, now: datetime) -> Seede
     evidence_id = _seed_evidence(conn, w, now, source)
     return Seeded(
         target,
+        f"/api/v1/knowledge/entities/{source}/relationships",
+        {"relationship_type": "OWNS", "to_entity_id": str(target), "evidence_id": str(evidence_id)},
+    )
+
+
+def _relationship_evidence(conn: Connection, w: RaceWorld, now: datetime) -> Seeded:
+    """The raced row is the cited evidence, which is authorized read-only."""
+    source = _seed_node(conn, w, now, visibility="workspace")
+    target = _seed_node(conn, w, now, visibility="workspace")
+    evidence_id = _seed_evidence(conn, w, now, source, visibility="private")
+    return Seeded(
+        evidence_id,
         f"/api/v1/knowledge/entities/{source}/relationships",
         {"relationship_type": "OWNS", "to_entity_id": str(target), "evidence_id": str(evidence_id)},
     )
@@ -343,6 +384,14 @@ CASES: dict[str, Case] = {
     ),
     "relationship_create_target": Case(
         "pkos_nodes", _relationship_target, "ENTITY_NOT_FOUND", 201, "pkos_nodes|pkos_edges"
+    ),
+    "relationship_create_evidence": Case(
+        "pkos_evidence",
+        _relationship_evidence,
+        "EVIDENCE_NOT_FOUND",
+        201,
+        "pkos_evidence|pkos_edges",
+        isolation=True,
     ),
     "delegation_create": Case("incidents", _delegation_create, "OBLIGATION_NOT_FOUND", 201),
     "delegation_create_evidence": Case(
@@ -445,8 +494,11 @@ def _seed(world: RaceWorld, case: Case) -> Seeded:
 
 
 @pytest.mark.parametrize("name", [n for n, c in CASES.items() if c.not_found is not None])
-def test_write_waiting_on_transfer_rechecks_authorization(world: RaceWorld, name: str) -> None:
+def test_write_waiting_on_transfer_rechecks_authorization(
+    world: RaceWorld, isolation: Callable[[bool], None], name: str
+) -> None:
     case = CASES[name]
+    isolation(case.isolation)
     seeded = _seed(world, case)
     counts_before = _side_effect_counts(world.ws)
 
@@ -473,10 +525,13 @@ def test_accept_waiting_on_evidence_transfer_does_not_grant_it(world: RaceWorld)
 
 
 @pytest.mark.parametrize("name", list(CASES))
-def test_write_waiting_on_lock_without_transfer_still_proceeds(world: RaceWorld, name: str) -> None:
+def test_write_waiting_on_lock_without_transfer_still_proceeds(
+    world: RaceWorld, isolation: Callable[[bool], None], name: str
+) -> None:
     """Control: the same lock wait with no ownership change succeeds -- the
     denials above come from the transfer, not from the wait itself."""
     case = CASES[name]
+    isolation(case.isolation)
     seeded = _seed(world, case)
 
     response, _ = _race(world, case, seeded, transfer=False)
