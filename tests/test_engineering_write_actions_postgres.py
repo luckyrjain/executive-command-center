@@ -318,6 +318,7 @@ def test_load_credential_rejects_connector_account_in_different_workspace(
             credential = write_actions_module._load_credential(
                 session,
                 workspace_id=other_workspace_id,
+                actor_id=other_user_id,
                 connector_account_id=other_account_id,
                 expected_provider="github",
             )
@@ -327,6 +328,7 @@ def test_load_credential_rejects_connector_account_in_different_workspace(
             write_actions_module._load_credential(
                 session,
                 workspace_id=workspace_id,
+                actor_id=user_id,
                 connector_account_id=other_account_id,
                 expected_provider="github",
             )
