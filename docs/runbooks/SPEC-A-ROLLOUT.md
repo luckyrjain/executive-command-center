@@ -2,7 +2,7 @@
 id: SPEC-A-ROLLOUT
 title: Security Remediation Spec A Rollout Runbook
 status: Active
-version: 1.2.0
+version: 1.3.0
 owner: Lucky Jain
 created: 2026-10-01
 updated: 2026-10-01
@@ -154,11 +154,13 @@ Exit 0 means nothing was found; exit 1 means rows were found (checks A–E, CSV 
 
 - [ ] R4 gate met; migrations 0083/0084 applied (R1); alert rules live.
 - [ ] **Database backup.** Take a full backup immediately before R5 (`make backup`, `docs/operations/PHASE-0-BACKUP-RESTORE.md`), verify it (`make verify-restore BACKUP=<file>`), and record its name in the change record. The backfill log and the snapshot tables below make the R5 changes reversible row by row; the backup covers anything they do not (the grants the backfill revokes, a mistaken manual statement).
+- [ ] **`<fx1_deploy_time>`** in every statement below is the moment the FX1 build (PR #308) went live, written with an explicit UTC offset, for example `'2026-09-29T14:00:00+00:00'`. The block also sets `SET LOCAL TimeZone = 'UTC'`, so the recorded `cleanup_ts` prints in UTC; a literal without an offset would otherwise be read in the session's time zone.
 - [ ] **Snapshot before the FX1 clean-up.** The two statements below change rows that no log records, so first copy what they will change into snapshot tables (ids, owners, visibility, status only; no content). The snapshot block below, the pack archive (if you archive rather than refresh) and the AI-run narrowing form **one transaction** in one `psql` session: the block opens it with `BEGIN` and the narrowing ends it with `COMMIT`. If you refresh packs through the API instead, do that after the `COMMIT`; the snapshot still lists which packs to refresh.
 
   ```sql
   \set ON_ERROR_STOP on
   BEGIN;
+  SET LOCAL TimeZone = 'UTC';
   SET LOCAL lock_timeout = '5s';
   -- Lock the AI runs and their steps BEFORE reading their grants: creating a
   -- grant locks its resource row (authz_grants._load_resource_for_update), so
@@ -297,12 +299,12 @@ What the restore does **not** undo:
 The clean window starts when R6's restart completes and needs **14 consecutive days** with all of the following:
 
 - no `EccConnectorRevokeFailed` / `EccConnectorRevokeErrorRatioHigh` left unresolved: each has had its manual Google-side revoke and is recorded;
-- no `EccGmailRefreshInvalidGrantAboveBaseline`;
+- no `EccGmailRefreshInvalidGrantAboveBaseline` that turned out to be caused by an ECC revoke. Confirm each one first (alert file, "What an alert means"): one whose mailbox owner confirms they removed the app's access at Google themselves, with no matching ECC revoke, is recorded as benign and does not reset the window;
 - no flag toggled and no `--restore` run;
 - no personal-data exposure incident, and no new backfill-reported row left unreviewed after a re-run;
 - no open Critical/High finding against the Spec A code.
 
-Any breach resets the window to day 0. Before resetting it for an `EccConnectorRevokeFailed` (or any other new-series alert), confirm the event is real: there must be a matching `connector_revoke_failed provider=<provider> site=<site>` / `gmail_revoke_failed` log line and a disconnect, removal or purge audit event at that time. A series that reappears after more than 55 minutes without samples, a relabelling, or a fresh TSDB / replaced Prometheus server can fire once for about 5 minutes with no real event behind it (see the alert file); record such an alert as a false positive and do not reset the window. When it closes, record the dates and the alert history in the change record, then start T20 (remove the three flags). Spec B may start after T20.
+Any breach resets the window to day 0. **Treat every `EccConnectorRevokeFailed` as real by default**: do the Google-side check and reset the window. Several real `error` paths have no disconnect, removal or purge audit event (`callback_failure` has only `connector_account.enrollment_refused` or nothing; `adapter_callback`, `callback_duplicate` and `reconnect_replaced` have none), so do not require one. Declare a false positive only when **none** of the log lines in the alert file's "Revoke-error evidence" table (`connector_revoke_failed`, `gmail_revoke_failed`, `gmail_revoke_post_failed`, `connector_revoke_safety_check_failed`, `removal_revoke_credential_unavailable`, `remediation_revoke_credential_unavailable`) exists for that provider and site on any API process from 60 minutes before the alert to its end. That pattern fits a series that reappears after more than 55 minutes without samples, a relabelling, or a fresh TSDB / replaced Prometheus server, which can fire once for about 5 minutes with no real event behind it. Record such an alert, with the empty log search, as a false positive and do not reset the window. When it closes, record the dates and the alert history in the change record, then start T20 (remove the three flags). Spec B may start after T20.
 
 ## Monitoring
 
@@ -350,6 +352,7 @@ Also open and not a sign-off: the owner-sharing question. FX3 also refuses owner
 
 | Version | Date | Summary | Author |
 |---|---|---|---|
+| 1.3.0 | 2026-10-01 | PR review: R7 treats revoke errors as real by default and needs an empty search across every revoke-error log line before calling one a false positive; the canary criterion confirms a user-side removal before recording it benign; R5 SQL uses UTC (`SET LOCAL TimeZone`, explicit offset in `<fx1_deploy_time>`) | Lucky Jain |
 | 1.2.0 | 2026-10-01 | Review fixes: the R5 clean-up locks the targeted AI runs and steps before snapshotting their grants and re-checks for live grants before `COMMIT`; R6 alert now resolves after about 5 minutes; R7 requires confirming a new-series alert against log lines and audit events before resetting the clean window (false-positive causes include a fresh TSDB or replaced Prometheus server) | Lucky Jain |
 | 1.1.0 | 2026-10-01 | Review fixes: database backup and snapshot tables required before R5; the FX1 AI-run clean-up is narrowing only (purge dropped), reversible through the snapshot, with one shared `revoked_at`; rollback lists what restore does not undo (rows written private while the flag was on, removal side effects); R6 verification and monitoring reflect counters that appear at 1 | Lucky Jain |
 | 1.0.0 | 2026-10-01 | First rollout runbook for Spec A R1–R7: flags and restarts, compose gap, R5 order and FX1 prerequisites, D2 record template, clean window, known limitations, G-SIGN checklist | Lucky Jain |

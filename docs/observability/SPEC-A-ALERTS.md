@@ -2,7 +2,7 @@
 id: SPEC-A-ALERTS
 title: Security Remediation Spec A Alert Rules
 status: Active
-version: 1.2.0
+version: 1.3.0
 owner: Lucky Jain
 created: 2026-10-01
 updated: 2026-10-01
@@ -40,8 +40,9 @@ This repository has no alerting stack and no other alert rules. These are the Pr
 ## Reading the series
 
 - **`result="error"` is truthful** (Security Remediation FX6). It means Google refused the revoke, the transport failed, or the stored credential was unusable, so the grant **may still be live**. `ok` means Google returned a 2xx or HTTP 400 `invalid_token`, meaning the token is already revoked, expired or unknown.
-- **`skipped_unsafe` has two meanings.** Usually `revoke_is_safe` found another live connection to the same Google account (expected under the default `ECC_GMAIL_REVOKE_SCOPE=global`). At `site="adapter_callback"` it also counts a revoke-safety check that itself failed (a database error), which fails closed and is not counted as `error`. Read an `adapter_callback` `skipped_unsafe` rise as "maybe DB trouble" too, and check the `gmail_revoke_on_reject_check_failed` log line.
-- **Every Gmail callback refusal also revokes at `site="callback_failure"`.** That covers `identity_mismatch`, `owned_by_another_member`, `membership_inactive` and `insufficient_role`. The minted grant is revoked iff safe; under `global` an owner-conflict refusal is always `skipped_unsafe`, because the other member's row is live. So `callback_failure` volume tracks refusals. Net the refusals out before treating a `callback_failure` trend as an adapter problem (recording rule below).
+- **A failed revoke-safety check usually counts as `error`.** When the `revoke_is_safe` query itself fails (a database error), the revoke is not attempted (fail closed). At the `revoke_if_safe` sites -- `callback_failure`, `callback_duplicate`, `reconnect_replaced`, `disable`, `cascade`, `remediation` -- that is counted `result="error"` and logged `connector_revoke_safety_check_failed provider=<p> site=<s> error_class=<C>`; the grant was not revoked, so treat it like any other error.
+- **`skipped_unsafe` has two meanings.** Usually `revoke_is_safe` found another live connection to the same Google account (expected under the default `ECC_GMAIL_REVOKE_SCOPE=global`). At two sites it also counts a revoke-safety check that itself failed, which fails closed and is **not** counted as `error`: `site="adapter_callback"` (log `gmail_revoke_on_reject_check_failed: error_class=<C>`) and `site="removal"` (log `removal_revoke_safety_check_failed error_class=<C>`). Read a `skipped_unsafe` rise at those sites as "maybe DB trouble" too, and check those log lines.
+- **Every Gmail callback refusal also revokes at `site="callback_failure"`.** That covers `identity_mismatch`, `owned_by_another_member`, `membership_inactive` and `insufficient_role`. The minted grant is revoked iff safe. Under `global`, an owner-conflict refusal counts `skipped_unsafe` while the other member's row is live (not `disconnected`); if that row is disconnected and no other live row anywhere uses the Google account, the minted grant is revoked and counted `ok` or `error`. So `callback_failure` volume tracks refusals. Net the refusals out before treating a `callback_failure` trend as an adapter problem (recording rule below).
 - **The refresh canary only sees manual syncs.** Gmail sync is manual-only, and a refresh happens only when a sync finds the access token expired, at least about 59 minutes after connect. The spec's original rule (`since_reconnect="lt_1h"` > 0) can never fire, and a duplicate-callback revoke writes no reconnect audit row to bucket against. The canary is therefore `invalid_grant` in **any** bucket, above its own baseline (plan note N18). Detection latency is "the next manual sync of an affected connector after its access token expires". It does not count Gmail API 401s during a sync, so the R2 check in the rollout runbook also watches sync runs.
 
 ## Rules
@@ -246,12 +247,26 @@ tests:
 
 This test has not been run here: promtool is not available in this environment. Run it before loading the rules.
 
+## Revoke-error evidence
+
+Every path that counts `ecc_connector_revoke_total{result="error"}` writes at least one of these log lines (process log of the API worker that did the revoke; the remediation script logs to its own stderr). Audit events are **not** a reliable signal: several sites write none.
+
+| Site(s) | Log line(s) that accompany the `error` | Audit event to look for |
+|---|---|---|
+| any site through `revoke_guarded` (`callback_failure`, `callback_duplicate`, `reconnect_replaced`, `disable`, `cascade`, `removal`, `remediation`) | `connector_revoke_failed provider=<p> site=<s> error_class=<C>`; for Gmail also `gmail_revoke_failed: reason=<reason> status=<status>` (plus `gmail_revoke_post_failed: error_class=<C>` on a transport failure) | `disable`: `connector_account.disabled`; `removal`: `connector_account.disabled` (`member_removed`); `remediation`: `connector_account.disabled` (`operator_remediation`); `cascade`: the email consent revoke / domain disable or delete audit; `callback_failure`: `connector_account.enrollment_refused` for a refusal, **none** for an adapter or persistence failure; `callback_duplicate`, `reconnect_replaced`: **none required** (a reconnect may have its own connector event) |
+| `revoke_if_safe` sites (all of the above except `removal`) when the safety check fails | `connector_revoke_safety_check_failed provider=<p> site=<s> error_class=<C>` | as above |
+| `removal`, stored credential could not be decrypted | `removal_revoke_credential_unavailable error_class=<C>` | `connector_account.disabled` (`member_removed`) |
+| `remediation`, stored credential could not be decrypted | `remediation_revoke_credential_unavailable error_class=<C>` (script output; the process is not scraped) | `connector_account.disabled` (`operator_remediation`) |
+| `adapter_callback` (the adapter rejected a Google account after token exchange) | `gmail_revoke_failed: reason=<reason> status=<status>` (plus `gmail_revoke_post_failed: error_class=<C>` on a transport failure); no `connector_revoke_failed` line | **none** |
+
+No log line carries an email or account id. When the audit event is missing, identify the mailbox from the request time (the member who was connecting or reconnecting) and ask that member to check Google's third-party access list.
+
 ## What an alert means and what to do
 
 | Alert | First action |
 |---|---|
-| `EccConnectorRevokeFailed` / `EccConnectorRevokeErrorRatioHigh` | Follow "Google revoke failed" in [`PHASE-10-GMAIL-RECOVERY.md`](../runbooks/PHASE-10-GMAIL-RECOVERY.md). Find the connector from the disconnect, removal or purge audit event at that time, and ask the mailbox owner to remove the app's access at Google. During R2 to R7 any occurrence resets the two-week clean window. |
-| `EccGmailRefreshInvalidGrantAboveBaseline` | Under `ECC_GMAIL_REVOKE_SCOPE=none`, the revoke of one token may have killed a grant another live row uses. Set the scope back to `global` and restart every process, then record it in the D2 record. Under `global`, check for users revoking access at Google themselves. |
+| `EccConnectorRevokeFailed` / `EccConnectorRevokeErrorRatioHigh` | **Treat it as real by default.** Follow "Google revoke failed" in [`PHASE-10-GMAIL-RECOVERY.md`](../runbooks/PHASE-10-GMAIL-RECOVERY.md): find the event with the [revoke-error evidence table](#revoke-error-evidence) below, identify the connector or mailbox, and ask the mailbox owner to remove the app's access at Google. During R2 to R7 a real occurrence resets the two-week clean window. Only if **no** log line from that table exists for the alert's provider and site on any API process in the window (60 minutes before the alert to its end) is it a false positive (see "Remaining false positives"); record the empty log search as evidence. |
+| `EccGmailRefreshInvalidGrantAboveBaseline` | Find the sync runs that failed with `invalid_grant` at that time and ask their mailbox owners whether they removed the app's access at Google (the most common cause of a single `invalid_grant`), and check whether an ECC revoke (`site` `callback_duplicate`, `reconnect_replaced`, `disable`) touched the same Google account shortly before. If an owner confirms they removed access themselves and no ECC revoke matches, record it as benign. If an ECC revoke matches under `ECC_GMAIL_REVOKE_SCOPE=none`, the revoke of one token killed a grant another live row uses: set the scope back to `global`, restart every process, and record it in the D2 record. |
 | `EccPersonalDataShareRefusedSpike` | Expected in small numbers after R5, while people discover that email-derived rows cannot be shared. A spike from one path (for example `transfer`) usually means a workflow, such as removal preparation, is pushing admins to transfer. Check the `personal_data.share_refused` audit events. |
 | `EccGmailIdentityMismatchRefused` | DS1 (no aliases) is working as designed. Tell the member to connect the Google account whose email matches their ECC account. A burst may mean a member is probing other people's mailboxes. |
 | `EccGmailOwnerConflictRefused` / `EccPersonalConnectorAccessDenied` | Check whether this was legitimate confusion (shared mailbox) or probing. The audit event names the actor. |
@@ -262,6 +277,7 @@ This test has not been run here: promtool is not available in this environment. 
 
 | Version | Date | Summary | Author |
 |---|---|---|---|
+| 1.3.0 | 2026-10-01 | PR review: revoke errors are real by default; new "Revoke-error evidence" table lists every log line (and audit event, if any) per site, and a false positive needs an empty log search; a failed safety check counts `error` except at `adapter_callback` and `removal`; owner-conflict refusals are `skipped_unsafe` only while the other row is live; canary first action confirms user-side removal before recording it benign | Lucky Jain |
 | 1.2.0 | 2026-10-01 | Review fix (also: a fresh TSDB or replaced Prometheus server listed as a one-off false-positive cause): the new-series term is now `X unless last_over_time(X[55m] offset 5m)` (range selectors skip staleness markers and gaps), so a scrape gap or stale marker no longer re-fires existing series; a new series fires for about 5 minutes; remaining false positives (gap over 55 minutes, relabelling) documented; promtool test gains a stale/gap case | Lucky Jain |
 | 1.1.0 | 2026-10-01 | Review fix: counters create each label set lazily at 1, so `increase()` alone misses the first event after every restart. Revoke-failed, canary, identity-mismatch, owner-conflict and access-denied rules gain a new-series term (`X unless X offset 55m`). Documented the remaining blind spot until counters are pre-initialised, and added a promtool unit-test snippet | Lucky Jain |
 | 1.0.0 | 2026-10-01 | First alert rules for the Spec A counters: truthful revoke failures, the corrected refresh canary (all buckets above baseline), personal-data share-refused spikes, identity-mismatch / owner-conflict / access-denied notices and two recording rules | Lucky Jain |

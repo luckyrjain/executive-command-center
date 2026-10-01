@@ -170,7 +170,13 @@ def _governed_class(relative: Path, metadata: dict[str, object]) -> tuple[str, s
         if name in {"CONSISTENCY-REVIEW.md", "FINAL-ACCEPTANCE.md"}:
             return "validation record", RUNBOOK_STATUSES
         return "phase contract", PHASE_STATUSES
-    if value.startswith(("docs/runbooks/", "docs/operations/", "docs/evidence/")):
+    operational_prefixes = (
+        "docs/runbooks/",
+        "docs/operations/",
+        "docs/evidence/",
+        "docs/observability/",
+    )
+    if value.startswith(operational_prefixes):
         return "runbook", RUNBOOK_STATUSES
     if value.startswith("docs/product/"):
         return "product contract", PHASE_STATUSES
