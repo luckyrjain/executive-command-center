@@ -38,6 +38,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.observability import record_idempotency_conflict
+from ecc.platform import authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 from ecc.platform.request_models import EmptyBody as _EmptyBody
 
@@ -237,6 +238,7 @@ def delete_domain_endpoint(
     now = datetime.now(UTC)
     pending_gmail_revokes: list[PendingGmailRevoke] = []
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="read")
         lock_idempotency(session, auth, idempotency_key)
 
         # `for_update=True` (Loop 2 round 11 review finding, corrected round

@@ -64,6 +64,7 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.config import get_settings
 from ecc.domains.ai_runtime.runtime import OllamaAdapterDep, execute_run
+from ecc.platform import authz
 from ecc.platform.idempotency import (
     held_idempotency_lock,
     load_cached,
@@ -223,7 +224,13 @@ def generate_insight_endpoint(
 
         output = run.output
         cited_record_ids: list[str] = list(output.get("cited_record_ids", []))
+        # The only transaction here that writes the caller's personal data,
+        # so the only one that takes the membership lock (ADR-0014) -- after
+        # the model call, never across it. The cache read above and the
+        # idempotency-bookkeeping writes around it store only the caller's
+        # own cached response.
         with session.begin():
+            authz.lock_membership_for_write(session, auth, role_action="read")
             period_start, period_end = _cited_record_period(
                 session, auth, cited_record_ids, now=now
             )

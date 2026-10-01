@@ -76,7 +76,7 @@ from ecc.domains.personal.gmail_revocation import (
     finish_gmail_revocation,
 )
 from ecc.observability import queue_lifecycle_event, record_idempotency_conflict
-from ecc.platform import audit_outbox
+from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 from ecc.platform.request_models import EmptyBody as _EmptyBody
 
@@ -439,6 +439,7 @@ def _enable_domain(
     req_hash = request_hash(payload, "enable_domain")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="read")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(session, auth, idempotency_key, req_hash, domain="personal_domains")
         if cached is not None:
@@ -641,6 +642,7 @@ def _disable_domain(
     now = datetime.now(UTC)
     pending_gmail_revokes: list[PendingGmailRevoke] = []
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="read")
         lock_idempotency(session, auth, idempotency_key)
 
         # `get_domain` moved ahead of `load_cached` (Loop 2 round 21 review
@@ -1003,6 +1005,7 @@ def create_record_endpoint(
     req_hash = request_hash(payload, "create_record")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="read")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(session, auth, idempotency_key, req_hash, domain="personal_record")
         if cached is not None:
@@ -1166,6 +1169,7 @@ def update_record_endpoint(
     req_hash = request_hash(payload, f"update_record:{record_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="read")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(session, auth, idempotency_key, req_hash, domain="personal_record")
         if cached is not None:

@@ -31,7 +31,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.observability import queue_lifecycle_event
-from ecc.platform import audit_outbox
+from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 from ecc.platform.request_models import EmptyBody as _EmptyBody
 
@@ -131,6 +131,7 @@ def create_grant_endpoint(
     req_hash = request_hash(payload, "create_grant")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="read")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(session, auth, idempotency_key, req_hash, domain="cross_domain_grant")
         if cached is not None:
@@ -205,6 +206,7 @@ def revoke_grant_endpoint(
     req_hash = request_hash(_EmptyBody(), f"revoke_grant:{grant_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="read")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(session, auth, idempotency_key, req_hash, domain="cross_domain_grant")
         if cached is not None:
