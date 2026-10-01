@@ -367,6 +367,7 @@ def create_candidate(
     req_hash = request_hash(payload, "create_candidate")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="write")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
@@ -700,6 +701,7 @@ def _decide_candidate(
     req_hash = request_hash(payload, f"{action}:{candidate_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
@@ -880,6 +882,7 @@ def defer_candidate(
     now = datetime.now(UTC)
     req_hash = request_hash(payload, f"defer:{candidate_id}")
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,

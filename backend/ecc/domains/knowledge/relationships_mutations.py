@@ -44,6 +44,7 @@ def invalidate_relationship(
     req_hash = request_hash(payload, f"invalidate:{relationship_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,

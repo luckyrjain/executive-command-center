@@ -257,6 +257,7 @@ def merge_entities(
     req_hash = request_hash(payload, "merge")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="write")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
@@ -577,6 +578,7 @@ def reverse_operation(
     req_hash = request_hash(payload, f"reverse:{operation_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
@@ -864,6 +866,7 @@ def split_operation(
     req_hash = request_hash(payload, f"split:{operation_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
