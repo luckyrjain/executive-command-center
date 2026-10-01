@@ -504,9 +504,22 @@ def pin_recommendation(
     )
 
 
+def _row_owner_id(session: Session, auth: AuthContext, recommendation_id: UUID) -> UUID | None:
+    """The recommendation's current owner. Read after `get_row(..., for_update=
+    True)` took the row lock, so it is the committed post-transfer value."""
+    owner = session.execute(
+        text(
+            "SELECT owner_id FROM recommendations "
+            "WHERE workspace_id = :workspace_id AND id = :recommendation_id"
+        ),
+        {"workspace_id": auth.workspace_id, "recommendation_id": recommendation_id},
+    ).scalar_one_or_none()
+    return None if owner is None else UUID(str(owner))
+
+
 def _require_email_consent_for_confirm(
     session: Session, auth: AuthContext, recommendation_id: UUID
-) -> None:
+) -> UUID | None:
     """FX5 round 3: confirming an `email_action_detected` recommendation
     copies its Gmail-derived content into a new task and marks it
     `executed` -- a row the revocation cascade only redacts. So its owner's
@@ -539,8 +552,14 @@ def _require_email_consent_for_confirm(
     transferred row is outside the old mailbox owner's cascade either way,
     and the check can only refuse more, never allow a write the cascade
     would otherwise have to clean up. A transfer racing this unlocked read
-    at worst checks the previous owner. No refusal audit: none of this
-    endpoint's other 4xx refusals write one either.
+    would check the previous owner, so the owner checked is returned and the
+    caller compares it with the owner on the locked row, refusing with a
+    retryable 409 on a mismatch (the consent locks cannot be re-taken after
+    the row lock, see above). No refusal audit: none of this endpoint's
+    other 4xx refusals write one either.
+
+    Returns the owner whose consent was checked, or None when the
+    recommendation is not email-derived (nothing was checked).
     """
     # Deferred import: `personal` already imports this module (the
     # detection hook calls `create_recommendation`), so importing it back at
@@ -554,8 +573,10 @@ def _require_email_consent_for_confirm(
         ),
         {"workspace_id": auth.workspace_id, "recommendation_id": recommendation_id},
     ).one_or_none()
+    # `recommendations.owner_id` is NOT NULL, so the `is None` arm is defensive:
+    # an email-derived row always has an owner to compare on the locked row.
     if target is None or target[0] != EMAIL_RECOMMENDATION_TYPE or target[1] is None:
-        return
+        return None
     try:
         require_email_consent_locked(
             session,
@@ -565,6 +586,7 @@ def _require_email_consent_for_confirm(
         )
     except EmailConsentInactiveError:
         raise HTTPException(status_code=403, detail=EmailConsentInactiveError.code) from None
+    return UUID(str(target[1]))
 
 
 @router.post("/{recommendation_id}/confirm", response_model=RecommendationResponse)
@@ -593,7 +615,7 @@ def confirm_recommendation(
         action="write",
     ):
         raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-    _require_email_consent_for_confirm(session, auth, recommendation_id)
+    consent_owner_id = _require_email_consent_for_confirm(session, auth, recommendation_id)
     # Lock before authorizing: an ownership transfer that commits while
     # this request waits on the row lock must be seen by the checks below
     # (READ COMMITTED: each later statement reads the committed row), not
@@ -614,6 +636,17 @@ def confirm_recommendation(
         action="write",
     ):
         raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+    # The consent above was checked for the owner read before this lock. An
+    # ownership transfer that committed while the request waited on the row
+    # lock changed it; the consent locks cannot be re-taken here without
+    # inverting their order against the revocation cascade, so refuse (after
+    # the authorization pair, so a caller who lost access still reads 404)
+    # and let the retry check the new owner's consent. Nothing is written.
+    if (
+        consent_owner_id is not None
+        and _row_owner_id(session, auth, recommendation_id) != consent_owner_id
+    ):
+        raise HTTPException(status_code=409, detail="RECOMMENDATION_OWNER_CHANGED")
     row = expire_if_needed(session, auth, locked, request=request)
     check_version(row, payload.expected_version)
     is_create = row["proposed_action"].get("operation") == "create"
