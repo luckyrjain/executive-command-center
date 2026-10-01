@@ -307,8 +307,13 @@ def _park_queued_runs_for_review(
             text(
                 "UPDATE workflow_runs SET status = 'needs_review', leased_by = NULL, "
                 "leased_until = NULL, updated_at = :now "
+                # Locked in `id` order (the sub-select), the same order
+                # `worker.cancel_runs_for_removed_member` locks runs in; two
+                # lockers of overlapping runs in different orders deadlock.
+                "WHERE id IN (SELECT id FROM workflow_runs "
                 "WHERE workspace_id = :workspace_id AND status = 'queued' "
-                f"{scope_clause} RETURNING id"
+                f"{scope_clause} ORDER BY id FOR UPDATE) "
+                "AND status = 'queued' RETURNING id"
             ),
             params,
         ).all()

@@ -739,6 +739,21 @@ def approve_endpoint(
         if cached is not None:
             return cached
 
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        # (`decide_approval` re-selects this row FOR UPDATE below:
+        # a no-op re-lock within this transaction.)
+        locked = session.execute(
+            text(
+                "SELECT id FROM approval_requests "
+                "WHERE workspace_id = :workspace_id AND id = :id FOR UPDATE"
+            ),
+            {"workspace_id": auth.workspace_id, "id": approval_id},
+        ).one_or_none()
+        if locked is None:
+            raise HTTPException(status_code=404, detail="APPROVAL_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="approval_requests", resource_id=approval_id, action="read"
         ):
@@ -831,6 +846,21 @@ def reject_endpoint(
         if cached is not None:
             return cached
 
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        # (`decide_approval` re-selects this row FOR UPDATE below:
+        # a no-op re-lock within this transaction.)
+        locked = session.execute(
+            text(
+                "SELECT id FROM approval_requests "
+                "WHERE workspace_id = :workspace_id AND id = :id FOR UPDATE"
+            ),
+            {"workspace_id": auth.workspace_id, "id": approval_id},
+        ).one_or_none()
+        if locked is None:
+            raise HTTPException(status_code=404, detail="APPROVAL_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="approval_requests", resource_id=approval_id, action="read"
         ):

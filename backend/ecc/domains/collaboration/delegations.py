@@ -406,12 +406,19 @@ def _expire_due(
     params: dict[str, Any] = {"workspace_id": workspace_id, "now": now}
     if account_id is not None:
         params["account_id"] = account_id
+    # Rows are locked in `id` order (the sub-select), not whatever order the
+    # UPDATE's plan scans them in: `lock_delegations_for_removed_member`
+    # locks an overlapping set of rows in `id` order, and two bulk lockers
+    # taking the same rows in different orders deadlock.
     expired_rows = (
         session.execute(
             text(
                 "UPDATE delegations SET status = 'expired', updated_at = :now "
+                "WHERE id IN (SELECT id FROM delegations "
                 "WHERE workspace_id = :workspace_id AND status = 'proposed' AND due_at < :now "
-                f"{clause}RETURNING id, delegator_account_id, recipient_account_id"  # noqa: S608 -- clause is a code literal; values bound
+                f"{clause}ORDER BY id FOR UPDATE) "  # noqa: S608 -- clause is a code literal; values bound
+                "AND status = 'proposed' AND due_at < :now "
+                "RETURNING id, delegator_account_id, recipient_account_id"
             ),
             params,
         )
@@ -439,6 +446,29 @@ def _expire_due(
             },
             now=now,
         )
+
+
+def lock_delegations_for_removed_member(
+    session: Session, *, workspace_id: UUID, account_id: UUID
+) -> None:
+    """Locks every `proposed`/`accepted` delegation naming `account_id`, for
+    `remove_member_endpoint` to take before it locks any resource row (the
+    isolation block's personal rows, then run cancellation -- see the lock
+    order comment at that call site) and before
+    `cancel_delegations_for_removed_member` updates them. Accept locks the
+    delegation, then its evidence resources, then inserts grants; removal
+    must take the delegation first too, or a removal holding a run that is
+    evidence on a delegation being accepted deadlocks against that accept.
+    """
+    session.execute(
+        text(
+            "SELECT id FROM delegations "
+            "WHERE workspace_id = :workspace_id AND status IN ('proposed', 'accepted') "
+            "AND (delegator_account_id = :account_id OR recipient_account_id = :account_id) "
+            "ORDER BY id FOR UPDATE"
+        ),
+        {"workspace_id": workspace_id, "account_id": account_id},
+    )
 
 
 def cancel_delegations_for_removed_member(
@@ -508,7 +538,7 @@ def _lock_resources(
     `SHARE` suffices when the caller only reads the rows (it still blocks a
     transfer's `FOR UPDATE`); `UPDATE` when it goes on to write them.
     """
-    for resource_type, resource_id in sorted(set(refs), key=lambda r: (r[0], str(r[1]))):
+    for resource_type, resource_id in sorted(set(refs)):
         authz.require_known_resource_type(resource_type)
         session.execute(
             text(
@@ -549,10 +579,18 @@ def _grant_evidence(
     # `timezone` is a placeholder -- `authorize()`'s six-step decision never
     # reads it, so fetching the delegator's real one would be a wasted query.
     delegator_auth = AuthContext(workspace_id=workspace_id, user_id=granted_by, timezone="UTC")
-    evidence = _evidence_for(session, delegation_id)
+    # Canonical (type, id) order, not `_evidence_for`'s insertion order:
+    # two delegations naming the same private resources in different orders
+    # would otherwise lock them in different orders when accepted together,
+    # and deadlock.
+    evidence = sorted(
+        _evidence_for(session, delegation_id),
+        key=lambda item: (item.resource_type, item.resource_id),
+    )
     # Lock before authorizing: a transfer of an evidence resource that
     # commits while this request waits on its row lock must be seen by the
     # re-check below, not granted to the recipient on a pre-transfer check.
+    # `_lock_resources` takes them in the same canonical order.
     _lock_resources(
         session,
         workspace_id,
