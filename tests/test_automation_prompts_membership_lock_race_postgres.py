@@ -70,7 +70,6 @@ _SEEDED_TABLES = (
     "workflow_definitions",
 )
 _WRITE_TABLES = (*_SEEDED_TABLES, "audit_events", "event_outbox", "idempotency_records")
-_GLOBAL_TABLES = ("prompt_versions", "tool_definitions")
 
 _DIGEST = "a" * 64
 _GRAPH = {"steps": [{"step_id": "s1", "step_type": "condition"}]}
@@ -387,16 +386,18 @@ def admin_world(world: RaceWorld) -> Iterator[RaceWorld]:
             )
 
 
-def _global_fingerprint() -> dict[str, str | None]:
+def _global_fingerprint() -> str | None:
+    """This test's own tool family in the global `tool_definitions` table
+    (not workspace-scoped), so other tests touching the table can't make
+    it flaky."""
     with engine.connect() as connection:
-        return {
-            table: connection.execute(
-                text(
-                    f"SELECT md5(string_agg(t::text, '|' ORDER BY t::text)) FROM {table} t"  # noqa: S608
-                )
-            ).scalar_one()
-            for table in _GLOBAL_TABLES
-        }
+        return connection.execute(
+            text(
+                "SELECT md5(string_agg(t::text, '|' ORDER BY t::text)) "
+                "FROM tool_definitions t WHERE t.name = :name"
+            ),
+            {"name": _TOOL},
+        ).scalar_one()
 
 
 def _tool_statuses() -> dict[int, str]:
