@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthDep, CsrfDep
 from ecc.database import get_session
+from ecc.domains.knowledge.embeddings import embed_after_commit
 from ecc.domains.knowledge.entity_lookup import refresh_projections as _refresh_projections
 from ecc.observability import queue_lifecycle_event
 from ecc.platform import audit_outbox, authz
@@ -158,7 +159,8 @@ def delete_evidence(
     content from search, not just a state flag with no observable effect."""
     req_hash = request_hash(payload, f"delete:{evidence_id}")
     now = datetime.now(UTC)
-    with session.begin():
+    with embed_after_commit(session), session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,

@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
+from ecc.domains.knowledge.embeddings import embed_after_commit
 from ecc.domains.knowledge.entity_lookup import refresh_projections as _refresh_projections
 from ecc.domains.knowledge.timeline import queue_timeline_entry
 from ecc.observability import queue_lifecycle_event
@@ -257,6 +258,7 @@ def merge_entities(
     req_hash = request_hash(payload, "merge")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="write")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
@@ -576,7 +578,8 @@ def reverse_operation(
 ) -> EntityOperationResponse:
     req_hash = request_hash(payload, f"reverse:{operation_id}")
     now = datetime.now(UTC)
-    with session.begin():
+    with embed_after_commit(session), session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
@@ -863,7 +866,8 @@ def split_operation(
     split succeeds against the very same post-merge claim."""
     req_hash = request_hash(payload, f"split:{operation_id}")
     now = datetime.now(UTC)
-    with session.begin():
+    with embed_after_commit(session), session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,

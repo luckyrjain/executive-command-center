@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.domains.knowledge.embeddings import queue_embedding
+from ecc.domains.knowledge.embeddings import defer_embedding, embed_after_commit
 from ecc.domains.knowledge.entities import EntityResponse, project_entity
 from ecc.domains.knowledge.entity_lookup import ENTITY_FIELDS as _ENTITY_FIELDS
 from ecc.domains.knowledge.entity_lookup import get_entity_row as _get_row
@@ -61,7 +61,8 @@ def update_entity(
 ) -> EntityResponse:
     req_hash = request_hash(payload, f"update:{entity_id}")
     now = datetime.now(UTC)
-    with session.begin():
+    with embed_after_commit(session), session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
@@ -159,7 +160,7 @@ def update_entity(
             response.version,
             now,
         )
-        queue_embedding(session, auth.workspace_id, entity_id, now)
+        defer_embedding(session, auth.workspace_id, entity_id)
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
@@ -178,6 +179,7 @@ def _transition_action(
     req_hash = request_hash(payload, f"{action}:{entity_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,

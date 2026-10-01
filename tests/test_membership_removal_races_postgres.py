@@ -724,10 +724,10 @@ def test_detection_recommendation_not_written_after_removal_before_insert(
     world: RaceWorld,
 ) -> None:
     """A-2: the run persisted while C was active (a retained personal row);
-    C's removal commits inside `create_recommendation` AFTER its (unlocked)
-    role check passed and BEFORE the insert -- via `request_hash`, which
-    runs between the two. Only the locked membership re-check can refuse
-    here: it does, and no recommendation is written."""
+    C's removal commits inside `create_recommendation` BEFORE its locked
+    membership and role check -- via `request_hash`, which runs first. That
+    check sees the committed removal and refuses, and no recommendation is
+    written."""
     connector = world.connect(world.c, "c")
     removal_result: dict[str, httpx.Response] = {}
     original = recommendation_mutations_module.request_hash

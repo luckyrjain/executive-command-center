@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.domains.knowledge.embeddings import queue_embedding
+from ecc.domains.knowledge.embeddings import defer_embedding, embed_after_commit
 from ecc.domains.knowledge.entity_lookup import (
     entity_retrieval_fields as _entity_retrieval_fields,
 )
@@ -186,7 +186,8 @@ def create_claim(
 ) -> ClaimResponse:
     req_hash = request_hash(payload, f"create:{entity_id}")
     now = datetime.now(UTC)
-    with session.begin():
+    with embed_after_commit(session), session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
@@ -282,7 +283,7 @@ def create_claim(
             queue_retrieval_document(
                 session, auth.workspace_id, entity_id, kind, canonical_name, summary, version, now
             )
-            queue_embedding(session, auth.workspace_id, entity_id, now)
+            defer_embedding(session, auth.workspace_id, entity_id)
         store_idempotency(
             session,
             auth,
@@ -367,7 +368,8 @@ def supersede_claim(
 ) -> ClaimResponse:
     req_hash = request_hash(payload, f"supersede:{entity_id}:{claim_id}")
     now = datetime.now(UTC)
-    with session.begin():
+    with embed_after_commit(session), session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
@@ -484,7 +486,7 @@ def supersede_claim(
             queue_retrieval_document(
                 session, auth.workspace_id, entity_id, kind, canonical_name, summary, version, now
             )
-            queue_embedding(session, auth.workspace_id, entity_id, now)
+            defer_embedding(session, auth.workspace_id, entity_id)
         store_idempotency(
             session,
             auth,
