@@ -21,7 +21,9 @@ _MODULES = (*(DOMAINS / "automation").glob("*.py"), DOMAINS / "ai_runtime" / "pr
 _ALLOWED: Counter[tuple[str, str]] = Counter(
     {
         # Scheduler tick: fires due schedule triggers (enqueue + trigger
-        # bookkeeping) per commit, no caller.
+        # bookkeeping) per commit, no caller AuthContext for the helper. Its
+        # fire transaction takes the raw `lock_membership_shared` first, so
+        # the trigger creator's membership check in `enqueue_run` holds.
         ("scheduler.py", "run_scheduler_once"): 1,
         # Worker lease/claim and run/step state machine, driven by the
         # background worker loop. `run_step` and

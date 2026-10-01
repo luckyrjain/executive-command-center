@@ -784,7 +784,10 @@ def personal_data_share_guard(
 # opts in too) and recommendation insert
 # (`governance/recommendation_mutations.create_recommendation`, through
 # `authz.lock_membership_for_write` as for every caller, raising
-# `MembershipInactiveError` for an inactive actor); ownership transfer
+# `MembershipInactiveError` for an inactive actor); the automation
+# scheduler's fire transaction (`automation/scheduler.run_scheduler_once`,
+# before the trigger row lock, guarding `enqueue_run`'s creator check);
+# ownership transfer
 # (`platform/authz_grants`); and every authorized write transaction in the modules below, through
 # `authz.lock_membership_for_write`, which can also re-check the caller's
 # role under the lock (ADR-0014; adopted module by module, each set guarded

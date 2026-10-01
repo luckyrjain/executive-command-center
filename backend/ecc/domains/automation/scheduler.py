@@ -191,6 +191,7 @@ from croniter import croniter
 from sqlalchemy.orm import Session
 
 from ecc.observability import record_schedule_lag
+from ecc.platform.connector_security import lock_membership_shared
 
 from . import triggers as triggers_module
 from . import worker as worker_module
@@ -511,6 +512,15 @@ def run_scheduler_once(
         # when this instance does win, preserving the original durability
         # guarantee (module docstring's durability section).
         with session_factory() as session:
+            # Shared membership lock FIRST (ADR-0014; before the trigger row
+            # lock below), so `enqueue_run`'s check that the trigger's
+            # creator is still an active member cannot be overtaken: a
+            # removal that already committed is seen there, and one that
+            # starts later waits for this commit and then cancels the queued
+            # run (`cancel_runs_for_removed_member`). Without it, a removal
+            # committing between that check and this commit would leave a
+            # run queued for a removed member that nothing cancels.
+            lock_membership_shared(session, trigger.workspace_id)
             won_race = triggers_module.mark_trigger_fired(
                 session,
                 trigger.workspace_id,
