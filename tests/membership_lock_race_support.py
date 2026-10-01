@@ -344,9 +344,15 @@ def assert_proceeds(w: RaceWorld, case: Case, ids: Ids) -> None:
 _LOCK_CALL = "authz.lock_membership_for_write("
 
 
-def _session_calls(fn: ast.AST) -> list[ast.Call]:
-    """Calls that touch the session: `session.<method>(...)` or any call
-    passing `session` as an argument, in source order."""
+def _is_session(node: ast.AST) -> bool:
+    """A name bound to a Session: `session`, or any `*_session`
+    (`create_session`, `outcome_session`, ...)."""
+    return isinstance(node, ast.Name) and node.id.endswith("session")
+
+
+def _session_calls(fn: ast.AST, name: str) -> list[ast.Call]:
+    """Calls that touch the session named `name`: `<name>.<method>(...)` or
+    any call passing `<name>` as an argument, in source order."""
     calls = []
     for node in ast.walk(fn):
         if not isinstance(node, ast.Call):
@@ -355,10 +361,10 @@ def _session_calls(fn: ast.AST) -> list[ast.Call]:
         on_session = (
             isinstance(func, ast.Attribute)
             and isinstance(func.value, ast.Name)
-            and func.value.id == "session"
+            and func.value.id == name
         )
         passes_session = any(
-            isinstance(arg, ast.Name) and arg.id == "session"
+            isinstance(arg, ast.Name) and arg.id == name
             for arg in (*node.args, *(kw.value for kw in node.keywords))
         )
         if on_session or passes_session:
@@ -366,14 +372,29 @@ def _session_calls(fn: ast.AST) -> list[ast.Call]:
     return sorted(calls, key=lambda call: (call.lineno, call.col_offset))
 
 
+def _begins(node: ast.With) -> list[str]:
+    """Session names this `with` opens a transaction on (`<name>.begin()`)."""
+    return [
+        expr.func.value.id
+        for expr in (item.context_expr for item in node.items)
+        if isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "begin"
+        and not expr.args
+        and _is_session(expr.func.value)
+        and isinstance(expr.func.value, ast.Name)
+    ]
+
+
 def unlocked_transactions(paths: Iterable[Path]) -> Counter[tuple[str, str]]:
     """(module, function) -> number of write transactions that do not take
-    the membership lock first. Two shapes are checked:
+    the membership lock first. Two shapes are checked, for `session` and
+    every other session name (`*session`):
 
-    - every `with session.begin():` block must start with the lock call;
+    - every `with <session>.begin():` block must start with the lock call;
     - a function that commits an autobegun transaction itself
-      (`session.commit()` outside any `session.begin()` block) must make
-      the lock call its first session-touching call.
+      (`<session>.commit()` on a session it never opens with `begin()`)
+      must make the lock call its first call touching that session.
     """
     found: Counter[tuple[str, str]] = Counter()
     for path in sorted(paths):
@@ -382,21 +403,25 @@ def unlocked_transactions(paths: Iterable[Path]) -> Counter[tuple[str, str]]:
             if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
                 continue
             key = (path.name, fn.name)
-            begin_blocks = [
-                node
-                for node in ast.walk(fn)
-                if isinstance(node, ast.With)
-                and any(ast.unparse(item.context_expr) == "session.begin()" for item in node.items)
-            ]
-            for block in begin_blocks:
-                if not ast.unparse(block.body[0]).startswith(_LOCK_CALL):
+            begun: set[str] = set()
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.With) or not (names := _begins(node)):
+                    continue
+                begun.update(names)
+                if not ast.unparse(node.body[0]).startswith(_LOCK_CALL):
                     found[key] += 1
-            if begin_blocks:
-                continue
-            commits = any(ast.unparse(call) == "session.commit()" for call in _session_calls(fn))
-            if not commits:
-                continue
-            first = _session_calls(fn)[0]
-            if not ast.unparse(first).startswith(_LOCK_CALL):
-                found[key] += 1
+            committed = {
+                call.func.value.id
+                for call in ast.walk(fn)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "commit"
+                and not call.args
+                and _is_session(call.func.value)
+                and isinstance(call.func.value, ast.Name)
+            }
+            for name in sorted(committed - begun):
+                first = _session_calls(fn, name)[0]
+                if not ast.unparse(first).startswith(_LOCK_CALL):
+                    found[key] += 1
     return found
