@@ -2,8 +2,9 @@
 id: PHASE-010-PRIVACY-CONSENT-CONTRACT
 title: Phase 10 Gmail Privacy and Consent Contract
 status: Approved for Implementation
-version: 1.5.0
+version: 1.6.0
 owner: Lucky Jain
+updated: 2026-10-01
 depends_on:
   - PHASE-010
   - PHASE-007-DOMAIN-PRIVACY-CONTRACT
@@ -291,6 +292,45 @@ single forgotten thread's own evidence still is not independently
 reachable by any endpoint (a real, disclosed gap -- there is no per-
 thread evidence-propagation action, only the domain-wide one).
 
+## Personal-data isolation (Security Remediation Spec A)
+
+Before this change, any workspace member could read, sync or share another member's Gmail connector and the content derived from it. Security remediation Spec A makes that data **owner-only at the data layer**. It is behind `ECC_PERSONAL_DATA_ISOLATION`, turned on at rollout step R5 (`docs/runbooks/SPEC-A-ROLLOUT.md`).
+
+**Private to the mailbox owner** (`visibility='private'`, owner = the mailbox owner). Rows written before the flag was enabled are brought to this state by `scripts/backfill_personal_visibility.py`:
+
+- the `gmail` connector row, its sync runs and sync cursors;
+- `email_thread` attention items;
+- `email_action_detected` recommendations;
+- `email.*` AI runs and their steps;
+- `gmail_sync` evidence;
+- tasks, commitments and risks created by confirming an `email_action_detected` recommendation. They copy email-derived text, and are owned by the recommendation's owner.
+
+Workspace owners and admins get no read access to these rows through the domain endpoints (the audit log is the exception, see below). There is no admin break-glass; the route is member removal (decision Q-A1).
+
+**Not shareable.** Grants, grant previews, ownership transfers and delegations of any of these rows are refused with `400 RESOURCE_TYPE_NOT_GRANTABLE` and a `personal_data.share_refused` audit event. Sharing (granting, transferring or delegating) feedback rows on email recommendations and email attention items is also refused; giving feedback is unaffected. The refusal applies to the owner too: whether owners may share their own email-derived rows is an open product question.
+
+**Member removal retains, it does not purge** (decision DS2, default pending sign-off). With `ECC_PERSONAL_DATA_ISOLATION` on, removing a member:
+
+- disconnects their Gmail connectors, without running the consent revocation cascade above, and revokes the Google grant if safe;
+- re-owns their Gmail-only person nodes, and those nodes' Gmail-derived aliases, to the earliest other active workspace owner;
+- keeps every other row above, private to the removed member. No one else can read it, and it no longer blocks the removal.
+
+With the flag off, removal keeps its pre-Spec A behaviour: the member's Gmail rows block it (`409 OWNED_RESOURCES_BLOCK_REMOVAL`) and nothing is disconnected or re-owned.
+
+The operator remediation command (`scripts/remediate_connector_ownership.py`, rollout step R4) also disconnects without purging. Only the consent revocation cascade purges. That cascade does not purge `email.detect_action` AI runs and their steps either: they stay private to the owner, pending the DS2 decision. The removed member's `email` consent stays granted (decision C15-d); with the connector disconnected, nothing syncs.
+
+**Correspondent directory (DS3).** Person entities and their aliases created from Gmail stay **workspace knowledge**, as the entity-resolution contract requires. The entity APIs expose no owner or mailbox link; the aliases endpoint returns the evidence `source_id`, not content. Residual disclosure: members can see that a correspondent's email address exists in the workspace graph, and when few members use Gmail they can infer whose mailbox it came from. The alternatives were (b) keep all Gmail-derived content shared, or (c) also make person nodes private, which would break workspace-scoped resolution. Both were rejected. **DS3 needs privacy sign-off before R5.**
+
+**Accepted admin capabilities and residual disclosures.** These were decided by the user on 2026-09-27 (plan notes N27, N28, N29(1)) as "accept and document". The R5 privacy sign-off must acknowledge them.
+
+1. **Audit-log snapshots (N28).** Workspace owners and admins can read full row snapshots (`before` / `after`) through `GET /api/v1/audit`, including private, email-derived content: titles and descriptions of private tasks, commitments and risks, and other private rows. This is an intended admin capability and is not redacted. Ordinary members use the redacted, per-row-authorized `GET /api/v1/shared/activity`.
+2. **Dashboard `recently_changed` (N27).** Every member's dashboard brief lists, for recently changed rows they cannot open, the aggregate id, event type and changed field names. No content is included. This covers private Gmail connectors and `connector_account.enrollment_refused` attempts. A refused attempt to connect a mailbox another member owns is recorded on that member's connector row.
+3. **Claims citing private evidence (N29(1)).** Knowledge claims stay visible as their author wrote them, even when they cite another member's private Gmail evidence. The claim text is the author's; the cited evidence itself stays private. The shared retrieval body still leaves such claims out (conservative).
+4. **Ids only.** Commitment search results expose cited `evidence_id`s, and aliases expose `source_id`. Both are ids, never content.
+5. **Ambiguous Gmail evidence.** Evidence whose mailbox owner cannot be resolved stays as written, usually workspace-visible. Its grants are revoked, and the backfill reports it on every run for manual review.
+
+Sign-off status (G-SIGN checklist in the rollout runbook): **A2 signed (2026-09-30)**; DS1, DS2, DS3, Q-A1, C15-a, C15-c, C15-d, C15-f and I5 open.
+
 ## Unsupported — production blocker
 
 Task 8 -- the plan's final task -- shipped `GmailPanel`, the executive UX
@@ -342,3 +382,4 @@ naming a task here would misstate when, or whether, they ship:
 | 1.4.4 | 2026-08-10 | Task 7 Loop 2 round 25 review (MEDIUM): the generic engineering `/disable` endpoint's `gmail`-provider rejection is now gated on the owner having a `personal_domains` row for `email` at all -- without it, an OAuth-connected owner who never enabled the `email` domain had no HTTP-reachable way to disconnect their `gmail` account, since the domain-level endpoints 404 for them too | Lucky Jain |
 | 1.4.5 | 2026-08-10 | Task 7 Loop 2 round 27 review (MEDIUM-HIGH): the generic engineering `/disable` endpoint now also rejects a reused `Idempotency-Key` with `409 IDEMPOTENCY_CONFLICT` if the account is no longer `disconnected` when replayed -- the same stale-cache-after-reconnect gap rounds 21-22 closed for the domain-level endpoints, never propagated to this sibling endpoint | Lucky Jain |
 | 1.5.0 | 2026-08-11 | Task 8: explicit user decision -- Task 8 shipped exactly plan.md's own frontend-only scope (`GmailPanel`); export/audit-event/retention-policy were never actually in that scope despite this document's own prior "Planned controls (Task 8)" heading implying otherwise. Renamed to "Deferred controls (open, not scheduled)" and reworded "Unsupported — production blocker" to state plainly that Gmail stays internal-development-only with these three items open, not blocked on a task that will close them | Lucky Jain |
+| 1.6.0 | 2026-10-01 | Security Remediation Spec A (T19; review fixes: sharing feedback rows is refused, giving feedback is not; removal disconnect/re-own only with the flag on): added "Personal-data isolation": owner-only Gmail connector and Gmail-derived content behind `ECC_PERSONAL_DATA_ISOLATION`, not shareable, removal retains (DS2) instead of purging, the DS3 correspondent-directory statement, and the accepted admin capabilities and residuals (N27 dashboard ids, N28 audit snapshots, N29(1) claims stay visible); sign-off status | Lucky Jain |

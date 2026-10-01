@@ -171,6 +171,7 @@ RFC-004 is split into independently reviewable chapters under [`docs/architectur
 - [Phase 7 personal-data recovery](docs/runbooks/PHASE-7-PERSONAL-DATA-RECOVERY.md)
 - [Phase 8 identity recovery](docs/runbooks/PHASE-8-IDENTITY-RECOVERY.md)
 - [Phase 10 Gmail recovery](docs/runbooks/PHASE-10-GMAIL-RECOVERY.md)
+- [Security remediation Spec A rollout (R1–R7)](docs/runbooks/SPEC-A-ROLLOUT.md) and [its alert rules](docs/observability/SPEC-A-ALERTS.md)
 
 ## Repository rule
 

@@ -2,8 +2,9 @@
 id: EVENT-CATALOG
 title: Domain Event Catalog
 status: Approved
-version: 1.4.0
+version: 1.5.0
 owner: Lucky Jain
+updated: 2026-10-01
 related:
   - ADR-0005
   - DOMAIN-MODEL
@@ -114,6 +115,21 @@ Added incrementally, one entry per delivery slice, alongside the code that emits
 
 `ai_run.failed.v1` also covers a run that finished `degraded` (design doc Decision 5: a total-wall-clock/output-token budget overrun) -- `DATA-MODEL.md` names three run-outcome events, not four, and the payload's `error_code` (`budget_exceeded`, `schema_invalid`, `tool_not_allowlisted`, `timeout`, `circuit_open`, `feature_disabled`, `remote_not_configured`, or an activation-specific extension) is what a consumer inspects to distinguish a hard failure from a degraded-but-terminated run. `ai_run_steps`' own per-step trace (never emitted as a domain event, matching `DATA-MODEL.md`'s redacted-trace convention) is where the finer-grained model-call/tool-call detail lives.
 
+## Security remediation (Spec A) audit events
+
+Connector ownership and personal-data isolation (security remediation Spec A; rollout `docs/runbooks/SPEC-A-ROLLOUT.md`). These events describe refusals and administrative side effects rather than a domain aggregate's own lifecycle. They are written through `audit_outbox.write_audit_and_outbox`, so each one is an `audit_events` row plus, unless noted, an `event_outbox` row stored as `<event>.v1`. Payloads carry ids, codes and reasons only: never an email address, a Google account id, a token or row content.
+
+| Event (audit `event_type`) | Producer | Aggregate | Required payload | Notes |
+|---|---|---|---|---|
+| `connector_account.enrollment_refused` | Personal (Gmail OAuth callback); Engineering (connector reactivation) | `connector_account_enrollment` + fresh id when no row is involved (identity mismatch, membership inactive, insufficient role); otherwise `connector_account` + the existing row's id (owner conflict: **the other member's** connector; reactivation refusal: the disconnected row) | reason, provider | `authorization_result="denied"`; written in its own transaction after the business transaction rolled back. `reason` ∈ `identity_mismatch`, `owned_by_another_member`, `membership_inactive`, `insufficient_role` (callback), `not_found`, `access_denied` (reactivation). Also counted in `ecc_connector_enrollment_refused_total{provider,reason}` |
+| `personal_data.share_refused` | Platform (grants, grant preview, ownership transfer, delegation create) | the refused row's own type and id | reason (`personal_data`), resource_type | `authorization_result="denied"`, own transaction. Only with `ECC_PERSONAL_DATA_ISOLATION` on. The path (`grant`, `grant_preview`, `transfer`, `delegation_create`) is on the metric `ecc_personal_data_share_refused_total{resource_type,path}`, not in the payload |
+| `pkos_node.ownership_reassigned` | Identity (member removal) | `pkos_node` | aggregate_id, version, reason (`member_removed`), from_owner_id, to_owner_id | With `ECC_PERSONAL_DATA_ISOLATION` on only: a removed member's Gmail-only person node moved to the earliest other active workspace owner, in the removal transaction |
+| `entity_alias.ownership_reassigned` | Identity (member removal) | `entity_alias` | aggregate_id, version, reason (`member_removed`), from_owner_id, to_owner_id | Flag on only: a Gmail-derived alias of such a node, moved with it |
+| `connector_account.disabled` (new reasons) | Identity (member removal); ops (`scripts/remediate_connector_ownership.py`) | `connector_account` | aggregate_id, version, reason; plus check for remediation | The existing disable event, now also written when removal disconnects a member's personal connector (`reason: member_removed`; only with `ECC_PERSONAL_DATA_ISOLATION` on -- with it off, the member's personal rows block removal and nothing is disconnected) and when the operator remediates an S2 finding (`reason: operator_remediation`, `actor_id` null, `source: system`, metadata `check`, `ref_ids`, `run_id`). Neither path purges data |
+| `connector_ownership.review_recorded` | ops (`scripts/remediate_connector_ownership.py`) | the flagged row's type and id | aggregate_id, check | **Audit only, no outbox event.** Records an operator's review of an S2 check B/D finding that needed no disconnect. Metadata: `reason` (`operator_remediation`), `check`, `table`, `ref_table`, `ref_id`, `decision` (`reviewed_no_identity_mismatch` / `reviewed_not_applicable`), `run_id` |
+
+Workspace owners and admins read these, like every audit event, through `GET /api/v1/audit`. The dashboard's `recently_changed` brief shows every member the aggregate id, event type and changed field names (`changed_fields`) of recent ones, without content (an accepted disclosure, `docs/phases/phase-010/PRIVACY-CONSENT-CONTRACT.md`).
+
 ## Recommendation publication rule
 
 `recommendation.generated.v1` records creation in `proposed`. `recommendation.confirmation_requested.v1` is emitted only by `PublishRecommendation`, which transitions the aggregate from `proposed` to `pending_confirmation`. Confirmation and execution events cannot occur before that publication event.
@@ -125,3 +141,9 @@ Domain events do not replace audit events. `AUDIT-CONTRACT.md` contains the norm
 ## Compatibility and failure handling
 
 Consumers support current versions and may support the previous version during migrations. Deprecated versions require migration and replay tests. Failed deliveries move to the dead-letter store with the original envelope, failure category, retry count and next action. Manual replay preserves `event_id` and creates a new delivery-attempt identifier.
+
+## Changelog
+
+| Version | Date | Summary | Author |
+|---|---|---|---|
+| 1.5.0 | 2026-10-01 | Security remediation Spec A (T19; review: removal events are flag-on only, `recently_changed` also shows `changed_fields`): catalogued `connector_account.enrollment_refused` (reasons), `personal_data.share_refused`, `pkos_node.ownership_reassigned`, `entity_alias.ownership_reassigned`, the new `connector_account.disabled` reasons and the audit-only `connector_ownership.review_recorded` | Lucky Jain |

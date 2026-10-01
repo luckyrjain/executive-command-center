@@ -2,8 +2,9 @@
 id: PHASE-008-API-SCHEMAS
 title: Phase 8 Multi-user API
 status: Approved for Implementation
-version: 0.9.0
+version: 0.10.0
 owner: Lucky Jain
+updated: 2026-10-01
 ---
 
 # Phase 8 API Schemas
@@ -123,3 +124,18 @@ Deliberately narrower than `GET /api/v1/audit` (the `owner`/`admin`-only, worksp
 ## Final whole-phase review (second round) status
 
 **`resource_grants.delegation_id`** (migration `0067_phase8_grant_delegation_id.py`, nullable, `ON DELETE SET NULL`): links a delegation-created grant back to the delegation that created it, so `_revoke_evidence_grants` can scope its `UPDATE` to grants that delegation itself created rather than every grant matching the same `(workspace_id, resource_type, resource_id, granted_to)` tuple -- see `DATA-MODEL.md`'s own Task 6 section for the full schema detail and the over-revocation bug this closes.
+
+## Security remediation (Spec A)
+
+With `ECC_PERSONAL_DATA_ISOLATION` on:
+
+- `POST /sharing/grants`, the grant preview, `POST /ownership/transfers` and `POST /delegations` refuse personal Gmail rows and email-derived rows with `400 RESOURCE_TYPE_NOT_GRANTABLE`, and write a `personal_data.share_refused` audit event. The row's own owner is refused too. Delegation accept skips such items.
+- `DELETE /identity/workspaces/{id}/members/{user_id}` is no longer blocked (`409 OWNED_RESOURCES_BLOCK_REMOVAL`) by those rows. It disconnects the member's Gmail connectors and re-owns their Gmail-only person nodes, with those nodes' aliases (the 409's `owned_resources` detail can list `entity_aliases` for mixed-source nodes). The remaining rows stay private to the removed member.
+
+Unflagged: removal and role change can return a retryable `409 MEMBERSHIP_CHANGE_BUSY` (ADR-0014). The full list of rows, codes and audit events is in `docs/phases/phase-010/API-SCHEMAS.md` ("Security remediation (Spec A)").
+
+## Changelog
+
+| Version | Date | Summary | Author |
+|---|---|---|---|
+| 0.10.0 | 2026-10-01 | Security remediation Spec A (T19): personal-data share refusal on grants, preview, transfers and delegations; removal no longer blocked by personal rows; `MEMBERSHIP_CHANGE_BUSY` | Lucky Jain |

@@ -2,8 +2,9 @@
 id: PHASE-010
 title: Gmail Connector
 status: Approved for Implementation
-version: 0.6.0
+version: 0.7.0
 owner: Lucky Jain
+updated: 2026-10-01
 depends_on:
   - PHASE-001
   - PHASE-002
@@ -92,7 +93,7 @@ New `GmailPanel` inside `PersonalWorkspace`, alongside `DomainsPanel`/`RecordsPa
 
 ## Security and privacy
 
-Internal-user allowlist is the load-bearing mechanism keeping this phase outside Google's CASA security-assessment requirement (verified against Google's own OAuth verification docs: `gmail.metadata` and `gmail.readonly` are both restricted-tier scopes regardless of usage pattern — narrow scope usage does not itself avoid the audit, staying within Google's OAuth test-user cap does). Email content is classified and encrypted at the same tier Phase 7 uses for `health`/`finance`. Consent revocation is the single action that both disconnects the connector and purges all synced content (subject to the three narrow, deliberate exceptions `PRIVACY-CONSENT-CONTRACT.md`'s Task 7 section names) — no separate, weaker "just disconnect" path exists in this phase's scope.
+Internal-user allowlist is the load-bearing mechanism keeping this phase outside Google's CASA security-assessment requirement (verified against Google's own OAuth verification docs: `gmail.metadata` and `gmail.readonly` are both restricted-tier scopes regardless of usage pattern — narrow scope usage does not itself avoid the audit, staying within Google's OAuth test-user cap does). Email content is classified and encrypted at the same tier Phase 7 uses for `health`/`finance`. Consent revocation is the single action that both disconnects the connector and purges all synced content (subject to the three narrow, deliberate exceptions `PRIVACY-CONSENT-CONTRACT.md`'s Task 7 section names) — no separate, weaker "just disconnect" path exists for the member themselves. Security remediation Spec A adds two operator/admin paths that disconnect **without** purging (decision DS2: retain, private): member removal disconnects the removed member's Gmail connectors and keeps their Gmail-derived rows private to them, and the S2 remediation command (`scripts/remediate_connector_ownership.py`) disconnects wrongly-owned connectors. With `ECC_PERSONAL_DATA_ISOLATION` on, the connector and all Gmail-derived content are private to the mailbox owner and cannot be shared (`docs/phases/phase-010/PRIVACY-CONSENT-CONTRACT.md`, "Personal-data isolation").
 
 ## Observability
 
@@ -116,7 +117,7 @@ Real dynamic verification against a real test Gmail account (not solely mocked `
 
 ## Rollback plan
 
-Revoking the `email` domain's consent purges all synced content (subject to the three narrow, deliberate exceptions `PRIVACY-CONSENT-CONTRACT.md`'s Task 7 section names) and disconnects the OAuth grant in one action — there is no partial/soft-disconnect state to reason about. No migration in this phase is destructive to any existing table.
+Revoking the `email` domain's consent purges all synced content (subject to the three narrow, deliberate exceptions `PRIVACY-CONSENT-CONTRACT.md`'s Task 7 section names) and disconnects the OAuth grant in one action — for the member's own consent revocation there is no partial/soft-disconnect state. Member removal and the Spec A operator remediation are the exceptions: they disconnect and revoke (if safe) but retain the data, private to the mailbox owner (DS2). Rolling back Spec A's isolation flag is its own procedure (`docs/runbooks/SPEC-A-ROLLOUT.md`, R5 rollback). No migration in this phase is destructive to any existing table.
 
 ## Deferred backlog
 
@@ -126,6 +127,7 @@ Gmail write actions (compose/reply/send/archive/label-modify); public/general-av
 
 | Version | Date | Summary | Author |
 |---|---|---|---|
+| 0.7.0 | 2026-10-01 | Security Remediation Spec A (T19): "Security and privacy" and "Rollback plan" now name the two disconnect-without-purge paths (member removal, operator remediation; DS2 retain-private) and owner-only Gmail data behind `ECC_PERSONAL_DATA_ISOLATION` | Lucky Jain |
 | 0.6.0 | 2026-08-11 | Task 8 Loop 2 review closed after round 14 (two consecutive clean rounds, 13-14) -- every task in the plan has now completed its own review; this file's own "Task 8's own Loop 2 review" language updated from "is in progress" to "is closed" | Lucky Jain |
 | 0.5.2 | 2026-08-11 | Task 8 Loop 2 round 9 review: this table's own strict-descending-version convention broke when rounds 7-8's `0.5.1`/`0.5.0` rows were inserted below `0.4.8` instead of above it, leaving `0.4.8` above two higher versions and the front matter's `version` no longer matching the table's top row -- reordered, no content changed | Lucky Jain |
 | 0.5.1 | 2026-08-11 | Task 8 Loop 2 round 7 review: this file's own changelog row and `docs/ROADMAP.md` both still claimed Task 8's Loop 2 review "has not yet started," contradicting rounds 1-6 already recorded in `IMPLEMENTATION-STATUS.md` -- both corrected to "is in progress" | Lucky Jain |

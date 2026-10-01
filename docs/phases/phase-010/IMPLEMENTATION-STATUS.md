@@ -2,9 +2,9 @@
 id: PHASE-010-IMPLEMENTATION-STATUS
 title: Phase 10 Implementation Status
 status: Active
-version: 0.22.0
+version: 0.23.0
 owner: Lucky Jain
-updated: 2026-08-11
+updated: 2026-10-01
 ---
 
 # Phase 10 Implementation Status
@@ -24,6 +24,57 @@ Design pass, Task 1, Task 2, Task 3, Task 4, Task 5, Task 6, Task 7 and Task 8 d
 | On-demand thread reading/caching | Done -- `GET /api/v1/personal/gmail/threads/{thread_id}` fetches any still-uncached message body on explicit open (reusing Task 5's own `fetch_and_store_body`) and returns the thread's decrypted content; `POST .../forget` nulls a single thread's cached content, recorded in `deletion_jobs` with a new `scope='thread'` (migration `0075`, widening Phase 7's table); Loop 2 review complete (12 rounds, closed on 2 consecutive clean rounds -- see "Task 6 -- Loop 2 review evidence" below) |
 | Consent revocation cascade | Done -- disabling `email` (`POST /personal/domains/email/disable`, `POST /personal/consents/{id}/revoke`, `POST /personal/domains/email/delete`) now reaches `gmail_revocation.cascade_email_revocation` in the same request: best-effort Google-token revoke deferred past the local transaction commit (matching `connector_accounts.py:disable_connector_endpoint`'s own split), connector disconnect (every matching `connector_accounts` row for the owner, not just one), and purge of `email_threads`/`email_messages`, `email_thread` `attention_items`, and Gmail-sourced `pkos_evidence` (except a `pkos_evidence` row whose id collides with a different owner's own message, left unpurged); non-`executed` `email_action_detected` recommendations deleted, `executed` ones redacted in place (their confirmed `target_id` survives); `pkos_nodes` deliberately survive (workspace-, not owner-, deduplicated); the ambiguous-id carve-out is now durable across separate cascade runs, not only within one, via `email_message_id_purge_log` (migration `0076`, the first migration Task 7 has needed); `revoke_consent_endpoint` now rejects a `consent_id` a later grant has superseded (`404`) instead of re-running the cascade against freshly re-granted state, while a merely-revoked `consent_id` with nothing superseding it still resolves normally (so a same-`Idempotency-Key` retry of an already-succeeded revoke keeps working); the generic engineering `disable_connector_endpoint` now rejects an *active* `gmail`-provider account outright (still an idempotent no-op for an already-disconnected one), closing a Loop 2 round 1 review finding (a cascade-bypassing third write path); the consent re-check now runs inside `_disable_domain`'s own transaction, serialized against a concurrent re-grant by the shared `personal_domains` row lock (round 10 review, closing a TOCTOU window); `delete_domain_endpoint`'s own `for_update=True` lock (round 11 review) serializes its read-cascade-write sequence against a concurrent re-grant but, unlike `_disable_domain`, has no `consent_id` to reject staleness on -- the same already-accepted self-race behavior `disable_domain_endpoint` has always had (round 12 review corrected the round-11 documentation's overclaim on this point) -- Loop 2 review in progress, see "Task 7 -- Loop 2 review evidence" below for the current round (this row is not updated per-round to avoid the staleness this exact wording drifted into once already, round 8) |
 | Executive UX and browser acceptance | Done -- `GmailPanel` inside `PersonalWorkspace`, a new `GET /threads` list endpoint, and `SyncRequest.since` threaded to `GmailAdapter.backfill`; Loop 2 review closed, see "Task 8 -- Loop 2 review evidence" below |
+
+## Security remediation (Spec A)
+
+**Spec:** "System Design Spec A -- Connector ownership & personal-data isolation remediation", **version 5.2.1 (2026-10-01)**. It is not in this repository; it is kept in the owner's spec workspace as `ecc-spec-a/SECURITY_REMEDIATION_SPEC.md`. Version 5.2 (patch 5.2.1) records the amendments from implementation (A1-A6 and B1-B16 in its changelog). Ask the owner for the current copy before relying on a section number.
+
+**Status: code delivered except the frontend (T17) and flag removal (T20); rollout not started.** Delivered on `main`:
+
+| Plan task | PR | What |
+|---|---|---|
+| T01 | #282 | Shared helpers (`ecc.platform.connector_security`), five counters, three settings |
+| T02 | #283 | Consent cascade scoped to an explicit target owner |
+| T03 | #284 | Migration 0082 (revoke-safety index, backfill log table), tenancy exception |
+| T04 | #285 | No bound parameters, emails or exception text in logs |
+| T13 | #286 | Two-member real-sync test fixture |
+| T05 | #290 | Narrow duplicate handling (`500 CONNECTOR_ACCOUNT_PERSIST_FAILED`), guarded revokes |
+| T06 | #288 | Adapter revoke-on-reject hook |
+| T11 | #289 | Personal data not shareable (`400 RESOURCE_TYPE_NOT_GRANTABLE`) |
+| T12 | #291 | Member removal safe for personal Gmail data |
+| T14b | #294 | Gmail-derived content written private |
+| T16 | #292 | Refresh-failure canary metric |
+| T18 | #293 | Read-only ownership audit (`scripts/audit_connector_ownership.py`) |
+| T07 | #299 | `409 CONNECTOR_OWNED_BY_ANOTHER_MEMBER` |
+| T10 | #298 | Engineering reactivation authz |
+| T14a | #300 | Personal connectors, runs and cursors private; non-owner sync/disable `404` |
+| T21 | #301 | Evidence readers honor visibility |
+| T21b | #302 | Email recommendation leak paths (422 on public create; derived rows private) |
+| T21c | #303 | Search filters by visibility |
+| T09 | #304 | Removal races (`403 MEMBERSHIP_INACTIVE`) |
+| T15 | #305 | Visibility/owner backfill (`scripts/backfill_personal_visibility.py`) |
+| T08 | #306 | Identity binding (`ECC_GMAIL_REQUIRE_IDENTITY_MATCH`) |
+| FX4 | #307 | Operator remediation (`scripts/remediate_connector_ownership.py`) |
+| FX1 | #308 | Meeting prep packs keep other members' private rows out |
+| FX5 | #309 | Gmail writes stop after consent withdrawal (`403 EMAIL_CONSENT_NOT_ACTIVE`) |
+| FX3 | #310 | Email-derived tasks/commitments/risks treated as personal data (migration 0083) |
+| FX6 | #311 | Truthful Gmail revoke results |
+| FX2 | #312 | Backfill of email-derived rows, exact restore (migration 0084), rebuild guard |
+
+Later PRs (outside the Spec A plan) whose behaviour these docs also describe:
+
+| PR | What |
+|---|---|
+| #313 | Dependency fix: `undici` pinned to a patched 7.x through a pnpm override (high CVE found during the fix wave; no API change) |
+| #314, #315 | Attention mutations lock their row before authorizing (dismiss/defer/restore; risk-review, waiting, constraint and plan mutations) -- FX2 deep-review follow-ups |
+| #324 | Engineering connector routes recheck authorization on the locked row (`_locked_connector_denial`) |
+| #316-#323, #333, #334, #336, #342 | Lock-before-authorize and serialize-against-removal follow-ups across meeting prep, automation, planning, communication, knowledge, calendar/scheduling, governance and attention (each locks the row, or takes the membership lock, before authorizing; #335 in that range is an unrelated AI-runtime dispatch fix) |
+| #331 | Member removal / role change give up on a busy membership lock with a retryable `409 MEMBERSHIP_CHANGE_BUSY` |
+| #340 | Engineering and personal-data writes serialized against removal and role change; the Gmail callback refuses a caller demoted mid-flight (`403 INSUFFICIENT_ROLE`, refusal reason `insufficient_role`) |
+| #345 | `email_action_detected` confirm re-checks the consent owner: `409 RECOMMENDATION_OWNER_CHANGED` after a concurrent ownership transfer |
+| #346 | A busy membership change is retried once, then explained to the caller |
+
+Contracts: `API-SCHEMAS.md` ("Security remediation (Spec A)"), `PRIVACY-CONSENT-CONTRACT.md` ("Personal-data isolation"), `docs/phases/phase-006/CONNECTOR-CONTRACT.md`, `docs/domain/EVENT-CATALOG.md`. Rollout, flags, sign-offs and known limitations: `docs/runbooks/SPEC-A-ROLLOUT.md`. Alert rules: `docs/observability/SPEC-A-ALERTS.md`. Open before rollout step R5: the G-SIGN sign-offs (only A2 is signed), and FX1 #308 M1 (a row narrowed after its meeting pack was generated stays in the stored pack until refreshed).
 
 ## Task 1 evidence
 
