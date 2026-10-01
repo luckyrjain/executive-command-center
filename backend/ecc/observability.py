@@ -52,9 +52,9 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from threading import Lock
-from typing import Final, Literal
+from typing import Final, Literal, get_args
 
 from fastapi import Request, Response
 from sqlalchemy import event, text
@@ -219,6 +219,15 @@ class _Counter:
             raise ValueError(f"{self.name}: expected {len(self.label_names)} label values")
         with self._lock:
             self._values[label_values] = self._values.get(label_values, 0.0) + amount
+
+    def preinit(self, *label_values: str) -> None:
+        """Expose a label set at 0 before its first event. Never lowers a
+        value already counted, so it is safe to call again (``ecc.main`` is
+        reloaded by some tests)."""
+        if len(label_values) != len(self.label_names):
+            raise ValueError(f"{self.name}: expected {len(self.label_names)} label values")
+        with self._lock:
+            self._values.setdefault(label_values, 0.0)
 
     def render(self) -> list[str]:
         lines = [f"# HELP {self.name} {self.help_text}", f"# TYPE {self.name} counter"]
@@ -709,6 +718,36 @@ RevokeResult = Literal["ok", "error", "skipped_unsafe"]
 ConnectorAccessDeniedRoute = Literal["sync", "disable"]
 GmailRefreshRejectedError = Literal["invalid_grant", "other"]
 GmailRefreshSinceReconnect = Literal["lt_1h", "1h_24h", "gt_24h", "unknown"]
+
+
+def preinitialise_connector_security_counters(
+    providers: Iterable[str], resource_types: Iterable[str]
+) -> None:
+    """Create every bounded label set of the Spec A counters at 0, so each
+    series exists from process start. Without it a label set first appears
+    at 1, and Prometheus `increase()` (no created timestamp in this text
+    format) never sees that first event -- and these are rare-event
+    counters reset by every restart. The literal labels are enumerated from
+    the type aliases above; `providers` / `resource_types` are the code-
+    defined sets the caller owns (`connector_security.PERSONAL_PROVIDERS` /
+    `SHARE_REFUSED_RESOURCE_TYPES`, which this module cannot import -- see
+    the aliases' comment). A provider outside `providers` (an engineering
+    connector) still gets its series lazily.
+    """
+    for provider in providers:
+        for reason in get_args(EnrollmentRefusedReason):
+            connector_enrollment_refused_total.preinit(provider, reason)
+        for site in get_args(RevokeSite):
+            for result in get_args(RevokeResult):
+                connector_revoke_total.preinit(provider, site, result)
+        for route in get_args(ConnectorAccessDeniedRoute):
+            connector_access_denied_total.preinit(provider, route)
+    for resource_type in resource_types:
+        for path in get_args(PersonalDataSharePath):
+            personal_data_share_refused_total.preinit(resource_type, path)
+    for error in get_args(GmailRefreshRejectedError):
+        for since_reconnect in get_args(GmailRefreshSinceReconnect):
+            gmail_refresh_rejected_total.preinit(error, since_reconnect)
 
 
 def record_connector_enrollment_refused(provider: str, reason: EnrollmentRefusedReason) -> None:
