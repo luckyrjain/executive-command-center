@@ -24,11 +24,13 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi.testclient import TestClient
 from lock_race_support import RaceWorld, headers, race, race_world, row_snapshot
 from sqlalchemy import Connection, text
 
 from ecc.config import get_settings
 from ecc.database import engine
+from ecc.main import app
 
 pytestmark = pytest.mark.skipif(
     not get_settings().database_url.startswith("postgresql"),
@@ -192,6 +194,9 @@ _DEFER = {"deferred_until": (datetime.now(UTC) + timedelta(days=7)).isoformat()}
 
 CASES: dict[str, Case] = {
     "merge_source": Case(False, "confirmed", "source", _MERGE, {}, 201, "ENTITY_NOT_FOUND"),
+    "merge_candidate": Case(
+        False, "confirmed", "candidate", _MERGE, {}, 201, "CANDIDATE_NOT_FOUND"
+    ),
     "reverse_operation": Case(
         True, "confirmed", "operation", _REVERSE, _REASON, 201, "OPERATION_NOT_FOUND"
     ),
@@ -284,3 +289,38 @@ def test_mutation_waiting_on_row_lock_without_transfer_still_proceeds(
 
     assert response.status_code == case.ok_status, response.text
     assert _side_effect_counts(world.ws)["audit_events"] > counts_before["audit_events"]
+
+
+@pytest.mark.parametrize("candidate_status", ["open", "confirmed"])
+def test_merge_with_unreadable_candidate_is_not_found(
+    world: RaceWorld, candidate_status: str
+) -> None:
+    """Without any race: a private candidate owned by someone else is
+    invisible to B, so merging through it answers the same 404 as a missing
+    candidate -- not CANDIDATE_NOT_CONFIRMED (which would reveal an open
+    candidate's state) and not a merge of B's own entities (which would let
+    B use a confirmation B cannot see)."""
+    seeded = _seed_case(world, Case(False, candidate_status, "candidate", _MERGE, {}, 201, ""))
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE resolution_candidates SET owner_id = :c WHERE id = :id"),
+            {"c": world.c, "id": seeded.candidate_id},
+        )
+    involved_before = {row: row_snapshot(*row) for row in _involved(seeded)}
+    counts_before = _side_effect_counts(world.ws)
+
+    client = TestClient(app)
+    client.cookies.set("ecc_session", world.b_token)
+    try:
+        response = client.post(
+            _MERGE,
+            headers=headers(world.b_token),
+            json=CASES["merge_candidate"].payload(seeded),
+        )
+    finally:
+        client.close()
+
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "CANDIDATE_NOT_FOUND"
+    assert {row: row_snapshot(*row) for row in involved_before} == involved_before
+    assert _side_effect_counts(world.ws) == counts_before
