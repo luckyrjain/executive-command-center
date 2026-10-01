@@ -393,6 +393,31 @@ def execute_target(
     # every direct mutation endpoint's own convention (`"tasks"`/
     # `"commitments"`/`"risks"`).
     resource_type = f"{target_type}s"
+    # Lock before authorizing: an ownership transfer that commits while
+    # this request waits on the row lock must be seen by the checks below
+    # (READ COMMITTED: each later statement reads the committed row), not
+    # by checks that ran against the pre-transfer row. The plain UPDATE
+    # below used to be the first statement to touch the row, so it could
+    # wait out a transfer and then write to a row the caller can no longer
+    # see. No `archived_at` filter here: an archived target still falls
+    # through to the UPDATE's own archived filter and the unchanged
+    # `target_version` fallback below.
+    locked = (
+        session.execute(
+            text(
+                f"""
+                SELECT {column} AS old_value, archived_at FROM {table}
+                WHERE workspace_id=:workspace_id AND id=:target_id
+                FOR UPDATE
+                """
+            ),
+            {"workspace_id": auth.workspace_id, "target_id": target_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if locked is None:
+        raise HTTPException(status_code=404, detail="TARGET_NOT_FOUND")
     if not authz.authorize(
         session, auth, resource_type=resource_type, resource_id=target_id, action="read"
     ):
@@ -411,18 +436,10 @@ def execute_target(
     # probability/impact change made via a confirmed recommendation was
     # invisible to `GET /api/v1/audit?aggregate_type={task,commitment,risk}`
     # even though the identical field change via a direct `PATCH` endpoint
-    # is not. `old_value` is read just before the update so the audit row
+    # is not. `old_value` is read under the row lock above so the audit row
     # can carry a real `before`/`after`, matching what a direct `PATCH`
     # would record for the same field.
-    old_value = session.execute(
-        text(
-            f"""
-            SELECT {column} FROM {table}
-            WHERE workspace_id=:workspace_id AND id=:target_id AND archived_at IS NULL
-            """
-        ),
-        {"workspace_id": auth.workspace_id, "target_id": target_id},
-    ).scalar_one_or_none()
+    old_value = locked["old_value"] if locked["archived_at"] is None else None
     now = datetime.now(UTC)
     result = (
         session.execute(
