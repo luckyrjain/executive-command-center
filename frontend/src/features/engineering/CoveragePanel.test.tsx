@@ -110,6 +110,20 @@ describe('CoveragePanel', () => {
     expect(screen.queryByText(/No connectors are configured yet/)).toBeNull()
   })
 
+  it('never shows a Gmail connector row -- personal providers are not engineering sources', async () => {
+    stubFetch({ connectors: [connector(), connector({ id: 'gmail-1', provider: 'gmail', display_name: 'owner@example.test' })] })
+    renderPanel()
+    expect(await screen.findAllByText(/0 repositories/)).toHaveLength(1)
+    expect(screen.queryByText('owner@example.test')).toBeNull()
+  })
+
+  it('shows the empty state when the only connector is a Gmail one', async () => {
+    stubFetch({ connectors: [connector({ id: 'gmail-1', provider: 'gmail', display_name: 'owner@example.test' })] })
+    renderPanel()
+    expect(await screen.findByText(/No connectors are configured yet/)).toBeTruthy()
+    expect(screen.queryByText('owner@example.test')).toBeNull()
+  })
+
   it('rolls up repository and work-item counts per connector', async () => {
     stubFetch({
       connectors: [connector()],

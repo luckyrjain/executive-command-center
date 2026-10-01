@@ -1,8 +1,10 @@
+import { ApiError } from '../../api/client'
 import { apiErrorMessage } from '../../api/errorMessage'
 
-/** Lead sentence for `EMAIL_CONSENT_NOT_ACTIVE`, shared with the
- * recommendation review panel (confirming an email-derived recommendation
- * re-checks the same consent) so both surfaces describe it identically. */
+/** Lead sentence for the caller's own `EMAIL_CONSENT_NOT_ACTIVE`. (The
+ * recommendation review panel words its confirm refusal separately: there
+ * the check is the email owner's consent and Gmail connection, not the
+ * caller's.) */
 export const EMAIL_CONSENT_NOT_ACTIVE_MESSAGE = 'Email consent is not active.'
 
 /** Shared across every panel in this feature -- the same error-code set
@@ -38,6 +40,13 @@ export function personalErrorMessage(error: unknown): string {
     GMAIL_OAUTH_STATE_INVALID: 'This Gmail sign-in link expired or was already used. Start again.',
     GMAIL_OAUTH_DENIED: 'Google sign-in was cancelled. Click Connect Gmail to try again.',
     GMAIL_OAUTH_FAILED: 'Google rejected this sign-in attempt. Try again.',
+    // Spec A codes (`gmail_oauth.py`'s callback, also reaching the OAuth
+    // return banner via `?gmail=error&code=`, and the sync route).
+    GMAIL_ACCOUNT_IDENTITY_MISMATCH: 'The Google account you chose isn\'t the one signed in to ECC. Nothing was connected -- connect again and choose the Google account you use to sign in to ECC.',
+    GMAIL_ACCOUNT_ALREADY_CONNECTED: 'This Google account is already connected in this workspace.',
+    CONNECTOR_OWNED_BY_ANOTHER_MEMBER: 'Another member of this workspace has already connected this Google account, so you cannot connect it. Ask that member or a workspace admin if you need it here.',
+    CONNECTOR_ACCOUNT_PERSIST_FAILED: 'Gmail could not be saved because of a server error. Nothing was connected -- try again.',
+    MEMBERSHIP_INACTIVE: 'Your membership in this workspace is no longer active, so this was stopped and nothing was saved. Ask a workspace owner if you think this is a mistake.',
     GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT: 'Use the email domain\'s disable action to disconnect Gmail, not the generic connector action.',
     CONNECTOR_NOT_FOUND: 'This connector no longer exists in this workspace.',
     CONNECTOR_DISCONNECTED: 'This connector is already disconnected.',
@@ -45,6 +54,21 @@ export function personalErrorMessage(error: unknown): string {
     '401': 'Your session is no longer valid. Sign in again.',
     '403': 'You are not permitted to manage personal data in this workspace.',
   })
+}
+
+/** The Gmail OAuth return banner (`?gmail=error&code=`). Only a code
+ * reaches it, rebuilt as `ApiError(0, code)`, so status-keyed overrides
+ * never match. `INSUFFICIENT_ROLE` there means the caller's role was lowered
+ * below write during the sign-in round trip (`gmail_oauth.py`), so it gets
+ * connect-specific copy -- kept out of `personalErrorMessage`, which every
+ * personal panel shares and where a 403 `INSUFFICIENT_ROLE` must keep the
+ * generic '403' wording. */
+export const GMAIL_CONNECT_ROLE_REFUSED_MESSAGE =
+  'Your workspace role does not allow connecting Gmail, so nothing was connected. Ask a workspace admin for access.'
+
+export function gmailOAuthReturnErrorMessage(code: string): string {
+  if (code === 'INSUFFICIENT_ROLE') return GMAIL_CONNECT_ROLE_REFUSED_MESSAGE
+  return personalErrorMessage(new ApiError(0, code, code))
 }
 
 export function formatTimestamp(value: string | null): string {

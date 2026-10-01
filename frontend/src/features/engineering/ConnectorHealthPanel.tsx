@@ -5,6 +5,7 @@ import { ApiError, apiRequest } from '../../api/client'
 import { apiErrorMessage } from '../../api/errorMessage'
 import { isStale, statusBadgeClass } from '../../lib/connectorStatus'
 import { useWizardStepFocus } from '../../lib/wizardFocus'
+import { withoutPersonalProviders } from './personalProviders'
 import type {
   ConnectorAccount,
   ConnectorAccountListResponse,
@@ -359,7 +360,17 @@ const RESOURCE_TYPES = [
 ] as const
 const RUN_TYPES: ReadonlyArray<Extract<SyncRunType, 'backfill' | 'incremental'>> = ['backfill', 'incremental']
 
-function errorMessage(error: unknown): string {
+// `create` is the "Connect an integration" wizard, which is also the
+// reconnect path: connecting a credential whose account has a disconnected
+// row reactivates that row (`create_connector_endpoint`, Spec A S1.7). There
+// `CONNECTOR_NOT_FOUND` (404) means an earlier connection of this account
+// exists that the caller cannot see -- "no longer exists" would be wrong --
+// and `INSUFFICIENT_ROLE` (403) means either that the caller's role cannot
+// write, or that they can see that earlier connection but not change it. `card` is a listed
+// connector's own sync/disconnect actions.
+type ErrorContext = 'create' | 'card'
+
+function errorMessage(error: unknown, context: ErrorContext = 'card'): string {
   if (error instanceof ApiError && error.code === 'CONNECTOR_AUTHORIZATION_FAILED') {
     // The backend's own detail dict is `{"code": ..., "error": &lt;sanitized
     // message&gt;}` (`create_connector_endpoint`'s `AdapterAuthorizationError`
@@ -372,7 +383,13 @@ function errorMessage(error: unknown): string {
   return apiErrorMessage(error, {
     CONNECTOR_PROVIDER_NOT_SUPPORTED: 'This provider has no registered connector adapter.',
     CONNECTOR_ALREADY_CONNECTED: 'This workspace already has a connector for this account.',
-    CONNECTOR_NOT_FOUND: 'This connector no longer exists in this workspace.',
+    CONNECTOR_ACCOUNT_PERSIST_FAILED: 'The connector could not be saved because of a server error. Nothing was connected -- try again.',
+    CONNECTOR_NOT_FOUND: context === 'create'
+      ? 'This account was connected before in this workspace, and you do not have access to that connection, so you cannot reconnect it. Ask the person who set it up to reconnect it.'
+      : 'This connector no longer exists in this workspace, or you do not have access to it.',
+    INSUFFICIENT_ROLE: context === 'create'
+      ? 'You do not have permission to connect this account. Either your workspace role cannot add connectors, or this account was connected before by someone else and you cannot change that connection. Ask a workspace admin or the person who set it up.'
+      : 'You do not have permission to change this connector.',
     CONNECTOR_DISCONNECTED: 'This connector is already disconnected.',
     CONNECTOR_SYNC_IN_PROGRESS: 'A sync is already running for this connector -- wait for it to finish before starting another.',
     '401': 'Your session is no longer valid. Sign in again.',
@@ -640,7 +657,9 @@ export default function ConnectorHealthPanel() {
   }
 
   const now = new Date()
-  const items = connectors.data?.connectors ?? []
+  // Gmail (and any other personal provider) is managed only in the Personal
+  // area, never listed in an engineering view (Spec A S1.8(e)).
+  const items = withoutPersonalProviders(connectors.data?.connectors ?? [])
 
   return (
     <section className="work-panel" aria-labelledby="engineering-connector-health-title">
@@ -707,7 +726,7 @@ export default function ConnectorHealthPanel() {
                     {createMutation.isPending ? 'Connecting…' : 'Connect'}
                   </button>
                 </div>
-                {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div> : null}
+                {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error, 'create')}</div> : null}
               </div>
             ) : (
               <div>

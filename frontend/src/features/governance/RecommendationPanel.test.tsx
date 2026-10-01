@@ -95,11 +95,17 @@ describe('recommendation presentation', () => {
     expect(recommendationErrorMessage(new Error('Network unavailable'))).toBe('Network unavailable')
   })
 
-  it('explains a confirm refused because email consent was withdrawn', () => {
-    const refused = new ApiError(403, 'EMAIL_CONSENT_NOT_ACTIVE', 'Email Consent Not Active')
-    const message = recommendationErrorMessage(refused)
-    expect(message).toMatch(/^Email consent is not active\./)
-    expect(message).toContain('cannot be confirmed until email consent is granted again')
+  it('explains a confirm refused because the email owner withdrew consent or their Gmail was disconnected (FX5 L2)', () => {
+    // The backend checks the recommendation owner's consent AND Gmail
+    // connection, not the confirmer's -- name both causes and never tell
+    // every confirmer that re-enabling Email will fix it.
+    const message = recommendationErrorMessage(new ApiError(403, 'EMAIL_CONSENT_NOT_ACTIVE', 'Email Consent Not Active'))
+    expect(message).toContain("came from a member's email")
+    expect(message).toContain('email consent was withdrawn or their Gmail connection was disconnected')
+    expect(message).toContain('can no longer be confirmed')
+    expect(message).toContain('the email owner would need to re-enable Email and reconnect Gmail')
+    expect(message).not.toContain('Email consent is not active.')
+    expect(message).not.toContain('enable Email under Personal')
   })
 })
 
