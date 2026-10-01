@@ -105,7 +105,10 @@ from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.config import get_settings
 from ecc.database import STATEMENT_TIMEOUT_MS, SessionFactory, get_session
 from ecc.domains.automation.worker import cancel_runs_for_removed_member
-from ecc.domains.collaboration.delegations import cancel_delegations_for_removed_member
+from ecc.domains.collaboration.delegations import (
+    cancel_delegations_for_removed_member,
+    lock_delegations_for_removed_member,
+)
 from ecc.domains.engineering.connector_accounts import get_encrypted_credential
 from ecc.domains.engineering.connectors import ConnectorAccountContext
 from ecc.domains.engineering.crypto import decrypt_credential
@@ -713,6 +716,22 @@ def remove_member_endpoint(
                 status_code=status.HTTP_409_CONFLICT, detail="LAST_OWNER_CANNOT_BE_REMOVED"
             )
 
+        # Lock order for everything below, matching every other writer of
+        # these tables: delegations, then resource rows, then grants.
+        # `accept_delegation_endpoint` locks a delegation, then its evidence
+        # resources, then inserts grants; `authz_grants.revoke_grant_endpoint`
+        # and `authz_grants.create_grant_endpoint` lock the resource row, then
+        # the grant. So the member's live delegations are locked first --
+        # before the personal rows the isolation block locks (an accept on a
+        # pod that disagrees about the isolation flag can lock those too) and
+        # before run cancellation (`cancel_run` locks `workflow_runs` rows) --
+        # and the delegations are only updated, and their evidence grants
+        # revoked, after both. Any other order deadlocks against a concurrent
+        # accept or grant revoke touching one of the member's rows.
+        lock_delegations_for_removed_member(
+            session, workspace_id=auth.workspace_id, account_id=member["account_id"]
+        )
+
         # Spec A S1.4 (`ECC_PERSONAL_DATA_ISOLATION`): the member's personal
         # (Gmail-derived) rows and Gmail-only person nodes no longer block
         # removal -- connectors are disconnected, nodes re-owned, the rest
@@ -723,8 +742,9 @@ def remove_member_endpoint(
         if isolation:
             # Mutate FIRST, check SECOND, all in this one transaction (a 409
             # below rolls every disconnect/re-own/audit back). Lock order:
-            # membership advisory lock (above) -> connector rows -> nodes
-            # -> the member's Gmail-derived aliases.
+            # membership advisory lock -> the member's delegations (both
+            # above) -> connector rows -> nodes -> the member's Gmail-derived
+            # aliases.
             pending_revokes = _disconnect_personal_connectors(
                 session, auth, request, removed_users_id=user_id, now=now
             )
@@ -776,17 +796,17 @@ def remove_member_endpoint(
                 detail={"code": "OWNED_RESOURCES_BLOCK_REMOVAL", "owned_resources": owned},
             )
 
-        cancel_delegations_for_removed_member(
-            session, workspace_id=auth.workspace_id, account_id=member["account_id"], now=now
-        )
         # Found in the second whole-phase review, mirroring the delegation
-        # cascade immediately above: `worker.py`'s own docstring already
+        # cascade immediately below: `worker.py`'s own docstring already
         # discloses that a run is authorized once, at enqueue, and never
         # re-checks `created_by`'s live membership -- without this, a
         # removed member's still-running (or paused/awaiting-approval)
         # automation kept right on executing real side effects attributed
         # to someone no longer in the workspace.
         cancel_runs_for_removed_member(session, workspace_id=auth.workspace_id, users_id=user_id)
+        cancel_delegations_for_removed_member(
+            session, workspace_id=auth.workspace_id, account_id=member["account_id"], now=now
+        )
         session.execute(
             text(
                 "UPDATE sessions SET revoked_at = :now "

@@ -447,6 +447,25 @@ _TOOL_OUTPUT_MODELS: dict[str, type[BaseModel]] = {
     "personal.get_insight_sources": _PersonalGetInsightSourcesOutput,
     "email.get_thread_content": _EmailGetThreadContentOutput,
 }
+# Defense in depth for `_resolve_handler`'s dynamic import: each tool name is
+# bound in application code to the one `(module, function)` its seeded
+# `tool_definitions.handler_ref` names. A row whose `handler_ref` differs
+# (hand-edited DB, a future migration not mirrored here) is refused as
+# `tool_not_registered`, and the module actually imported is always one of
+# these literals -- never a string read back from the database.
+_TOOL_HANDLERS: dict[str, tuple[str, str]] = {
+    "attention.get_item": ("ecc.domains.attention.tools", "get_item_tool"),
+    "knowledge.get_entity": ("ecc.domains.knowledge.tools", "get_entity_tool"),
+    "meeting.get_prep_pack": ("ecc.domains.attention.meeting_prep_tools", "get_prep_pack_tool"),
+    "personal.get_insight_sources": (
+        "ecc.domains.personal.insight_tools",
+        "get_insight_sources_tool",
+    ),
+    "email.get_thread_content": (
+        "ecc.domains.personal.email_action_tools",
+        "get_thread_content_tool",
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -478,14 +497,21 @@ class ToolDispatchFailed:
     reason: Literal["tool_not_registered", "input_invalid", "not_found", "output_invalid"]
 
 
-def _resolve_handler(handler_ref: str) -> Any:
-    # Not request-derived: handler_ref is only ever a migration-seeded
-    # `tool_definitions` row (no API inserts one or sets handler_ref; the
-    # immutability trigger freezes it past draft), reached only after `tool_name` passed
-    # the task's `eligible_tools` allowlist in `_dispatch_tool`.
-    module_name, _, func_name = handler_ref.partition(":")
-    module = import_module(module_name)
-    return getattr(module, func_name)
+def _resolve_handler(tool_name: str, handler_ref: str) -> Any | None:
+    """The handler for an already-allowlisted `tool_name`, or `None` when
+    the row's `handler_ref` is not the one `_TOOL_HANDLERS` binds that name
+    to. `handler_ref` is never request-derived today (only migrations insert
+    `tool_definitions` rows; the activation endpoint flips `status` only and
+    the immutability trigger freezes `handler_ref` past draft) -- this check
+    keeps a tampered or unmirrored row from choosing what gets imported.
+    """
+    bound = _TOOL_HANDLERS.get(tool_name)
+    if bound is None:
+        return None
+    module_name, func_name = bound
+    if handler_ref != f"{module_name}:{func_name}":
+        return None
+    return getattr(import_module(module_name), func_name)
 
 
 def _dispatch_tool(
@@ -506,12 +532,14 @@ def _dispatch_tool(
     output_model = _TOOL_OUTPUT_MODELS.get(tool_name)
     if tool_def is None or input_model is None or output_model is None:
         return ToolDispatchFailed(tool_name=tool_name, reason="tool_not_registered")
+    handler = _resolve_handler(tool_name, tool_def.handler_ref)
+    if handler is None:
+        return ToolDispatchFailed(tool_name=tool_name, reason="tool_not_registered")
 
     validated_input = validate_output(input_model, dumps(tool_input, default=str))
     if isinstance(validated_input, SchemaInvalid):
         return ToolDispatchFailed(tool_name=tool_name, reason="input_invalid")
 
-    handler = _resolve_handler(tool_def.handler_ref)
     result = handler(session, auth, **validated_input.value.model_dump())
     if isinstance(result, ai_tools.ToolNotFound):
         return ToolDispatchFailed(tool_name=tool_name, reason="not_found")
@@ -2418,6 +2446,19 @@ def cancel_run(run_id: UUID, auth: AuthDep, session: SessionDep, _csrf: CsrfDep)
     """
     now = datetime.now(UTC)
     with session.begin():
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        locked = session.execute(
+            text(
+                "SELECT id FROM ai_runs "
+                "WHERE workspace_id = :workspace_id AND id = :run_id FOR UPDATE"
+            ),
+            {"workspace_id": auth.workspace_id, "run_id": run_id},
+        ).one_or_none()
+        if locked is None:
+            raise HTTPException(status_code=404, detail="AI_RUN_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="ai_runs", resource_id=run_id, action="read"
         ):
