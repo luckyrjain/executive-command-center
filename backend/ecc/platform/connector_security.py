@@ -251,6 +251,9 @@ _SHARE_REFUSED_STATEMENTS: Final[dict[str, str]] = {
         for table, fragment in PERSONAL_DERIVED_PREDICATES.items()
     },
 }
+# Every `resource_type` a share refusal can carry (the label set of
+# `ecc_personal_data_share_refused_total`, pre-initialised by `ecc.main`).
+SHARE_REFUSED_RESOURCE_TYPES: Final[frozenset[str]] = frozenset(_SHARE_REFUSED_STATEMENTS)
 
 # `owner_id` of a personal-data row by id (no row -> not personal data).
 _PERSONAL_OWNER_STATEMENTS: Final[dict[str, str]] = {
