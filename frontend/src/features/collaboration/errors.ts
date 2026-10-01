@@ -36,6 +36,7 @@ export function collaborationErrorMessage(error: unknown): string {
     MEMBER_NOT_FOUND: 'That member could not be found.',
     LAST_OWNER_CANNOT_BE_DEMOTED: 'This is the workspace\'s only owner -- promote another member to owner first.',
     LAST_OWNER_CANNOT_BE_REMOVED: 'This is the workspace\'s only owner -- promote another member to owner first.',
+    MEMBERSHIP_CHANGE_BUSY: 'The workspace is busy finishing other changes. Nothing was changed -- try again in a moment.',
     OWNED_RESOURCES_BLOCK_REMOVAL: 'This member still owns workspace resources. Transfer ownership of each one before removing them.',
     ALREADY_MEMBER: 'That person is already a member of this workspace.',
     INVITATION_ALREADY_PENDING: 'An invitation is already pending for that email.',

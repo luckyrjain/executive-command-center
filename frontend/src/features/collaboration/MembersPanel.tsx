@@ -19,6 +19,20 @@ import type {
 
 const ROLES: Role[] = ['owner', 'admin', 'member', 'viewer']
 
+// `membership_removal.py`'s `_lock_membership_exclusive`: a role change or
+// removal that can't get the workspace's membership lock within its
+// `lock_timeout` returns 409 `MEMBERSHIP_CHANGE_BUSY` with nothing written
+// and `Retry-After: 2` (`MEMBERSHIP_CHANGE_RETRY_AFTER_SECONDS`), so one
+// automatic retry after that delay is safe. A second busy response is
+// shown to the user instead of looping.
+export const MEMBERSHIP_BUSY_RETRY_DELAY_MS = 2_000
+
+const retryOnceWhenMembershipBusy = {
+  retry: (failureCount: number, error: unknown) =>
+    failureCount < 1 && error instanceof ApiError && error.code === 'MEMBERSHIP_CHANGE_BUSY',
+  retryDelay: MEMBERSHIP_BUSY_RETRY_DELAY_MS,
+}
+
 function invitationStatus(invitation: Invitation, now: Date): string {
   if (invitation.revoked_at) return 'Revoked'
   if (invitation.rejected_at) return 'Rejected'
@@ -111,6 +125,7 @@ function MemberRow({
   const isSelfSoleActiveOwner = isSelf && isSoleActiveOwner
 
   const roleMutation = useMutation({
+    ...retryOnceWhenMembershipBusy,
     mutationFn: (role: Role) =>
       apiRequest<Member>(`/api/v1/identity/workspaces/${workspaceId}/members/${member.user_id}`, {
         method: 'PATCH',
@@ -131,6 +146,7 @@ function MemberRow({
   })
 
   const removeMutation = useMutation({
+    ...retryOnceWhenMembershipBusy,
     mutationFn: () =>
       apiRequest<MemberRemovalResponse>(
         `/api/v1/identity/workspaces/${workspaceId}/members/${member.user_id}`,
