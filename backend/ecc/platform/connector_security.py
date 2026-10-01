@@ -808,7 +808,9 @@ def personal_data_share_guard(
 #     above and re-checks its `write` role after it. Background Gmail sync
 #     and detection keep the owner checks above;
 #   - `governance/*`, including `GET /recommendations/{id}`, which may
-#     expire the recommendation in the caller's name.
+#     expire the recommendation in the caller's name;
+#   - `knowledge/*`. Embeddings are computed after commit
+#     (`embeddings.embed_after_commit`), so no model call runs under it.
 # Meeting-prep enrichment and personal insight generation are the two
 # inversions: their session-scoped `held_idempotency_lock` (a different
 # connection) is taken before this lock, which they take per write
