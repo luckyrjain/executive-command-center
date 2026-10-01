@@ -363,6 +363,15 @@ def activate_policy(
     req_hash = request_hash(payload, f"activate:{prompt_id_or_tool_name}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
+        # Re-check owner/admin under the membership lock: the gate above ran
+        # before this transaction, so a demotion or removal committed since
+        # then must refuse here (ADR-0014).
+        locked_role = authz.current_role(
+            session, workspace_id=auth.workspace_id, users_id=auth.user_id
+        )
+        if locked_role not in {"owner", "admin"}:
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
