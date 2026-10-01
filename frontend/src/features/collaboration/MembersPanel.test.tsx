@@ -180,6 +180,40 @@ describe('MembersPanel', () => {
     }
   })
 
+  it('keeps Cancel disabled while a busy removal waits to retry, since the retry cannot be stopped', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      let attempts = 0
+      stubFetch({
+        members: [member()],
+        onDelete: () => {
+          attempts += 1
+          return attempts === 1
+            ? response({ error: { code: 'MEMBERSHIP_CHANGE_BUSY', message: 'Membership Change Busy' } }, 409)
+            : response({
+              user_id: 'user-1',
+              export: { account_id: 'account-1', email: 'a@example.test', display_name: 'Ada', role: 'member', joined_at: '2026-01-01T00:00:00Z', removed_at: '2026-01-02T00:00:00Z' },
+            })
+        },
+      })
+      renderPanel()
+      await screen.findByText('Ada')
+
+      fireEvent.click(screen.getByRole('button', { name: 'Remove' }))
+      fireEvent.click(await screen.findByRole('button', { name: 'Confirm removal' }))
+      await waitFor(() => expect(attempts).toBe(1))
+      const cancel = screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement
+      expect(cancel.disabled).toBe(true)
+
+      await vi.advanceTimersByTimeAsync(MEMBERSHIP_BUSY_RETRY_DELAY_MS)
+      await waitFor(() => expect(attempts).toBe(2))
+      // The retried removal's outcome reaches the panel (not silently lost).
+      expect(await screen.findByText(/Removed Ada/)).toBeTruthy()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('requires confirmation before removing a member', async () => {
     stubFetch({ members: [member()] })
     renderPanel()

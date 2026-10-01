@@ -238,9 +238,14 @@ function MemberRow({
             <button type="button" className="btn-destructive" disabled={removeMutation.isPending} aria-busy={removeMutation.isPending} onClick={() => removeMutation.mutate()}>
               {removeMutation.isPending ? 'Removing…' : 'Confirm removal'}
             </button>
+            {/* Disabled while pending: `reset()` only detaches this observer --
+                the mutation keeps running, including a scheduled
+                `MEMBERSHIP_CHANGE_BUSY` retry, so "Cancel" would still remove
+                the member, just without the panel ever showing it. */}
             <button
               type="button"
               className="btn-quiet"
+              disabled={removeMutation.isPending}
               onClick={() => {
                 setConfirmRemove(false)
                 removeMutation.reset()
