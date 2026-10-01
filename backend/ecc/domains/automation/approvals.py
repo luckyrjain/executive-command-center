@@ -727,6 +727,7 @@ def approve_endpoint(
     req_hash = request_hash(payload, f"approve:{approval_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
@@ -834,6 +835,7 @@ def reject_endpoint(
     req_hash = request_hash(_EmptyBody(), f"reject:{approval_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,

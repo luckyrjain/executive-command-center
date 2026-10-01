@@ -447,6 +447,7 @@ def create_policy_endpoint(
     req_hash = request_hash(payload, "create_policy")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth, role_action="write")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,
@@ -514,6 +515,7 @@ def revoke_policy_endpoint(
     req_hash = request_hash(_EmptyBody(), f"revoke:{policy_id}")
     now = datetime.now(UTC)
     with session.begin():
+        authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session,

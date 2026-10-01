@@ -789,7 +789,13 @@ def personal_data_share_guard(
 # by its `tests/test_*_membership_lock_coverage.py`):
 #   - `attention/*`, including `meeting_prep`;
 #   - `planning/tasks`, `communication/commitments`;
-#   - `calendar/events`, `scheduling/meetings`.
+#   - `calendar/events`, `scheduling/meetings`;
+#   - `automation/*` user endpoints (the worker, scheduler and adapter
+#     sessions have no caller and are excluded) and
+#     `ai_runtime/prompts.activate_policy`;
+#   - `collaboration/delegations` and `platform/dashboard_briefs` (the
+#     brief GET too, since it may generate the brief; the membership lock
+#     is taken before the per-user brief lock).
 # Meeting-prep enrichment is the one inversion: its
 # session-scoped `held_idempotency_lock` (a different connection) is taken
 # before this lock, which it takes per write transaction so a removal never
