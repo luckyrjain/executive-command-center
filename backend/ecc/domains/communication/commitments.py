@@ -496,6 +496,13 @@ def _mutate_commitment(
         )
         if cached is not None:
             return cached
+        # Lock before authorizing: an ownership transfer that commits while
+        # this request waits on the row lock must be seen by the checks below
+        # (READ COMMITTED: each later statement reads the committed row), not
+        # by checks that ran against the pre-transfer row.
+        current = _get_row(session, auth, commitment_id, for_update=True)
+        if current is None:
+            raise HTTPException(status_code=404, detail="COMMITMENT_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="commitments", resource_id=commitment_id, action="read"
         ):
@@ -504,9 +511,6 @@ def _mutate_commitment(
             session, auth, resource_type="commitments", resource_id=commitment_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-        current = _get_row(session, auth, commitment_id, for_update=True)
-        if current is None:
-            raise HTTPException(status_code=404, detail="COMMITMENT_NOT_FOUND")
         _check_version(current, payload.expected_version)
         if current["archived_at"] is not None:
             raise HTTPException(status_code=409, detail="COMMITMENT_ARCHIVED")
@@ -607,6 +611,13 @@ def lifecycle_write(
     scheme; nesting a second `session.begin()` here would raise) -- mirrors
     `insert_commitment`'s own precedent exactly.
     """
+    # Lock before authorizing: an ownership transfer that commits while
+    # this request waits on the row lock must be seen by the checks below
+    # (READ COMMITTED: each later statement reads the committed row), not
+    # by checks that ran against the pre-transfer row.
+    current = _get_row(session, auth, commitment_id, for_update=True)
+    if current is None:
+        raise HTTPException(status_code=404, detail="COMMITMENT_NOT_FOUND")
     if not authz.authorize(
         session, auth, resource_type="commitments", resource_id=commitment_id, action="read"
     ):
@@ -615,9 +626,6 @@ def lifecycle_write(
         session, auth, resource_type="commitments", resource_id=commitment_id, action="write"
     ):
         raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-    current = _get_row(session, auth, commitment_id, for_update=True)
-    if current is None:
-        raise HTTPException(status_code=404, detail="COMMITMENT_NOT_FOUND")
     _check_version(current, expected_version)
 
     target_reached = (

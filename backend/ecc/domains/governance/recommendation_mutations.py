@@ -325,6 +325,11 @@ def _transition(
     cached = _start(session, auth, idempotency_key, digest)
     if cached is not None:
         return cached
+    # Lock before authorizing: an ownership transfer that commits while
+    # this request waits on the row lock must be seen by the checks below
+    # (READ COMMITTED: each later statement reads the committed row), not
+    # by checks that ran against the pre-transfer row.
+    locked = get_row(session, auth, recommendation_id, for_update=True)
     if not authz.authorize(
         session, auth, resource_type="recommendations", resource_id=recommendation_id, action="read"
     ):
@@ -337,12 +342,7 @@ def _transition(
         action="write",
     ):
         raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-    row = expire_if_needed(
-        session,
-        auth,
-        get_row(session, auth, recommendation_id, for_update=True),
-        request=request,
-    )
+    row = expire_if_needed(session, auth, locked, request=request)
     check_version(row, int(payload.expected_version))
     if row["status"] not in allowed_statuses:
         raise HTTPException(status_code=409, detail="INVALID_RECOMMENDATION_STATE")
@@ -594,12 +594,27 @@ def confirm_recommendation(
     ):
         raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
     _require_email_consent_for_confirm(session, auth, recommendation_id)
-    row = expire_if_needed(
+    # Lock before authorizing: an ownership transfer that commits while
+    # this request waits on the row lock must be seen by the checks below
+    # (READ COMMITTED: each later statement reads the committed row), not
+    # by checks that ran against the pre-transfer row.
+    # The pair above stays: the consent check must run before this lock
+    # (see `_require_email_consent_for_confirm`) and must not answer a
+    # caller who cannot see the recommendation; the pair is re-run here.
+    locked = get_row(session, auth, recommendation_id, for_update=True)
+    if not authz.authorize(
+        session, auth, resource_type="recommendations", resource_id=recommendation_id, action="read"
+    ):
+        raise HTTPException(status_code=404, detail="RECOMMENDATION_NOT_FOUND")
+    if not authz.authorize(
         session,
         auth,
-        get_row(session, auth, recommendation_id, for_update=True),
-        request=request,
-    )
+        resource_type="recommendations",
+        resource_id=recommendation_id,
+        action="write",
+    ):
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+    row = expire_if_needed(session, auth, locked, request=request)
     check_version(row, payload.expected_version)
     is_create = row["proposed_action"].get("operation") == "create"
     if is_create:
