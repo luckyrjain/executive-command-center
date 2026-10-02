@@ -243,18 +243,37 @@ def _authorize_workflow_for_policy(session: Session, auth: AuthContext, workflow
     member's private workflow existed, and let them bind to it.
 
     That one row is locked `FOR SHARE` before the checks, so an ownership
-    transfer or visibility change committing meanwhile is seen. One row
-    only: locking every version could deadlock with publish, which locks the
-    target and the active version `FOR UPDATE` in its own order.
+    transfer or visibility change committing meanwhile is seen. The family
+    row goes first, `FOR KEY SHARE` (what the policy insert's foreign key
+    takes anyway): draft create locks the family and then the latest
+    version, so taking the version first would deadlock with it. One version
+    row only: locking every version could deadlock with publish, which locks
+    the target and the active version `FOR UPDATE` in its own order.
     """
-    version_id = session.execute(
+    session.execute(
         text(
-            "SELECT id FROM workflow_versions "
-            "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id "
-            "ORDER BY status = 'active' DESC, version DESC LIMIT 1 FOR SHARE"
+            "SELECT 1 FROM workflow_definitions "
+            "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id FOR KEY SHARE"
         ),
         {"workspace_id": auth.workspace_id, "workflow_id": workflow_id},
-    ).scalar_one_or_none()
+    )
+    pick_sql = text(
+        "SELECT id FROM workflow_versions "
+        "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id "
+        "ORDER BY status = 'active' DESC, version DESC LIMIT 1"
+    )
+    params = {"workspace_id": auth.workspace_id, "workflow_id": workflow_id}
+    version_id = session.execute(pick_sql, params).scalar_one_or_none()
+    if version_id is not None:
+        lock_sql = text("SELECT id FROM workflow_versions WHERE id = :id FOR SHARE")
+        session.execute(lock_sql, {"id": version_id})
+        # A publish that committed while the lock waited may have moved
+        # `active` to another row; a fresh statement sees it. That publish
+        # has committed, so locking its row cannot deadlock with it.
+        current = session.execute(pick_sql, params).scalar_one_or_none()
+        if current is not None and current != version_id:
+            version_id = current
+            session.execute(lock_sql, {"id": version_id})
     if version_id is None or not authz.authorize(
         session, auth, resource_type="workflow_versions", resource_id=version_id, action="read"
     ):

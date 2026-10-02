@@ -21,6 +21,8 @@ and C (`member`, the caller).
 
 from __future__ import annotations
 
+import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -425,6 +427,72 @@ def test_policy_create_replay_is_reauthorized(world: World) -> None:
 
     assert replay_status == 404, replay_body
     assert replay_body["error"]["code"] == "WORKFLOW_NOT_FOUND"
+
+
+def _blocked_by(holder_pid: int) -> bool:
+    """A fresh connection per poll: `pg_stat_activity` is a snapshot that
+    stays fixed for the rest of the reading transaction."""
+    with engine.connect() as probe:
+        return bool(
+            probe.execute(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname = current_database() "
+                    "AND pg_blocking_pids(pid) @> ARRAY[CAST(:holder AS integer)]"
+                ),
+                {"holder": holder_pid},
+            ).scalar_one()
+        )
+
+
+def test_policy_create_does_not_deadlock_with_draft_create(world: World) -> None:
+    """Draft create locks the family row `FOR UPDATE`, then the latest
+    version. Policy create used to lock the version first and then wait on
+    the family (its insert's foreign key), so the two deadlocked. Here a
+    holder takes draft create's locks in its order around a policy create:
+    the policy create must queue on the family, holding no version lock."""
+    workflow_id = f"vis.deadlock.{uuid4().hex[:8]}"
+    draft = _draft_workflow(world, workflow_id)
+    result: dict[str, Any] = {}
+
+    def fire() -> None:
+        try:
+            result["status"], result["body"] = _post_policy(world.c_token, workflow_id)
+        except BaseException as exc:  # surfaced on the main thread below
+            result["error"] = exc
+
+    holder = engine.connect()
+    holder_tx = holder.begin()
+    thread = threading.Thread(target=fire)
+    try:
+        holder_pid = int(holder.execute(text("SELECT pg_backend_pid()")).scalar_one())
+        holder.execute(
+            text(
+                "SELECT id FROM workflow_definitions "
+                "WHERE workspace_id = :ws AND workflow_id = :wf FOR UPDATE"
+            ),
+            {"ws": world.ws, "wf": workflow_id},
+        )
+        thread.start()
+        deadline = time.monotonic() + 15
+        while not _blocked_by(holder_pid):
+            assert time.monotonic() < deadline, "policy create never queued on the family"
+            time.sleep(0.05)
+        holder.execute(text("SET LOCAL lock_timeout = '5s'"))
+        holder.execute(
+            text("SELECT id FROM workflow_versions WHERE id = :id FOR UPDATE"), {"id": draft.id}
+        )
+        holder_tx.commit()
+    finally:
+        if holder_tx.is_active:
+            holder_tx.rollback()
+        holder.close()
+        thread.join(timeout=15)
+
+    assert not thread.is_alive()
+    if "error" in result:
+        raise result["error"]
+    assert result["status"] == 201, result["body"]
 
 
 # ---------------------------------------------------------------------------

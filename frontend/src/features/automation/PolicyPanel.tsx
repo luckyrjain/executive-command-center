@@ -40,7 +40,7 @@ function errorMessage(error: unknown): string {
     return `This policy already expired${details?.expires_at ? ` at ${new Date(details.expires_at).toLocaleString()}` : ''} and cannot be revoked further.`
   }
   return apiErrorMessage(error, {
-    WORKFLOW_NOT_FOUND: 'No workflow with this ID exists in this workspace that you can see -- draft the workflow first.',
+    WORKFLOW_NOT_FOUND: 'No workflow with this ID exists in this workspace that you can see. Check the ID.',
     POLICY_NOT_FOUND: 'That policy no longer exists in this workspace.',
     OFFLINE: 'You are offline, so policies could not be read or changed.',
     NETWORK_ERROR: 'Could not reach the server, so policies could not be read or changed.',
