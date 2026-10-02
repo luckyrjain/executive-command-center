@@ -73,7 +73,15 @@ def trigger_test_context() -> Iterator[tuple[UUID, UUID]]:
 
 
 def _insert_workflow_family(workspace_id: UUID, user_id: UUID, workflow_id: str) -> None:
+    """A family plus one workspace-visible draft version: a trigger is listed
+    only while its workflow's governing version is readable."""
     now = datetime.now(UTC)
+    params = {
+        "workspace_id": workspace_id,
+        "workflow_id": workflow_id,
+        "created_by": user_id,
+        "now": now,
+    }
     with engine.begin() as connection:
         connection.execute(
             text(
@@ -81,13 +89,16 @@ def _insert_workflow_family(workspace_id: UUID, user_id: UUID, workflow_id: str)
                 "created_at, updated_at) VALUES (:id, :workspace_id, :workflow_id, :created_by, "
                 ":now, :now)"
             ),
-            {
-                "id": uuid4(),
-                "workspace_id": workspace_id,
-                "workflow_id": workflow_id,
-                "created_by": user_id,
-                "now": now,
-            },
+            {**params, "id": uuid4()},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO workflow_versions (id, workspace_id, workflow_id, graph, "
+                "definition_hash, created_by, updated_by, created_at, updated_at, owner_id) "
+                "VALUES (:id, :workspace_id, :workflow_id, '{}'::jsonb, :hash, :created_by, "
+                ":created_by, :now, :now, :created_by)"
+            ),
+            {**params, "id": uuid4(), "hash": "0" * 64},
         )
 
 
