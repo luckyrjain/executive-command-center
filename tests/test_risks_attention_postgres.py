@@ -1,4 +1,5 @@
 import os
+import warnings
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
@@ -826,11 +827,15 @@ def test_ranking_10000_eligible_entities_under_budget(
     p95, samples = _measure_regenerate_p95(client, token)
     if p95 >= RANKING_BUDGET_SECONDS:
         first_p95, first_samples = p95, samples
-        print(
-            f"\n[ranking budget] initial pass p95 {first_p95 * 1000:.1f} ms exceeded "
+        # A warning, not a print: pytest captures stdout of passing tests, so a
+        # pass-on-retry would otherwise leave no trace in CI. The warnings
+        # summary is shown even when the test passes.
+        warnings.warn(
+            f"[ranking budget] initial pass p95 {first_p95 * 1000:.1f} ms exceeded "
             f"{RANKING_BUDGET_SECONDS * 1000:.0f} ms budget; retrying once with a fresh "
             f"measurement pass before failing. samples(ms)="
-            f"{[round(s * 1000, 1) for s in first_samples]}"
+            f"{[round(s * 1000, 1) for s in first_samples]}",
+            stacklevel=1,
         )
         retry_token = _mint_session(workspace_id, user_id)
         client.cookies.set("ecc_session", retry_token)
