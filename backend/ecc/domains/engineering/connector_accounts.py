@@ -2485,10 +2485,10 @@ def disable_connector_endpoint(
     idempotency_key: IdempotencyHeader,
 ) -> ConnectorAccountResponse:
     # No pre-transaction authz here (unlike `sync_connector_endpoint`, whose
-    # pre-checks also gate an `Idempotency-Key` replay that is served before
-    # its row lock): the personal-owner layer and authz run below, on the
-    # locked row, ahead of the idempotency cache and every write. Only an
-    # unlocked read fast-fail runs before the idempotency and row locks.
+    # fast-fail pre-checks run in a separate, rolled-back transaction): the
+    # personal-owner layer and authz run below, on the locked row, ahead of
+    # the idempotency cache and every write. Only an unlocked read fast-fail
+    # runs before the idempotency and row locks.
     req_hash = request_hash(_EmptyBody(), f"disable:{account_id}")
     now = datetime.now(UTC)
     # Round 23 review: `adapter.disconnect(...)` used to be called from
@@ -3414,12 +3414,13 @@ def _assign_team[ResponseT: _TeamAssignedResponse](
 ) -> ResponseT:
     """The guard+write+audit path behind both `assign_repository_team_
     endpoint` and `assign_work_item_team_endpoint` -- byte-for-byte
-    identical control flow between the two (unlocked read fast-fail, row
-    lock then authz on the locked row, idempotency lock/cache/store,
-    `_validate_team_entity`,
+    identical control flow between the two (membership lock, unlocked
+    read fast-fail, idempotency lock, row lock then authz on the locked
+    row, `_validate_team_entity`, idempotency cache,
     `expected_version`-vs-`team_assignment_version` optimistic-concurrency
-    check, audit/outbox write) discovered as real duplication, not just
-    superficially similar code, before extraction. `table`/`returning_
+    check, write, audit/outbox, idempotency store) discovered as real
+    duplication, not just superficially similar code, before extraction.
+    `table`/`returning_
     fields`/`response_model` are genuinely different per caller (different
     columns, different Pydantic response shape) and stay as explicit
     parameters rather than being derived from `entity_kind`, since e.g.
@@ -3474,13 +3475,18 @@ def _assign_team[ResponseT: _TeamAssignedResponse](
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
+        # The team entity too, ahead of the cache (as the bulk team-
+        # suggestion confirm does): a caller who has since lost `read` on
+        # the team -- or whose team was archived -- must not replay a cached
+        # assignment to it (ADR-0014: a replay is authorized like a fresh
+        # request).
+        _validate_team_entity(session, auth, payload.team_entity_id)
+
         cached = load_cached(
             session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
         )
         if cached is not None:
             return cast(ResponseT, response_model.model_validate(cached))
-
-        _validate_team_entity(session, auth, payload.team_entity_id)
 
         if current[0] != payload.expected_version:
             raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
