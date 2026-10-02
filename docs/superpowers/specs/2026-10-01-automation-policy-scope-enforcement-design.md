@@ -94,7 +94,7 @@ Neither outcome is acceptable unannounced.
 **Recommendation: version the scope semantics per row and grandfather legacy rows until they expire.**
 
 1. Add `automation_policies.scope_enforced boolean NOT NULL DEFAULT false`. The migration adds it with `server_default false`, which every existing row receives, and **does not flip the default to `true`**. The application sets `scope_enforced = true` explicitly in `create_policy`'s `INSERT` (resolved in review: explicit set, not a default flip).
-   - Use the next free migration number at implementation time. `0085` is being claimed concurrently by `0085_distinct_approver.py` on another branch.
+   - Use the next free migration number at implementation time. `0085` is taken by `0085_distinct_approver.py` (PR #361).
    - **Deploy window.** Old app instances still running during a rolling deploy omit the column, so they keep creating legacy (unenforced) rows. They neither fail on the new `CHECK` nor create enforced rows with free-text scope. Those rows age out like every other legacy row.
    - **Code rollback.** Rolling the application back while keeping the migration leaves rows created after the deploy with `scope_enforced = true`, but the old code never reads the flag. Those policies are unchecked until roll-forward. This is a **fail-open window, accepted explicitly**: it equals today's behaviour for every policy, and it ends at roll-forward. If it is not acceptable for a given incident, the rollback runbook step is to revoke the policies created after the deploy (`created_at >= <deploy time>`) and recreate them after roll-forward.
 2. In the same migration, add a `CHECK` that applies only to `scope_enforced = true` rows:
@@ -135,7 +135,7 @@ Neither outcome is acceptable unannounced.
 
 **Recommendation: dispatch value per step, cumulative per run, enforced as `policy-limit-exceeding`.**
 
-- **Per-step value:** `adapter.dispatch_value(validated_input)` if the adapter defines it, otherwise `Decimal("0")`. `validated_input` is the adapter's `input_schema` model, validated once before the gate (Decision 5, "Input validation moves ahead of the gate"). All six current adapters therefore have value 0.
+- **Per-step value:** `adapter.dispatch_value(validated_input)` if the adapter defines it, otherwise `Decimal("0")`. `validated_input` is the adapter's `input_schema` model, validated once inside the gate (Decision 5, "Input validation moves inside the gate"). All six current adapters therefore have value 0.
 - **Rule:** a step requires approval when the sum of its run's prior step values plus its own value exceeds `value_limit`. Because `value_limit >= 0` (`0038:232`), a value-0 step can never exceed it. **Value enforcement is therefore a no-op for every adapter that exists today.** Its first real coverage is a test-only financial fake adapter.
 - **Persistence:** add `workflow_run_steps.dispatch_value numeric(14,2) NULL`, written in the same `INSERT` that records the `dispatched` row. Every other `INSERT` leaves it `NULL`: the compensation step's own `workflow_run_steps` row (`worker.py:2870`), the rejected-approval row (`approvals.py:673`), and the failed-validation row (Decision 5). Rows written before the migration are `NULL` too.
 - **Run sum:** `COALESCE(SUM(dispatch_value), 0)` over the run's `workflow_run_steps` rows **of any status**, computed in the same query that already counts them (`worker._count_dispatched_action_steps`, `worker.py:1954-1974`). Any status matches the count's own semantics and fails closed: a `failed`, `unknown` or `retrying` step may still have moved money. `NULL`s contribute 0. Storing the value, rather than recomputing it from `input_mapping`, keeps the sum stable even if an adapter's `dispatch_value` changes between deploys.
@@ -173,9 +173,10 @@ The rule: a step is in scope when `adapter.action_type ∈ policy.action_types` 
    - Today `activate_workflow_version` does not load the policy at all, and its registry checks run only when `adapter_registry` is passed (`:782`; the real endpoint always passes it, direct test callers usually do not). The new check follows the same rule: it runs only with a registry, and it loads the policy with `policy.get_policy` inside the existing transaction.
    - **The publish check is skipped**, and the dispatch gate stays authoritative, when the version has no `policy_ref`, when the policy is legacy (`scope_enforced=false`), or when it is revoked or expired at publish time. Those cases already block at dispatch with the existing reasons, and failing publish for them would be a new behaviour outside this design.
    - Because a policy is immutable and pinned, this catches nearly every mismatch while authoring.
-2. **First dispatch,** in `worker._evaluate_dispatch_gate` (`worker.py:2073-2145`):
-   - Runs after `_resolve_usable_policy` and adapter resolution (`:2126-2131`) and after input validation (below), and **before** `_evaluate_approval_gate`. An unauthorized step therefore never creates an `approval_requests` row that a human could approve.
-   - Runs before the `preview_only` exit, so a preview run also reports scope violations.
+   - For compensation steps the publish check is **deliberately stricter than dispatch**. At dispatch, a compensation step's own `action_ref` adapter only executes when the original step's adapter has no `compensate()` (`worker.py:2952-2960`), so it is scope-checked only then (item 4). Publish cannot cheaply know which branch will run, and an out-of-scope compensation `action_ref` is an authoring error either way, so publish rejects it unconditionally.
+2. **First dispatch,** in `worker._evaluate_dispatch_gate` (`worker.py:2073-2145`). Gate order (resolved in review): usability → adapter resolution → **scope** → input validation → value and approval → `preview_only` exit.
+   - Scope runs after `_resolve_usable_policy` and adapter resolution (`:2126-2131`), **before** input validation (it needs no input) and before `_evaluate_approval_gate`. An unauthorized step therefore never creates an `approval_requests` row that a human could approve, and an out-of-scope step with invalid input blocks as `needs_review` rather than failing.
+   - Scope runs before the `preview_only` exit, so a preview run also reports scope violations.
    - An unregistered adapter is skipped here, and existing handling applies.
 3. **Retry-resume** (`worker.py:2325-2327`): the same helper runs after `_resolve_usable_policy`. This is defence in depth against an adapter being reclassified by a deploy that lands during a backoff window, matching that block's own "re-check on resume" reasoning (`:2296-2324`).
 4. **Compensation** (`worker.py:2921-2929`):
@@ -184,16 +185,17 @@ The rule: a step is in scope when `adapter.action_type ∈ policy.action_types` 
    - The original adapter's own `compensate()` is not re-checked. It undoes an action the gate already authorized, and denying the undo would leave the side effect behind.
    - `value_limit` is not checked here, because compensation adapters cannot be `financial`: high-impact compensation is rejected at publish.
 5. **`/simulate` parity** (`_simulate_steps`, gate at `workflows.py:1504-1537`):
-   - The same helper is inserted at the same position: after usability and adapter resolution and after input validation, before `evaluate_approval_requirement`. It yields `dispatch_gate="policy_blocked"` with the new reasons.
+   - The same helper is inserted at the same position: after usability and adapter resolution, before input validation and `evaluate_approval_requirement`. It yields `dispatch_gate="policy_blocked"` with the new reasons.
    - The walk also accumulates `dispatch_value` exactly as it tracks `action_step_count_so_far`.
    - `SimulateStepResult` gains `action_type`, `data_class` and `dispatch_value`. The first two are static declarations, as `reversible` and `high_impact_categories` already are (`workflows.py:1417-1442`). `dispatch_value` is computed from the validated static input, as dispatch will compute it.
 
-**Input validation moves ahead of the gate** (resolved in review). Today `run_step` runs the gate (`worker.py:2363`) and writes the `dispatched` row (`:2369-2390`) before `adapter.input_schema.model_validate` (`:2426`). `/simulate` likewise evaluates approval (`workflows.py:1534`) before validating (`:1568`). Value enforcement needs `dispatch_value(validated_input)`, so on the first-dispatch path:
+**Input validation moves inside the gate** (resolved in review). Today `run_step` runs the gate (`worker.py:2363`) and writes the `dispatched` row (`:2369-2390`) before `adapter.input_schema.model_validate` (`:2426`). `/simulate` likewise evaluates approval (`workflows.py:1534`) before validating (`:1568`). Value enforcement needs `dispatch_value(validated_input)`, so on the first-dispatch path:
 
-- `_evaluate_dispatch_gate` validates the input **once**, right after usability and adapter resolution and before the scope check, and passes the validated model to `dispatch_value` and back to `run_step`, which reuses it in its existing `try` rather than validating again. A failure returns a new gate outcome, `StepInputInvalid(step_index, error_class)`. This replaces "validate in the existing `try`" for first dispatch, because that `try` runs only after the `dispatched` row exists. The retry-resume path keeps validating where it does today, because its row already exists and no gate runs there.
-- A validation failure keeps today's classification: `error_class = type(exc).__name__`, i.e. Pydantic's `ValidationError`, as the existing `except Exception` branch writes it (`worker.py:2541-2558`). Because no row exists yet, `run_step` `INSERT`s the step row directly as `failed` with that `error_class` and `dispatch_value NULL`, never passing through `dispatched`. That is safe because nothing has been executed.
-- Validation sits **inside** the gate, after `_resolve_usable_policy`, rather than in front of the whole gate. That keeps two existing guarantees. An unusable policy still wins over bad input (`needs_review`, not `failed`). And under `preview_only` an invalid input returns `StepBlockedByPreviewOnlyPolicy` instead of writing a `failed` row, because a `failed` row triggers the compensation sequence, which dispatches for real (the gate's own docstring, `worker.py:2109-2120`, closes the same path for unregistered adapters).
-- `_simulate_steps` is reordered the same way: it validates before scope and approval evaluation, reports a failure in its existing `error` field as `ValidationError`, and evaluates scope, approval and value only on valid input.
+- `_evaluate_dispatch_gate` validates the input **once**, inside the gate, after the scope check and before value and approval evaluation. It passes the validated model to `dispatch_value` and back to `run_step`, which reuses it in its existing `try` rather than validating again. A failure returns a new gate outcome, `StepInputInvalid(step_index, error_class)`. This replaces "validate in the existing `try`" for first dispatch, because that `try` runs only after the `dispatched` row exists. The retry-resume path keeps validating where it does today, because its row already exists and no gate runs there.
+- A validation failure keeps today's classification: `error_class = type(exc).__name__`, i.e. Pydantic's `ValidationError`, as the existing `except Exception` branch writes it (`worker.py:2541-2558`). Because no row exists yet, `run_step` `INSERT`s the step row directly as `failed` with that `error_class` and `dispatch_value NULL`, never passing through `dispatched`, then calls `record_step_outcome("failed")` and returns `StepOutcome(step_index, "failed", None, "ValidationError")`. `process_claimed_run`'s existing `failed` branch (`worker.py:3191`) therefore handles compensation unchanged. That is safe because nothing has been executed.
+- Validation sits **inside** the gate rather than in front of it. That keeps two existing guarantees and adds a third. An unusable policy still wins over bad input (`needs_review`, not `failed`). An out-of-scope step still wins over bad input (`needs_review` plus `automation.step_blocked`, not `failed`). And under `preview_only` an invalid input returns `StepBlockedByPreviewOnlyPolicy` instead of writing a `failed` row, because a `failed` row triggers the compensation sequence, which dispatches for real (the gate's own docstring, `worker.py:2109-2120`, closes the same path for unregistered adapters). This is consistent with item 2: the `preview_only` *exit* stays last for valid input, and only the invalid-input case leaves early with the same outcome.
+- **Behaviour change under `preview_only`:** an invalid input now skips the approval rehearsal. No `approval_requests` row is created and the run blocks as preview-only straight away. Today such a step creates an approval row first, and after approval it is blocked anyway, so the rehearsal never reached a valid dispatch.
+- `_simulate_steps` is reordered the same way: usability → adapter → scope → validation → value and approval. An invalid input gets a new `DispatchGate` member, `dispatch_gate="input_invalid"` (`workflows.py:1377-1379`, mirrored in `types.ts`), with `error="ValidationError"` in its existing `error` field. Value and approval are evaluated only on valid input.
 
 **Value enforcement** extends `evaluate_approval_requirement` with a required `run_value_so_far: Decimal` keyword and the step's `step_value: Decimal`. Like the count, the run value is required so that a forgotten argument cannot fall through to 0 (`approvals.py:247-251`).
 
@@ -202,7 +204,9 @@ The rule: a step is in scope when `adapter.action_type ∈ policy.action_types` 
 - `None` means no approval is needed.
 - Otherwise it returns the effective high-impact category set: the adapter's `high_impact_categories`, plus `policy-limit-exceeding` when `action_step_count_so_far >= policy.count_limit` or `run_value_so_far + step_value > policy.value_limit`. Under `per_run` or `preview_only` on a bounded adapter with no limit tripped, the set is empty but not `None`, so approval is still required.
 
-Both callers change. `_evaluate_approval_gate` (`worker.py:2048-2070`) treats `None` as "no approval" and persists the returned set through `create_approval_request` in place of `adapter.high_impact_categories` (`:2062-2064`). `_simulate_steps` (`workflows.py:1534-1537`) maps `None` to `clear` and anything else to `requires_approval`.
+**Truthiness trap:** an empty `frozenset` means "approval required" but is falsy, so both callers must test `is None`, never truthiness. Today's `if not evaluate_approval_requirement(...)` (`worker.py:2049`) and the simulate ternary `"requires_approval" if requires_approval else "clear"` (`workflows.py:1537`) would both silently skip approval for a `per_run` bounded step if left as they are.
+
+Both callers change. `_evaluate_approval_gate` (`worker.py:2048-2070`) treats `is None` as "no approval" and persists the returned set through `create_approval_request` in place of `adapter.high_impact_categories` (`:2062-2064`). `_simulate_steps` (`workflows.py:1534-1537`) maps `None` to `clear` and anything else to `requires_approval`.
 
 This closes an adjacent gap (Owner decision 5): today a count-triggered approval on a bounded adapter stores an empty category set, so the approver is never told the reason is `policy-limit-exceeding`.
 
@@ -214,10 +218,10 @@ This closes an adjacent gap (Owner decision 5): today a count-triggered approval
 | `PolicyResponse` | adds `scope_enforced: bool` |
 | `GET /automations/adapters` (new, read-only) | `{adapter_id, action_type, data_class, reversible, high_impact_categories, has_dispatch_value}` per registered adapter, plus the ordered `data_classes` vocabulary, so the UI can offer the closed vocabularies instead of free text. Auth: `AuthDep` with an active workspace membership, read-only, no CSRF or idempotency key, the same as `GET /automations/policies` (`policy.py:427-434`). The registry is global, so the response holds no workspace data |
 | `POST .../publish` | `422 ACTION_REF_OUTSIDE_POLICY_SCOPE` |
-| `/simulate` | new `policy_block_reason` values, plus `action_type`, `data_class` and `dispatch_value` per step |
+| `/simulate` | new `policy_block_reason` values, a new `dispatch_gate` value `input_invalid`, plus `action_type`, `data_class` and `dispatch_value` per step |
 | Run outcome | `needs_review`, plus an audit-outbox event `automation.step_blocked` carrying `{run_id, step_index, reason}`, because a blocked step writes no step row (`worker.py:970-975`) and the reason is otherwise unrecoverable for an operator (`IMPLEMENTATION-STATUS.md:99`, judgment call 3). It is written with `audit_outbox.write_audit_and_outbox`, with `auth` set to an `AuthContext` built from the run's `workspace_id` and `created_by` (the pattern at `local_adapters.py:335-342`) and `request=None`. It is written in the `StepBlockedByPolicy` branch of `process_claimed_run` (`worker.py:3164-3165`) in the same session and transaction as `_pause_run(..., "needs_review")`, so the event and the transition commit together. **Only the two new reasons emit it** (resolved in review); the three existing reasons keep today's behaviour, to keep scope |
 | `PolicyPanel.tsx` | replaces the two free-text inputs (`:195-200`) with a checkbox group of action types fed by `/automations/adapters`, and a single choice of the **highest data class the policy allows** (ordinal ceiling; it submits `[chosen]`); shows a "Legacy scope: not enforced, expires {date}" badge for `scope_enforced=false` |
-| `frontend/src/features/automation/types.ts` | `Policy` gains `scope_enforced: boolean`; `PolicyBlockReason` gains the two new reasons; `SimulateStepResult` gains `action_type?: string \| null`, `data_class?: string \| null` and `dispatch_value?: string \| null` (a decimal string, as `value_limit` already is); a new `AutomationAdapter` type for the adapters endpoint |
+| `frontend/src/features/automation/types.ts` | `Policy` gains `scope_enforced: boolean`; `PolicyBlockReason` gains the two new reasons; `DispatchGate` gains `'input_invalid'`; `SimulateStepResult` gains `action_type?: string \| null`, `data_class?: string \| null` and `dispatch_value?: string \| null` (a decimal string, as `value_limit` already is); a new `AutomationAdapter` type for the adapters endpoint |
 | `RunWorkspace` / approval card | shows the block reason; shows `policy-limit-exceeding` when present |
 
 ## Decision 6: rollout, tests, and documentation
@@ -227,13 +231,14 @@ This closes an adjacent gap (Owner decision 5): today a count-triggered approval
 1. contract and registry validation;
 2. adapter backfill (all six adapters and every test fake);
 3. migration;
-4. the scope check in `policy.create_policy` (Decision 3 item 3), and **every test policy helper that creates a policy with empty or free-text scope moved to a valid enforced scope** that authorizes the adapters its tests dispatch:
+4. the scope check in `policy.create_policy` (Decision 3 item 3), and **every direct call and API payload that creates a policy with empty, omitted or free-text scope moved to a valid enforced scope** that authorizes the adapters its tests dispatch:
    - `create_policy` callers passing `action_types=[]`: `tests/test_automation_worker_postgres.py:364` (`_create_policy`, call at `:392`), `tests/test_automation_approvals_postgres.py:181` (`_create_policy`, `:195`), `tests/test_automation_adapters_postgres.py:183` (`_create_policy`, `:197`), `tests/test_automation_policy_postgres.py:257,287,318`, `tests/test_automation_retry_postgres.py:348`, `tests/test_automation_kill_switches_postgres.py:255`, `tests/test_automation_simulate_postgres.py:255`, `tests/test_automation_runs_postgres.py:228`, `tests/test_automation_compensation_postgres.py:501`, `tests/test_automation_scheduler_postgres.py:322`, `tests/test_engineering_write_actions_postgres.py:1558`, `tests/test_engineering_write_actions_connector_authz_postgres.py:432`;
    - in-memory `AutomationPolicy(...)` builders, which also gain `scope_enforced`: `tests/test_automation_policy_postgres.py:164` (`_make_policy`, `:172`) and `tests/test_automation_approvals_postgres.py:288` (`_fake_policy`, `:296`);
+   - API payloads that omit `action_types`/`data_classes` (they default to `[]`) and expect a created policy, which will now get `422 POLICY_SCOPE_EMPTY`: `tests/test_automation_policy_postgres.py:488,511,537,566,648,752,808` and the `policy_create` case in `tests/test_automation_prompts_membership_lock_race_postgres.py:269-279` (expects 201). Unaffected, because an earlier check answers first: `:452` (schema 422), `:464` (workflow 404), `:609` (CSRF) and `:629` (auth);
    - the two that store an adapter id as an action type: `tests/test_automation_policy_postgres.py:227` (direct call) and `:428` (API payload);
    - direct-`INSERT` seeders (`tests/test_automation_mutation_lock_race_postgres.py:98`, `tests/test_automation_prompts_membership_lock_race_postgres.py:129`, `tests/test_automation_policy_postgres.py:364,394`) omit `scope_enforced`, so they keep producing legacy rows and need no change unless a test dispatches against them;
    - `scripts/seed_phase1_acceptance.py:1802` (values at `:1818-1819`), which inserts `action_types=['bounded']`, `data_classes=['internal']` directly: set `scope_enforced = true` with the seeded workflow's real action types and a ceiling that covers its adapters' `data_class`;
-5. `evaluate_policy_scope`, input validation ahead of the gate, and value accumulation;
+5. `evaluate_policy_scope`, input validation inside the gate, and value accumulation;
 6. gate, retry and compensation;
 7. publish check;
 8. `/simulate`;
@@ -264,19 +269,22 @@ Before merging, run the Decision 3 report query against production and include t
   - a compensation `execute()` that is out of scope gives `PolicyScopeViolationDuringCompensation` / `compensation_failed`;
   - an original adapter's `compensate()` is not blocked;
   - `preview_only` with an out-of-scope step blocks on scope.
-- Input validation ahead of the gate (extend `tests/test_automation_worker_postgres.py`):
+- Input validation inside the gate (extend `tests/test_automation_worker_postgres.py`):
   - an input that fails `input_schema` validation writes one `failed` step row with `error_class='ValidationError'` and no `dispatched` intermediate, creates no `approval_requests` row, and never calls `execute()`;
   - with a revoked policy the same step blocks (`needs_review`) instead; under `preview_only` it returns the preview-only block and writes no `failed` row;
-  - `_simulate_steps` reports `error='ValidationError'` for the same step.
+  - an invalid input on an out-of-scope step lands in `needs_review` with one `automation.step_blocked` event and writes no `failed` row;
+  - under `preview_only` an invalid input creates no `approval_requests` row (the documented rehearsal change);
+  - `_simulate_steps` reports `dispatch_gate='input_invalid'` and `error='ValidationError'` for the same step, and `policy_blocked` when the step is also out of scope.
 - `tests/test_automation_value_limit_postgres.py`, using a test-only `financial` fake with `dispatch_value`:
   - the run sum crossing `value_limit` requires approval even under `bounded_recurring`, and the approval row's `high_impact_categories` contains `policy-limit-exceeding`;
   - a count-triggered approval (`count_limit` reached on a bounded adapter) also stores `policy-limit-exceeding` on the approval row;
   - `evaluate_approval_requirement` returns `None` when no approval is needed and an empty set under `per_run` for a bounded adapter;
+  - at gate level, a `per_run` step on a bounded adapter (empty set, falsy) still pauses in `waiting_approval`, and `/simulate` reports it as `requires_approval` (guards the `is None` check);
   - value 0 never trips;
   - `dispatch_value` is persisted on the step row, and a prior `failed` step's value still counts toward the run sum.
 - Extend `tests/test_automation_simulate_postgres.py`: for the same graph and policy, `/simulate` reports the **same first block reason and the same approval points up to the first block** as real dispatch, one assertion per new reason.
 - Extend `tests/test_automation_workflows_postgres.py` with `ACTION_REF_OUTSIDE_POLICY_SCOPE` at publish, covering both action and compensation steps, plus the skip cases: no `policy_ref`, a legacy policy, and a revoked policy all publish.
-- Frontend: `PolicyPanel.test.tsx` covers the action-type checkboxes, the highest-data-class choice and the legacy badge.
+- Frontend: `PolicyPanel.test.tsx` covers the action-type checkboxes, the highest-data-class choice and the legacy badge. The `Policy` fixtures in `RunWorkspace.test.tsx:155` and `WorkflowDetail.test.tsx:269` gain `scope_enforced` once the type does.
 
 **Documentation updates in the implementation PR** (each flips "stored but not enforced" to the enforced description, scoped to `scope_enforced` rows):
 
@@ -304,4 +312,4 @@ Before merging, run the Decision 3 report query against production and include t
 
 ## Completion boundary for this planning pass
 
-Complete: the owner has accepted Decisions 1-6 and answered the open questions above. The implementation PR follows Decision 6's order and test list. It uses the next free migration number at that time (`0085` is taken by `0085_distinct_approver.py`, PR #361).
+Complete: the owner has accepted Decisions 1-6, recorded in "Owner decisions" above. The implementation PR follows Decision 6's order and test list. It uses the next free migration number at that time (`0085` is taken by `0085_distinct_approver.py`, PR #361).
