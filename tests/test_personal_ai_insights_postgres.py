@@ -407,6 +407,68 @@ def test_generate_insight_idempotent_replay_returns_identical_response(
         get_settings.cache_clear()
 
 
+def test_generate_insight_replay_after_suspension_is_refused(
+    personal_test_context: tuple[TestClient, UUID, UUID, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-key replay is authorized like a fresh request (ADR-0014): a
+    member suspended after the first request gets 403, not their cached
+    insight, and the replay calls no model and writes nothing."""
+    monkeypatch.setenv("ECC_PERSONAL_AI_INSIGHT_GENERATION_ENABLED", "true")
+    get_settings.cache_clear()
+    try:
+        client, workspace_id, owner_id, token = personal_test_context
+        record_id = _enable_and_grant_habits(
+            client, token, workspace_id=workspace_id, owner_id=owner_id
+        )
+        model_calls: list[None] = []
+        adapter = _mock_adapter_citing(record_id, on_request=lambda: model_calls.append(None))
+        headers = _headers(token, "suspended-replay-key")
+        app.dependency_overrides[get_ollama_adapter] = lambda: adapter
+        try:
+            first = client.post(
+                "/api/v1/personal/insights/generate",
+                json={"source_domain_keys": ["habits"]},
+                headers=headers,
+            )
+            assert first.status_code == 200, first.text
+            assert first.json()["available"] is True
+
+            def counts() -> dict[str, int]:
+                with engine.connect() as connection:
+                    return {
+                        table: connection.execute(
+                            text(f"SELECT count(*) FROM {table} WHERE workspace_id = :ws"),  # noqa: S608
+                            {"ws": workspace_id},
+                        ).scalar_one()
+                        for table in ("ai_runs", "personal_insights", "idempotency_records")
+                    }
+
+            before = counts()
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE workspace_memberships SET status = 'suspended' "
+                        "WHERE workspace_id = :ws AND users_id = :u"
+                    ),
+                    {"ws": workspace_id, "u": owner_id},
+                )
+
+            replay = client.post(
+                "/api/v1/personal/insights/generate",
+                json={"source_domain_keys": ["habits"]},
+                headers=headers,
+            )
+        finally:
+            app.dependency_overrides.pop(get_ollama_adapter, None)
+
+        assert replay.status_code == 403, replay.text
+        assert replay.json()["error"]["code"] == "INSUFFICIENT_ROLE"
+        assert len(model_calls) == 1
+        assert counts() == before
+    finally:
+        get_settings.cache_clear()
+
+
 def test_generate_insight_idempotency_store_failure_still_returns_the_insight(
     personal_test_context: tuple[TestClient, UUID, UUID, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
