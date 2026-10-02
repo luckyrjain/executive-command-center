@@ -63,7 +63,10 @@ function errorMessage(error: unknown): string {
     if (error.code === 'RATE_LIMITED') return `Workflow "${details?.workflow_id ?? ''}" has already used its policy's limit of ${details?.limit ?? 'allowed'} runs per hour -- the next run is rejected until the trailing hour rolls over.`
     if (error.code === 'RUN_NOT_PAUSED') return `This run is ${details?.status ?? 'not paused'}, so it cannot be resumed.`
   }
-  return apiErrorMessage(error, { RUN_NOT_FOUND: 'This run no longer exists in this workspace.' })
+  return apiErrorMessage(error, {
+    RUN_NOT_FOUND: 'This run no longer exists in this workspace.',
+    WORKFLOW_NOT_FOUND: 'No workflow with this id exists in this workspace that you can run.',
+  })
 }
 
 function RunDetailView({ run }: { run: RunDetail }) {

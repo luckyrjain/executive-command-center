@@ -312,7 +312,7 @@ def test_create_run_endpoint_rejects_caller_supplied_policy_id(
     assert runs == []
 
 
-def test_create_run_endpoint_workflow_not_active_is_409(
+def test_create_run_endpoint_unknown_workflow_is_404(
     runs_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
     client, _workspace_id, _user_id, token = runs_test_context
@@ -321,8 +321,8 @@ def test_create_run_endpoint_workflow_not_active_is_409(
         json={"workflow_id": f"test.never-existed.{uuid4().hex}"},
         headers=_headers(token, key="create-run-inactive"),
     )
-    assert response.status_code == 409
-    assert response.json()["error"]["code"] == "WORKFLOW_NOT_ACTIVE"
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "WORKFLOW_NOT_FOUND"
 
 
 def test_create_run_endpoint_rate_limited_is_409(
