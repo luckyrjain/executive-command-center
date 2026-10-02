@@ -33,6 +33,7 @@ from ecc.domains.governance.recommendation_storage import (
     save_cached,
 )
 from ecc.domains.governance.recommendation_targets import (
+    TARGET_RESOURCE_TYPES,
     execute_target,
     target_version,
     validate_action,
@@ -52,16 +53,6 @@ IdempotencyHeader = Annotated[
     str,
     Header(alias="Idempotency-Key", min_length=1, max_length=255),
 ]
-
-
-def _start(
-    session: Session,
-    auth: AuthContext,
-    idempotency_key: str,
-    digest: str,
-) -> RecommendationResponse | None:
-    lock_idempotency(session, auth, idempotency_key)
-    return load_cached(session, auth, idempotency_key, digest)
 
 
 def synthetic_request(request_id: UUID, correlation_id: UUID) -> Request:
@@ -125,7 +116,7 @@ def create_recommendation(
     """
     digest = request_hash(payload, "generate")
     # The role gate runs under the shared membership lock, taken before
-    # `_start`'s idempotency lock (lock order: membership -> idempotency ->
+    # the idempotency lock (lock order: membership -> idempotency ->
     # rows), so a removal or demotion either committed before it (403) or
     # waits for this transaction (ADR-0014).
     try:
@@ -156,7 +147,7 @@ def create_recommendation(
         if not authz.authorize(
             session,
             auth,
-            resource_type=f"{payload.target_type}s",
+            resource_type=TARGET_RESOURCE_TYPES[payload.target_type],
             resource_id=payload.target_id,
             action="read",
         ):
