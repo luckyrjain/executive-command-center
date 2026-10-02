@@ -205,16 +205,27 @@ def create_recommendation(
     # subquery would still see the pre-revoke snapshot and supersede the
     # row after the revoke returned. Each `authz.authorize` below is a new
     # READ COMMITTED statement issued after the lock is granted, so it sees
-    # the committed revoke. The read filter on the SELECT only narrows which
-    # rows get locked (a caller never locks rows it cannot see); it is not
-    # the authorization. `ORDER BY id` keeps concurrent creates on the same
-    # target locking in one order.
+    # the committed revoke. The read and write filters on the SELECT only
+    # narrow which rows get locked (a caller never locks rows it cannot
+    # see, nor ones shared with it read-only); they are not the
+    # authorization. A stale snapshot can only make them lock a row the
+    # checks below then skip. `ORDER BY id` keeps concurrent creates on the
+    # same target locking in one order.
     read_sql, read_params = authz.visible_resource_filter_sql(
         session,
         auth,
         resource_type="recommendations",
         action="read",
         table_alias="recommendations",
+        param_prefix="read_",
+    )
+    write_sql, write_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="recommendations",
+        action="write",
+        table_alias="recommendations",
+        param_prefix="write_",
     )
     candidate_ids = list(
         session.execute(
@@ -227,15 +238,17 @@ def create_recommendation(
                   AND status IN ('proposed','pending_confirmation')
                   AND archived_at IS NULL
                   AND {read_sql}
+                  AND {write_sql}
                 ORDER BY id
                 FOR UPDATE
-                """  # noqa: S608 -- authz visibility fragment; values bound
+                """  # noqa: S608 -- authz visibility fragments; values bound
             ),
             {
                 "workspace_id": auth.workspace_id,
                 "target_type": payload.target_type,
                 "target_id": payload.target_id,
                 **read_params,
+                **write_params,
             },
         ).scalars()
     )
