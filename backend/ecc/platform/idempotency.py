@@ -170,8 +170,10 @@ def load_cached(
     who has since been demoted, suspended, or lost the row to an ownership
     or visibility change must not read back a cached success. Call it
     before state and version checks, so an authorized replay of a write
-    that succeeded still gets its cached response, not a `409`. ADR-0014
-    records the decision.
+    that succeeded still gets its cached response, not a `409` -- unless
+    the caller deliberately refuses a stale hit, as connector disable does
+    (`409 IDEMPOTENCY_CONFLICT` once the account is no longer
+    `disconnected`). ADR-0014 records the decision.
     """
     row = (
         session.execute(
