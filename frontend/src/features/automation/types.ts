@@ -53,9 +53,15 @@ export type DispatchGate =
   | 'requires_approval'
   | 'policy_blocked'
   | 'adapter_not_registered'
+  | 'input_invalid'
   | 'not_applicable'
 
-export type PolicyBlockReason = 'no_policy' | 'policy_revoked' | 'policy_expired'
+export type PolicyBlockReason =
+  | 'no_policy'
+  | 'policy_revoked'
+  | 'policy_expired'
+  | 'action_type_not_authorized'
+  | 'data_class_not_authorized'
 
 export type SimulateStepResult = {
   step_index: number
@@ -66,6 +72,10 @@ export type SimulateStepResult = {
   preview?: Record<string, unknown> | null
   reversible?: boolean | null
   high_impact_categories: string[]
+  action_type?: string | null
+  data_class?: string | null
+  /** Decimal string, like `value_limit`. */
+  dispatch_value?: string | null
   dispatch_gate: DispatchGate
   policy_block_reason?: PolicyBlockReason | null
   error?: string | null
@@ -98,9 +108,30 @@ export type Policy = {
   version: number
   created_at: string
   updated_at: string
+  /** False for a legacy policy created before scope enforcement: its
+   * action types and data classes are not checked, and it expires as usual. */
+  scope_enforced: boolean
 }
 
 export type PolicyListResponse = { policies: Policy[] }
+
+// --- Adapters (GET /automations/adapters) -------------------------------
+
+export type AutomationAdapter = {
+  adapter_id: string
+  action_type: string
+  data_class: string
+  reversible: boolean
+  high_impact_categories: string[]
+  has_dispatch_value: boolean
+}
+
+export type AdapterListResponse = {
+  adapters: AutomationAdapter[]
+  action_types: string[]
+  /** Ascending sensitivity; a policy names the highest class it allows. */
+  data_classes: string[]
+}
 
 // --- Approvals ------------------------------------------------------------
 

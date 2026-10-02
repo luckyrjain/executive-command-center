@@ -266,7 +266,7 @@ describe('WorkflowDetail', () => {
     vi.stubGlobal('fetch', mockFetchByPath({
       '/api/v1/automations/workflows/version-1': withPolicy,
       '/api/v1/automations/triggers': noTriggers,
-      '/api/v1/automations/policies': { policies: [{ id: 'policy-1', workflow_id: 'weekly-digest', action_types: [], data_classes: [], value_limit: '0', count_limit: 10, rate_limit: {}, schedule: null, approval_mode: 'per_run', expires_at: '2026-10-01T00:00:00Z', revoked_at: '2026-07-22T00:00:00Z', status: 'revoked', version: 1, created_at: '2026-07-01T00:00:00Z', updated_at: '2026-07-22T00:00:00Z' }] },
+      '/api/v1/automations/policies': { policies: [{ id: 'policy-1', workflow_id: 'weekly-digest', action_types: [], data_classes: [], value_limit: '0', count_limit: 10, rate_limit: {}, schedule: null, approval_mode: 'per_run', expires_at: '2026-10-01T00:00:00Z', revoked_at: '2026-07-22T00:00:00Z', status: 'revoked', version: 1, created_at: '2026-07-01T00:00:00Z', updated_at: '2026-07-22T00:00:00Z', scope_enforced: true }] },
       '/kill_switch': noSwitch,
     }))
     renderDetail()

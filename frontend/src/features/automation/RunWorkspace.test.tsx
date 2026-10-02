@@ -152,7 +152,7 @@ describe('RunWorkspace', () => {
       compensation_steps: [],
     }
     const revokedPolicy: PolicyListResponse = {
-      policies: [{ id: 'policy-1', workflow_id: 'weekly-digest', action_types: [], data_classes: [], value_limit: '0', count_limit: 10, rate_limit: {}, schedule: null, approval_mode: 'per_run', expires_at: '2026-10-01T00:00:00Z', revoked_at: '2026-07-24T00:00:00Z', status: 'revoked', version: 2, created_at: '2026-07-01T00:00:00Z', updated_at: '2026-07-24T00:00:00Z' }],
+      policies: [{ id: 'policy-1', workflow_id: 'weekly-digest', action_types: [], data_classes: [], value_limit: '0', count_limit: 10, rate_limit: {}, schedule: null, approval_mode: 'per_run', expires_at: '2026-10-01T00:00:00Z', revoked_at: '2026-07-24T00:00:00Z', status: 'revoked', version: 2, created_at: '2026-07-01T00:00:00Z', updated_at: '2026-07-24T00:00:00Z', scope_enforced: true }],
     }
     vi.stubGlobal('fetch', mockFetchByPath({
       '/api/v1/automations/runs/run-1': detail,
