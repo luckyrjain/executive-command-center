@@ -559,3 +559,118 @@ def test_policy_made_private_while_create_waits_is_refused(world: RaceWorld) -> 
 
     _assert_refused(response, 404, "POLICY_NOT_FOUND")
     assert _family_rows(world) == rows_before
+
+
+# ---------------------------------------------------------------------------
+# A publish committing while the request waits on the active row: the newly
+# active version is the one authorized
+# ---------------------------------------------------------------------------
+
+
+def _publish(retire_id: UUID, activate_id: UUID) -> Any:
+    """What `activate_workflow_version` writes, run on the holder connection
+    that already locks `retire_id`."""
+
+    def mutate(conn: Connection) -> None:
+        conn.execute(
+            text("UPDATE workflow_versions SET status = 'retired' WHERE id = :id"),
+            {"id": retire_id},
+        )
+        conn.execute(
+            text("UPDATE workflow_versions SET status = 'active' WHERE id = :id"),
+            {"id": activate_id},
+        )
+
+    return mutate
+
+
+@pytest.mark.parametrize(("visibility", "status_code"), [("private", 404), ("workspace", 201)])
+def test_publish_committing_while_create_waits_authorizes_the_new_active_version(
+    world: RaceWorld, visibility: str, status_code: int
+) -> None:
+    """A's v1 is active, A's v2 (`visibility`) a draft, A's v3 the visible
+    latest. B's append waits on v1 while a publish retires v1 and activates
+    v2. Waking up, the locking select skips v1 and cannot see v2 as active;
+    v2 must still be checked, so a private v2 refuses B with 404."""
+    workflow_id, v1 = _seed_family(world, owner=world.a, visibility="workspace")
+    with engine.begin() as conn:
+        v2 = _insert_version(
+            conn,
+            world,
+            workflow_id=workflow_id,
+            version=2,
+            owner=world.a,
+            visibility=visibility,
+            status="draft",
+        )
+        _insert_version(
+            conn,
+            world,
+            workflow_id=workflow_id,
+            version=3,
+            owner=world.a,
+            visibility="workspace",
+            status="draft",
+        )
+    response, _ = race(
+        world,
+        table="workflow_versions",
+        row_id=v1,
+        send=lambda client: _create(client, world.b_token, workflow_id),
+        transfer=False,
+        mutate=_publish(v1, v2),
+    )
+
+    assert response.status_code == status_code, response.text
+    if status_code == 404:
+        _assert_refused(response, 404, "WORKFLOW_NOT_FOUND")
+        assert [row["version"] for row in _family_rows(world)] == [1, 2, 3]
+    else:
+        assert response.json()["version"] == 4
+
+
+@pytest.mark.parametrize(("visibility", "status_code"), [("private", 403), ("workspace", 200)])
+def test_publish_committing_while_publish_waits_authorizes_the_new_active_version(
+    world: RaceWorld, visibility: str, status_code: int
+) -> None:
+    """B publishes its draft v3 while another publish retires A's v1 and
+    activates A's v2 (`visibility`). B's publish would retire v2, so it needs
+    write on v2: a private v2 refuses B and stays active."""
+    workflow_id, v1 = _seed_family(world, owner=world.a, visibility="workspace")
+    with engine.begin() as conn:
+        v2 = _insert_version(
+            conn,
+            world,
+            workflow_id=workflow_id,
+            version=2,
+            owner=world.a,
+            visibility=visibility,
+            status="draft",
+        )
+        v3 = _insert_version(
+            conn,
+            world,
+            workflow_id=workflow_id,
+            version=3,
+            owner=world.b,
+            visibility="workspace",
+            status="draft",
+        )
+    response, _ = race(
+        world,
+        table="workflow_versions",
+        row_id=v1,
+        send=lambda client: client.post(
+            f"{_WORKFLOWS}/{v3}/publish", headers=headers(world.b_token)
+        ),
+        transfer=False,
+        mutate=_publish(v1, v2),
+    )
+
+    assert response.status_code == status_code, response.text
+    statuses = {row["id"]: row["status"] for row in _family_rows(world)}
+    if status_code == 403:
+        _assert_refused(response, 403, "INSUFFICIENT_ROLE")
+        assert statuses == {v1: "retired", v2: "active", v3: "draft"}
+    else:
+        assert statuses == {v1: "retired", v2: "retired", v3: "active"}
