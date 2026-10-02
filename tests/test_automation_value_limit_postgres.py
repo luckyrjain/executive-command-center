@@ -205,8 +205,9 @@ def test_value_zero_never_trips_and_returns_none(world: World) -> None:
 def test_dispatch_value_is_stored_exactly_as_the_gate_compares_it() -> None:
     money = FinancialFakeAdapter("test.pay")
     assert dispatch_value(money, FakeInput(amount=Decimal("1.005"))) == Decimal("1.01")
-    with pytest.raises(ValueError, match="numeric"):
-        dispatch_value(money, FakeInput(amount=Decimal(10) ** 12))
+    for too_big in (Decimal(10) ** 12, Decimal("999999999999.995"), Decimal("1e30")):
+        with pytest.raises(ValueError, match="numeric"):
+            dispatch_value(money, FakeInput(amount=too_big))
 
 
 def test_an_unstorable_value_fails_the_step_instead_of_wedging_the_run(world: World) -> None:

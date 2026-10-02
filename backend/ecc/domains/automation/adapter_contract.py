@@ -288,8 +288,14 @@ def dispatch_value(adapter: ActionAdapter, action_input: BaseModel) -> Decimal:
     # so the gate compares the same value the run sum will later read back;
     # anything that cannot be stored is refused here (the gate turns the
     # ValueError into a failed step) rather than failing the INSERT.
+    # Checked before quantizing too: quantize raises InvalidOperation (not
+    # ValueError) for values beyond the decimal context's precision.
+    if value >= _MAX_DISPATCH_VALUE:
+        raise ValueError(
+            f"adapter '{adapter.adapter_id}' dispatch_value {value} exceeds numeric(14,2)"
+        )
     stored = value.quantize(_CENTS, rounding=ROUND_HALF_UP)  # Postgres numeric rounding
-    if stored >= _MAX_DISPATCH_VALUE:
+    if stored >= _MAX_DISPATCH_VALUE:  # e.g. 999999999999.995 rounds up to 10^12
         raise ValueError(
             f"adapter '{adapter.adapter_id}' dispatch_value {value} exceeds numeric(14,2)"
         )
