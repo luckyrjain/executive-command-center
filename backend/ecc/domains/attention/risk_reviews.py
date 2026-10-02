@@ -135,16 +135,6 @@ def record_risk_review(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         idempotency.lock_idempotency(session, auth, idempotency_key)
-        cached = idempotency.load_cached(
-            session,
-            auth,
-            idempotency_key,
-            request_hash,
-            domain="risk_reviews",
-            response_model=RiskReview,
-        )
-        if cached is not None:
-            return cached
         # A review's authorization boundary is the risk it reviews -- risk_
         # reviews has no independent ownership meaningful apart from the
         # risk it's about, matching claims.py's identical parent-boundary
@@ -154,7 +144,10 @@ def record_risk_review(
         # commits while this request waits on the row lock must be seen by
         # the checks below, not by checks that ran against the pre-transfer
         # row. Under READ COMMITTED each statement after the lock reads the
-        # committed post-change state.
+        # committed post-change state. The idempotency cache is read only
+        # after those checks pass, so a caller who has since lost access
+        # (removed, suspended, demoted, or no longer able to see the risk)
+        # never has a cached success replayed to them.
         risk = (
             session.execute(
                 text(
@@ -176,6 +169,19 @@ def record_risk_review(
             session, auth, resource_type="risks", resource_id=risk_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        # After authz, before the archived/version checks: a same-key replay
+        # of a successful review finds the risk's version already bumped and
+        # must get the cached 201, not a 409.
+        cached = idempotency.load_cached(
+            session,
+            auth,
+            idempotency_key,
+            request_hash,
+            domain="risk_reviews",
+            response_model=RiskReview,
+        )
+        if cached is not None:
+            return cached
         if risk["archived_at"] is not None:
             raise HTTPException(status_code=409, detail="RISK_ARCHIVED")
         if risk["version"] != payload.expected_version:

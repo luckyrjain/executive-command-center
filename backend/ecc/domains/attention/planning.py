@@ -1014,16 +1014,14 @@ def accept_plan(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         idempotency.lock_idempotency(session, auth, idempotency_key)
-        cached = idempotency.load_cached(
-            session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
-        )
-        if cached is not None:
-            return cached
 
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. The idempotency
+        # cache is read only after those checks pass, so a caller who has
+        # since lost access (removed, suspended, demoted, or no longer able
+        # to see the plan) never has a cached success replayed to them.
         current = _get_plan_for_update(session, auth, plan_id)
         if current is None:
             raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
@@ -1035,6 +1033,14 @@ def accept_plan(
             session, auth, resource_type="plans", resource_id=plan_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        # After authz, before the version/status checks: a same-key replay of
+        # a successful write finds the plan already changed and must get the
+        # cached 200, not a 409.
+        cached = idempotency.load_cached(
+            session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
+        )
+        if cached is not None:
+            return cached
         if current["version"] != payload.expected_version:
             raise HTTPException(
                 status_code=409,
@@ -1110,16 +1116,14 @@ def supersede_plan(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         idempotency.lock_idempotency(session, auth, idempotency_key)
-        cached = idempotency.load_cached(
-            session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
-        )
-        if cached is not None:
-            return cached
 
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. The idempotency
+        # cache is read only after those checks pass, so a caller who has
+        # since lost access (removed, suspended, demoted, or no longer able
+        # to see the plan) never has a cached success replayed to them.
         current = _get_plan_for_update(session, auth, plan_id)
         if current is None:
             raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
@@ -1131,6 +1135,14 @@ def supersede_plan(
             session, auth, resource_type="plans", resource_id=plan_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        # After authz, before the version/status checks: a same-key replay of
+        # a successful write finds the plan already changed and must get the
+        # cached 200, not a 409.
+        cached = idempotency.load_cached(
+            session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
+        )
+        if cached is not None:
+            return cached
         if current["version"] != payload.expected_version:
             raise HTTPException(
                 status_code=409,
@@ -1267,16 +1279,14 @@ def replan(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         idempotency.lock_idempotency(session, auth, idempotency_key)
-        cached = idempotency.load_cached(
-            session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
-        )
-        if cached is not None:
-            return cached
 
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. The idempotency
+        # cache is read only after those checks pass, so a caller who has
+        # since lost access (removed, suspended, demoted, or no longer able
+        # to see the plan) never has a cached success replayed to them.
         old = _get_plan_for_update(session, auth, plan_id)
         if old is None:
             raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
@@ -1288,6 +1298,14 @@ def replan(
             session, auth, resource_type="plans", resource_id=plan_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        # After authz, before the version/status checks: a same-key replay of
+        # a successful write finds the plan already changed and must get the
+        # cached 200, not a 409.
+        cached = idempotency.load_cached(
+            session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
+        )
+        if cached is not None:
+            return cached
         if old["version"] != payload.expected_version:
             raise HTTPException(
                 status_code=409,
@@ -1514,16 +1532,14 @@ def move_block(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         idempotency.lock_idempotency(session, auth, idempotency_key)
-        cached = idempotency.load_cached(
-            session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
-        )
-        if cached is not None:
-            return cached
 
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. The idempotency
+        # cache is read only after those checks pass, so a caller who has
+        # since lost access (removed, suspended, demoted, or no longer able
+        # to see the plan) never has a cached success replayed to them.
         current = _get_plan_for_update(session, auth, plan_id)
         if current is None:
             raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
@@ -1535,6 +1551,14 @@ def move_block(
             session, auth, resource_type="plans", resource_id=plan_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        # After authz, before the version/status checks: a same-key replay of
+        # a successful write finds the plan already changed and must get the
+        # cached 200, not a 409.
+        cached = idempotency.load_cached(
+            session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
+        )
+        if cached is not None:
+            return cached
         if current["version"] != payload.expected_version:
             raise HTTPException(
                 status_code=409,
@@ -1663,16 +1687,14 @@ def remove_block(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         idempotency.lock_idempotency(session, auth, idempotency_key)
-        cached = idempotency.load_cached(
-            session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
-        )
-        if cached is not None:
-            return cached
 
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. The idempotency
+        # cache is read only after those checks pass, so a caller who has
+        # since lost access (removed, suspended, demoted, or no longer able
+        # to see the plan) never has a cached success replayed to them.
         current = _get_plan_for_update(session, auth, plan_id)
         if current is None:
             raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
@@ -1684,6 +1706,14 @@ def remove_block(
             session, auth, resource_type="plans", resource_id=plan_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        # After authz, before the version/status checks: a same-key replay of
+        # a successful write finds the plan already changed and must get the
+        # cached 200, not a 409.
+        cached = idempotency.load_cached(
+            session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
+        )
+        if cached is not None:
+            return cached
         if current["version"] != payload.expected_version:
             raise HTTPException(
                 status_code=409,

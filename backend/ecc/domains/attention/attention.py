@@ -1265,9 +1265,6 @@ def record_attention_feedback(
     with session.begin():
         authz.lock_membership_for_write(session, auth, role_action="write")
         _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached_feedback(session, auth, idempotency_key, request_hash)
-        if cached is not None:
-            return cached
         # Feedback has no independent authorization boundary of its own --
         # it comments on an existing attention_item, so a read-only check
         # on that parent (matching claims.py's/resolution.py's
@@ -1279,7 +1276,9 @@ def record_attention_feedback(
         # ownership transfer's FOR UPDATE, so a transfer that commits while
         # this request waits is seen by the check below (READ COMMITTED: each
         # later statement reads the committed row), and one that starts after
-        # this lock waits until the feedback row is committed.
+        # this lock waits until the feedback row is committed. The idempotency
+        # cache is read only after that check passes, so a caller who can no
+        # longer see the item never has a cached success replayed to them.
         item = (
             session.execute(
                 text(
@@ -1292,11 +1291,22 @@ def record_attention_feedback(
             .one_or_none()
         )
         if item is None:
+            # A refresh hard-deletes items whose source closed, so a same-key
+            # retry of feedback that already landed can find the item gone.
+            # It still gets its cached 201: the membership lock above has
+            # re-checked the caller's role, and there is no longer an item
+            # whose visibility could have been taken away from them.
+            cached = _load_cached_feedback(session, auth, idempotency_key, request_hash)
+            if cached is not None:
+                return cached
             raise HTTPException(status_code=404, detail="ATTENTION_ITEM_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="attention_items", resource_id=item_id, action="read"
         ):
             raise HTTPException(status_code=404, detail="ATTENTION_ITEM_NOT_FOUND")
+        cached = _load_cached_feedback(session, auth, idempotency_key, request_hash)
+        if cached is not None:
+            return cached
         row = (
             session.execute(
                 text(
