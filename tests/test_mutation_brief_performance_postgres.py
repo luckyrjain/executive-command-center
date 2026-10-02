@@ -161,8 +161,8 @@ def _assert_p95_under_budget(
     (`tests/test_knowledge_entity_operations_performance_postgres.py`)
     document: transient Postgres background work (checkpoint writes,
     autovacuum) or runner scheduling noise can slow a couple of calls in one
-    pass without reflecting a regression. A real regression fails both the
-    initial pass and the retry. The budget itself is unchanged.
+    pass without reflecting a regression. A real regression keeps putting
+    calls over budget across both passes. The budget itself is unchanged.
 
     The retry is judged on the pooled samples of both passes, not on the
     retry's samples alone. Judging the retry alone would let a partial
