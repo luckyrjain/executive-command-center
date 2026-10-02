@@ -369,16 +369,6 @@ def update_calendar_event(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session,
-            auth,
-            idempotency_key,
-            req_hash,
-            domain="calendar_events",
-            response_model=CalendarEventResponse,
-        )
-        if cached is not None:
-            return cached
         # Two-phase read-then-write authz check: a plain existence lookup
         # then a write-only authorize() call would let a suspended member
         # distinguish 404 from 403 for an event id in their former
@@ -388,7 +378,10 @@ def update_calendar_event(
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. Ahead of the
+        # idempotency cache too: a caller who has since lost access (removed,
+        # suspended, demoted, or no longer able to see the row) must not have
+        # a cached success replayed to them.
         current = _get_row(session, auth, event_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="CALENDAR_EVENT_NOT_FOUND")
@@ -400,6 +393,21 @@ def update_calendar_event(
             session, auth, resource_type="calendar_events", resource_id=event_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+        # After authz, before the version/state checks: a same-key replay of a
+        # successful update finds the version already bumped and must get
+        # the cached 200, not a 409.
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="calendar_events",
+            response_model=CalendarEventResponse,
+        )
+        if cached is not None:
+            return cached
+
         if current["version"] != payload.expected_version:
             raise HTTPException(
                 status_code=409,
@@ -482,20 +490,13 @@ def _lifecycle(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session,
-            auth,
-            idempotency_key,
-            req_hash,
-            domain="calendar_events",
-            response_model=CalendarEventResponse,
-        )
-        if cached is not None:
-            return cached
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. Ahead of the
+        # idempotency cache too: a caller who has since lost access (removed,
+        # suspended, demoted, or no longer able to see the row) must not have
+        # a cached success replayed to them.
         current = _get_row(session, auth, event_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="CALENDAR_EVENT_NOT_FOUND")
@@ -507,6 +508,20 @@ def _lifecycle(
             session, auth, resource_type="calendar_events", resource_id=event_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+        # After authz, before the version/state checks (a replay finds the
+        # version already bumped) -- see update_calendar_event.
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="calendar_events",
+            response_model=CalendarEventResponse,
+        )
+        if cached is not None:
+            return cached
+
         if current["version"] != payload.expected_version:
             raise HTTPException(
                 status_code=409,

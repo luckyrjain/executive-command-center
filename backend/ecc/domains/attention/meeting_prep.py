@@ -1525,9 +1525,6 @@ def add_participant(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(session, auth, idempotency_key, req_hash, domain="meeting_prep")
-        if cached is not None:
-            return ParticipantResponse.model_validate(cached)
 
         _lock_meeting_for_write(session, auth, meeting_id)
         entity = (
@@ -1556,6 +1553,15 @@ def add_participant(
             session, auth, resource_type="pkos_nodes", resource_id=payload.entity_id, action="read"
         ):
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+
+        # The idempotency cache is read only after the meeting and entity
+        # checks above pass, so a caller who has since lost access to either
+        # never has a cached success replayed to them -- and before the
+        # already-linked check, which a replay of a successful link would
+        # otherwise trip with a 409.
+        cached = load_cached(session, auth, idempotency_key, req_hash, domain="meeting_prep")
+        if cached is not None:
+            return ParticipantResponse.model_validate(cached)
 
         if _participant_already_linked(session, auth, meeting_id, payload.entity_id):
             raise HTTPException(status_code=409, detail="PARTICIPANT_ALREADY_LINKED")
@@ -1777,11 +1783,15 @@ def create_prep(
         with session.begin():
             authz.lock_membership_for_write(session, auth)
             lock_idempotency(session, auth, idempotency_key)
+
+            meeting_row = _lock_meeting_for_write(session, auth, meeting_id)
+            # Only after the locked meeting checks, so a caller who has since
+            # lost access never has a cached success replayed to them; before
+            # the existing-pack check, which a replay of a successful create
+            # would otherwise trip with a 409.
             cached = load_cached(session, auth, idempotency_key, req_hash, domain="meeting_prep")
             if cached is not None:
                 return MeetingPack.model_validate(cached)
-
-            meeting_row = _lock_meeting_for_write(session, auth, meeting_id)
 
             existing = _current_pack_row(session, auth, meeting_id)
             if existing is not None:
@@ -1796,12 +1806,13 @@ def create_prep(
 
     with held_idempotency_lock(auth, idempotency_key):
         with session.begin():
-            cached = load_cached(session, auth, idempotency_key, req_hash, domain="meeting_prep")
-        if cached is not None:
-            return MeetingPack.model_validate(cached)
-
-        with session.begin():
             meeting_row = _lock_meeting_for_write(session, auth, meeting_id)
+            # Same placement as the fast path above: authorize against the
+            # locked meeting before serving the cache, and serve it before
+            # the existing-pack check a successful create's replay would trip.
+            cached = load_cached(session, auth, idempotency_key, req_hash, domain="meeting_prep")
+            if cached is not None:
+                return MeetingPack.model_validate(cached)
 
             existing = _current_pack_row(session, auth, meeting_id)
             if existing is not None:
@@ -2024,13 +2035,16 @@ def refresh_prep(
             with session.begin():
                 authz.lock_membership_for_write(session, auth)
                 lock_idempotency(session, auth, idempotency_key)
+
+                meeting_row = _lock_meeting_for_write(session, auth, meeting_id)
+                # After the locked meeting checks, before reading the pack a
+                # successful refresh's replay finds already replaced -- see
+                # create_prep.
                 cached = load_cached(
                     session, auth, idempotency_key, req_hash, domain="meeting_prep"
                 )
                 if cached is not None:
                     return MeetingPack.model_validate(cached)
-
-                meeting_row = _lock_meeting_for_write(session, auth, meeting_id)
 
                 old = _current_pack_row(session, auth, meeting_id, for_update=True)
                 if old is None:
@@ -2049,12 +2063,11 @@ def refresh_prep(
 
     with held_idempotency_lock(auth, idempotency_key):
         with session.begin():
-            cached = load_cached(session, auth, idempotency_key, req_hash, domain="meeting_prep")
-        if cached is not None:
-            return MeetingPack.model_validate(cached)
-
-        with session.begin():
             meeting_row = _lock_meeting_for_write(session, auth, meeting_id)
+            # Same placement as the fast path above.
+            cached = load_cached(session, auth, idempotency_key, req_hash, domain="meeting_prep")
+            if cached is not None:
+                return MeetingPack.model_validate(cached)
 
             old = _current_pack_row(session, auth, meeting_id, for_update=True)
             if old is None:

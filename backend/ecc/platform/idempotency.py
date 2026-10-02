@@ -157,6 +157,24 @@ def load_cached(
     domain: str,
     response_model: type[BaseModel] | None = None,
 ) -> BaseModel | dict[str, Any] | None:
+    """Return the cached response for `key`, or `None` on a miss; `409
+    IDEMPOTENCY_CONFLICT` when the key was used with a different request.
+
+    Serving a hit replays a past success, so call this only after the
+    request has passed the same authorization a fresh request would: in a
+    write transaction, after `authz.lock_membership_for_write`, then
+    `lock_idempotency`, then the row lock, then the read (`404`) and write
+    (`403`) `authorize()` checks (or `role_action="write"` for a create
+    with no target row). A same-key replay is re-authorized, so it can
+    answer `403`/`404` where the first request answered `200` -- a caller
+    who has since been demoted, suspended, or lost the row to an ownership
+    or visibility change must not read back a cached success. Call it
+    before state and version checks, so an authorized replay of a write
+    that succeeded still gets its cached response, not a `409` -- unless
+    the caller deliberately refuses a stale hit, as connector disable does
+    (`409 IDEMPOTENCY_CONFLICT` once the account is no longer
+    `disconnected`). ADR-0014 records the decision.
+    """
     row = (
         session.execute(
             text(

@@ -228,16 +228,6 @@ def create_relationship(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session,
-            auth,
-            idempotency_key,
-            req_hash,
-            domain="knowledge_relationships",
-            response_model=RelationshipResponse,
-        )
-        if cached is not None:
-            return cached
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
@@ -247,6 +237,10 @@ def create_relationship(
         # is not reported here: `authorize()` below reports it exactly like a
         # row the caller cannot see, in the same read -> write -> target
         # order, so a 404 here cannot reveal whether a private target exists.
+        # The idempotency cache is read only after those checks too: a caller
+        # who has since lost access (removed, suspended, demoted, or no longer
+        # able to see either entity) must not have a cached success replayed
+        # to them.
         # NO KEY UPDATE, not UPDATE: this path writes only child rows (see
         # claims.py's identical lock).
         for locked_id in sorted({entity_id, payload.to_entity_id}):
@@ -273,6 +267,21 @@ def create_relationship(
             action="read",
         ):
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+
+        # After authz on both entities, before the status/evidence checks: a
+        # same-key replay of a successful create must still get the cached
+        # 201 even if an entity has since been archived or redirected.
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="knowledge_relationships",
+            response_model=RelationshipResponse,
+        )
+        if cached is not None:
+            return cached
+
         source_version = _entity_version(session, auth, entity_id)
         target_status = _entity_status(session, auth, payload.to_entity_id)
         if source_version is None or target_status is None:

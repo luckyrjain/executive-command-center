@@ -330,13 +330,14 @@ def _transition(
 ) -> RecommendationResponse:
     digest = request_hash(payload, action_name)
     authz.lock_membership_for_write(session, auth)
-    cached = _start(session, auth, idempotency_key, digest)
-    if cached is not None:
-        return cached
+    lock_idempotency(session, auth, idempotency_key)
     # Lock before authorizing: an ownership transfer that commits while
     # this request waits on the row lock must be seen by the checks below
     # (READ COMMITTED: each later statement reads the committed row), not
-    # by checks that ran against the pre-transfer row.
+    # by checks that ran against the pre-transfer row. The idempotency
+    # cache is read only after those checks pass: a caller who has since
+    # lost access (suspended, demoted, or no longer able to see the
+    # recommendation) must not have a cached success replayed to them.
     locked = get_row(session, auth, recommendation_id, for_update=True)
     if not authz.authorize(
         session, auth, resource_type="recommendations", resource_id=recommendation_id, action="read"
@@ -350,6 +351,12 @@ def _transition(
         action="write",
     ):
         raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+    # After authz, before the expiry/version/state checks: a same-key
+    # replay of a successful transition finds the row already changed and
+    # must get the cached 200, not a 409.
+    cached = load_cached(session, auth, idempotency_key, digest)
+    if cached is not None:
+        return cached
     row = expire_if_needed(session, auth, locked, request=request)
     check_version(row, int(payload.expected_version))
     if row["status"] not in allowed_statuses:
@@ -609,9 +616,7 @@ def confirm_recommendation(
 ) -> RecommendationResponse:
     digest = request_hash(payload, "recommendation.confirm")
     authz.lock_membership_for_write(session, auth)
-    cached = _start(session, auth, idempotency_key, digest)
-    if cached is not None:
-        return cached
+    lock_idempotency(session, auth, idempotency_key)
     if not authz.authorize(
         session, auth, resource_type="recommendations", resource_id=recommendation_id, action="read"
     ):
@@ -632,6 +637,10 @@ def confirm_recommendation(
     # The pair above stays: the consent check must run before this lock
     # (see `_require_email_consent_for_confirm`) and must not answer a
     # caller who cannot see the recommendation; the pair is re-run here.
+    # The idempotency cache is read only after the locked pair passes (see
+    # `_transition`), so a replay is refused to a caller who lost access --
+    # and, since the consent check above runs first too, to one whose
+    # email-derived recommendation's consent was revoked meanwhile.
     locked = get_row(session, auth, recommendation_id, for_update=True)
     if not authz.authorize(
         session, auth, resource_type="recommendations", resource_id=recommendation_id, action="read"
@@ -645,6 +654,12 @@ def confirm_recommendation(
         action="write",
     ):
         raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+    # Before the owner-changed, expiry, version and state checks: a same-key
+    # replay of a successful confirm finds the row already accepted and must
+    # get the cached 200, not a 409.
+    cached = load_cached(session, auth, idempotency_key, digest)
+    if cached is not None:
+        return cached
     # The consent above was checked for the owner read before this lock. An
     # ownership transfer that committed while the request waited on the row
     # lock changed it; the consent locks cannot be re-taken here without

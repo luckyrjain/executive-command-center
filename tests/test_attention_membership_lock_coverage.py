@@ -16,13 +16,14 @@ from pathlib import Path
 _ATTENTION = Path(__file__).resolve().parents[1] / "backend" / "ecc" / "domains" / "attention"
 
 # (module, function) -> number of read-only `session.begin()` blocks allowed
-# to skip the lock: meeting-prep enrichment's idempotency-cache read and its
-# pre-enrichment authorize-and-generate transaction, which write nothing
-# (the final write transaction re-locks and re-authorizes).
+# to skip the lock: meeting-prep enrichment's pre-enrichment transaction
+# (authorize against the locked meeting, then the idempotency-cache read,
+# then generate), which writes nothing (the final write transaction
+# re-locks and re-authorizes).
 _READ_ONLY: Counter[tuple[str, str]] = Counter(
     {
-        ("meeting_prep.py", "create_prep"): 2,
-        ("meeting_prep.py", "refresh_prep"): 2,
+        ("meeting_prep.py", "create_prep"): 1,
+        ("meeting_prep.py", "refresh_prep"): 1,
     }
 )
 
