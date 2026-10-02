@@ -270,3 +270,49 @@ def test_idempotent_replay_is_authorized_before_the_cache_is_served(
     assert refused.status_code == 404, refused.text
     assert refused.json()["error"]["code"] == case.not_found
     assert _side_effect_counts(world.ws) == counts_before
+
+
+@pytest.mark.parametrize("name", list(CASES))
+def test_idempotent_replay_after_demotion_is_refused_by_the_locked_write_check(
+    world: RaceWorld, name: str
+) -> None:
+    """The caller can still see the row, so the read fast-fail passes; only
+    the locked write check -- which now runs before the idempotency cache --
+    refuses the replay."""
+    case = CASES[name]
+    with engine.begin() as connection:
+        row_id = case.seed(connection, world)
+        # Workspace-visible and owned by A: C (`member`) can write it by role
+        # alone, and as a `viewer` can still read it.
+        connection.execute(
+            text(
+                f"UPDATE {case.table} SET owner_id = :a, visibility = 'workspace' "  # noqa: S608
+                "WHERE id = :id"
+            ),
+            {"a": world.a, "id": row_id},
+        )
+    c_token = _c_token(world)
+    body = case.body()
+    request_headers = headers(c_token)
+    client = TestClient(app)
+    client.cookies.set("ecc_session", c_token)
+    try:
+        first = client.post(case.path.format(id=row_id), headers=request_headers, json=body)
+        assert first.status_code == 200, first.text
+
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE workspace_memberships SET role = 'viewer' "
+                    "WHERE workspace_id = :ws AND users_id = :c"
+                ),
+                {"ws": world.ws, "c": world.c},
+            )
+        counts_before = _side_effect_counts(world.ws)
+        refused = client.post(case.path.format(id=row_id), headers=request_headers, json=body)
+    finally:
+        client.close()
+
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["error"]["code"] == "INSUFFICIENT_ROLE"
+    assert _side_effect_counts(world.ws) == counts_before
