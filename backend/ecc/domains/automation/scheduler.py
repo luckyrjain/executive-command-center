@@ -286,8 +286,9 @@ class TriggerFireFailedActorInactive:
 class TriggerFireFailedActorUnauthorized:
     """The trigger fired (its schedule was due), but `trigger.created_by`,
     still an active member, can no longer read or write the workflow's
-    active version -- an ownership transfer, a visibility change or a
-    revoked grant since the trigger was created. The same read/write
+    active version, or was demoted to a role without `write` -- an
+    ownership transfer, a visibility change, a revoked grant or a
+    demotion since the trigger was created. The same read/write
     check `POST /automations/runs` makes, against the same locked row, so
     a schedule cannot keep running a workflow its creator could no longer
     start by hand. Audited (`trigger.fire_denied`), no run written, and
@@ -475,30 +476,35 @@ _ACTIVE_VERSION_FOR_SHARE = text(
 )
 
 
+_NO_ACTIVE_VERSION = "no_active_version"
+
+
 def _creator_denied_action(session: Session, trigger: triggers_module.Trigger) -> str | None:
     """`"read"`/`"write"` if `trigger.created_by` fails that check on the
-    workflow's active version, else `None`. Same lock and checks as
-    `runs.create_run_endpoint`: the active row is held FOR SHARE (blocks
-    an ownership transfer, visibility change or publish until this fire
-    commits) and re-read once if a publish committed while this waited.
-    `None` too when there is no active version or the creator is no
-    longer an active member, leaving those to `enqueue_run`'s own
-    `WorkflowNotActive`/`ActorMembershipInactive` outcomes."""
+    workflow's active version, `_NO_ACTIVE_VERSION` if there is none, else
+    `None`. Same lock and checks as `runs.create_run_endpoint`: the active
+    row is held FOR SHARE (blocks an ownership transfer, visibility change
+    or publish until this fire commits) and re-read once if a publish
+    committed while this waited; the creator's workspace role must allow
+    `write` (as `lock_membership_for_write(role_action="write")` there),
+    then read and write on the row. With no active version the caller
+    must not enqueue: `enqueue_run` would re-read the active version
+    unlocked, and one published since was never authorized. A creator who
+    is no longer an active member gets `None`, leaving that to
+    `enqueue_run`'s own `ActorMembershipInactive` outcome."""
     params = {"workspace_id": trigger.workspace_id, "workflow_id": trigger.workflow_id}
     version_id = session.execute(_ACTIVE_VERSION_FOR_SHARE, params).scalar_one_or_none()
     if version_id is None:
         version_id = session.execute(_ACTIVE_VERSION_FOR_SHARE, params).scalar_one_or_none()
     if version_id is None:
+        return _NO_ACTIVE_VERSION
+    role = authz.current_role(
+        session, workspace_id=trigger.workspace_id, users_id=trigger.created_by
+    )
+    if role is None:
         return None
-    is_member = session.execute(
-        text(
-            "SELECT 1 FROM workspace_memberships "
-            "WHERE workspace_id = :workspace_id AND users_id = :users_id AND status = 'active'"
-        ),
-        {"workspace_id": trigger.workspace_id, "users_id": trigger.created_by},
-    ).one_or_none()
-    if is_member is None:
-        return None
+    if "write" not in authz.ROLE_PERMISSIONS[role]:
+        return "write"
     auth = AuthContext(
         workspace_id=trigger.workspace_id, user_id=trigger.created_by, timezone="UTC"
     )
@@ -650,9 +656,19 @@ def run_scheduler_once(
 
                 # The schedule runs as its creator, so the creator must
                 # still be allowed to run the workflow by hand: denied
-                # (transfer, visibility change, revoked grant) means no
-                # run, an audit row, and the anchor still advances.
+                # (transfer, visibility change, revoked grant, demotion to
+                # viewer) means no run, an audit row, and the anchor still
+                # advances.
                 denied_action = _creator_denied_action(session, trigger)
+                if denied_action == _NO_ACTIVE_VERSION:
+                    session.commit()
+                    record_schedule_lag((moment - decision.first_due).total_seconds())
+                    outcomes.append(
+                        TriggerFireFailedWorkflowNotActive(
+                            trigger_id=trigger.id, workflow_id=trigger.workflow_id
+                        )
+                    )
+                    continue
                 if denied_action is not None:
                     _audit_fire_denied(session, trigger, denied_action, datetime.now(UTC))
                     session.commit()

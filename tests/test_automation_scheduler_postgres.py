@@ -1289,3 +1289,134 @@ def test_scheduled_fire_waits_on_the_active_row_and_sees_a_committed_visibility_
     else:
         assert [type(o) for o in _mine(outcomes, trigger.id)] == [automation_scheduler.TriggerFired]
         assert runs == 1
+
+
+def test_scheduled_fire_denied_when_creator_was_demoted_to_viewer(
+    scheduler_test_context: tuple[UUID, UUID],
+) -> None:
+    """A viewer cannot start a run by hand even on a workflow they own, so
+    their schedule must not either."""
+    workspace_id, _ = scheduler_test_context
+    creator, _ = _add_member(workspace_id)
+    workflow_id = f"test.sched-viewer.{uuid4().hex}"
+    _publish_workflow(workspace_id, creator, workflow_id)
+    trigger = _due_trigger(workspace_id, creator, workflow_id)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE workspace_memberships SET role = 'viewer' "
+                "WHERE workspace_id = :ws AND users_id = :u"
+            ),
+            {"ws": workspace_id, "u": creator},
+        )
+
+    outcomes = automation_scheduler.run_scheduler_once(SessionFactory, now=_FIRE_TICK)
+
+    assert _mine(outcomes, trigger.id) == [
+        automation_scheduler.TriggerFireFailedActorUnauthorized(
+            trigger_id=trigger.id, workflow_id=workflow_id, users_id=creator, denied_action="write"
+        )
+    ]
+    runs, anchor, audits = _fire_state(workspace_id, trigger.id)
+    assert runs == 0
+    assert anchor == _FIRE_TICK
+    assert len(audits) == 1
+
+
+def test_scheduled_fire_with_no_active_version_never_reaches_enqueue(
+    scheduler_test_context: tuple[UUID, UUID], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no active version the fire stops before `enqueue_run`, whose own
+    unlocked re-read could pick up a version published since and never
+    authorized."""
+    workspace_id, user_id = scheduler_test_context
+    workflow_id = f"test.sched-noactive.{uuid4().hex}"
+    with SessionFactory() as session, session.begin():
+        automation_workflows.create_workflow_draft(
+            session,
+            workspace_id,
+            user_id,
+            workflow_id=workflow_id,
+            graph={"steps": []},
+            trigger_refs=[],
+            policy_ref=None,
+        )
+    trigger = _due_trigger(workspace_id, user_id, workflow_id)
+
+    def _unexpected(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("enqueue_run called with no locked, authorized active version")
+
+    monkeypatch.setattr(automation_worker, "enqueue_run", _unexpected)
+    outcomes = automation_scheduler.run_scheduler_once(SessionFactory, now=_FIRE_TICK)
+
+    assert _mine(outcomes, trigger.id) == [
+        automation_scheduler.TriggerFireFailedWorkflowNotActive(
+            trigger_id=trigger.id, workflow_id=workflow_id
+        )
+    ]
+    assert _fire_state(workspace_id, trigger.id)[1] == _FIRE_TICK
+
+
+def test_scheduled_fire_waiting_on_the_active_row_runs_a_version_published_meanwhile(
+    scheduler_test_context: tuple[UUID, UUID],
+) -> None:
+    """A publish (retire the active row, promote a draft) commits while the
+    fire waits on the active row: the waiting statement matches neither
+    row, so the fire must re-read and run the new version."""
+    workspace_id, owner_id = scheduler_test_context
+    creator, _ = _add_member(workspace_id)
+    workflow_id = f"test.sched-publish.{uuid4().hex}"
+    active = _publish_workflow(workspace_id, owner_id, workflow_id)
+    with SessionFactory() as session, session.begin():
+        draft = automation_workflows.create_workflow_draft(
+            session,
+            workspace_id,
+            owner_id,
+            workflow_id=workflow_id,
+            graph=active.graph,
+            trigger_refs=[],
+            policy_ref=active.policy_ref,
+        )
+    trigger = _due_trigger(workspace_id, creator, workflow_id)
+
+    with ThreadPoolExecutor(max_workers=1) as pool, engine.connect() as holder:
+        holder_tx = holder.begin()
+        try:
+            holder_pid = int(holder.execute(text("SELECT pg_backend_pid()")).scalar_one())
+            holder.execute(
+                text("SELECT id FROM workflow_versions WHERE id = :id FOR UPDATE"),
+                {"id": active.id},
+            )
+            holder.execute(
+                text("UPDATE workflow_versions SET status = 'retired' WHERE id = :id"),
+                {"id": active.id},
+            )
+            holder.execute(
+                text("UPDATE workflow_versions SET status = 'active' WHERE id = :id"),
+                {"id": draft.id},
+            )
+            tick = pool.submit(
+                automation_scheduler.run_scheduler_once, SessionFactory, now=_FIRE_TICK
+            )
+            deadline = time.monotonic() + 15
+            while _waiting_on_active_row(holder_pid) < 1:
+                assert not tick.done(), f"tick finished without waiting: {tick.result()}"
+                assert time.monotonic() < deadline, "tick never waited on the active row"
+                time.sleep(0.05)
+            holder_tx.commit()
+        finally:
+            if holder_tx.is_active:
+                holder_tx.rollback()
+        outcomes = tick.result(timeout=15)
+
+    assert [type(o) for o in _mine(outcomes, trigger.id)] == [automation_scheduler.TriggerFired]
+    with engine.connect() as connection:
+        versions = (
+            connection.execute(
+                text("SELECT workflow_version FROM workflow_runs WHERE workspace_id = :ws"),
+                {"ws": workspace_id},
+            )
+            .scalars()
+            .all()
+        )
+    assert versions == [draft.version]
