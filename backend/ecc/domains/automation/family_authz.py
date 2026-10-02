@@ -78,15 +78,23 @@ def lock_and_authorize_family(session: Session, auth: AuthContext, workflow_id: 
         ),
         params,
     ).scalar_one_or_none()
-    version_ids = list(dict.fromkeys(v for v in (latest_id, active_id) if v is not None))
-    for version_id in version_ids:
+    resources = [
+        ("workflow_versions", v) for v in dict.fromkeys((latest_id, active_id)) if v is not None
+    ]
+    # A family row with no versions (not produced by any code path today:
+    # `create_workflow_draft` inserts both together) is checked against its
+    # own `owner_id`/`visibility` instead, so it fails closed rather than
+    # skipping authorization.
+    if not resources:
+        resources = [("workflow_definitions", family.id)]
+    for resource_type, resource_id in resources:
         if not authz.authorize(
-            session, auth, resource_type="workflow_versions", resource_id=version_id, action="read"
+            session, auth, resource_type=resource_type, resource_id=resource_id, action="read"
         ):
             raise HTTPException(status_code=404, detail="WORKFLOW_NOT_FOUND")
-    for version_id in version_ids:
+    for resource_type, resource_id in resources:
         if not authz.authorize(
-            session, auth, resource_type="workflow_versions", resource_id=version_id, action="write"
+            session, auth, resource_type=resource_type, resource_id=resource_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
     return True

@@ -161,7 +161,7 @@ describe('PolicyPanel', () => {
 
   it.each([
     ['WORKFLOW_NOT_FOUND', 404, 'Workflow Not Found', 'No workflow with that ID exists that you can see. Check the ID, or draft the workflow first.'],
-    ['INSUFFICIENT_ROLE', 403, 'Insufficient Role', 'You do not have permission to change that workflow, so you cannot create a policy for it.'],
+    ['INSUFFICIENT_ROLE', 403, 'Insufficient Role', 'You do not have permission to create a policy for that workflow.'],
   ])('maps a create refused with %s to a readable sentence', async (code, status, raw, expected) => {
     const fetch = vi.fn()
       .mockImplementationOnce(() => response({ policies: [] }))

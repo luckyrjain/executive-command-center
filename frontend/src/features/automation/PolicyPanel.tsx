@@ -24,11 +24,12 @@ const CREATE_STEP_LABELS: Record<(typeof CREATE_STEPS)[number], string> = { scop
 const CREATE_ERROR_ID = 'create-policy-error'
 
 // A create is refused 404 both for a workflow ID that does not exist and for
-// one the caller cannot see (the backend answers them identically), and 403
-// for a workflow the caller can see but not change.
+// one the caller cannot see (the backend answers them identically). A 403 is
+// either a role that cannot create policies at all or a workflow the caller
+// can see but not change, so its message covers both.
 const CREATE_ERROR_MESSAGES: Record<string, string> = {
   WORKFLOW_NOT_FOUND: 'No workflow with that ID exists that you can see. Check the ID, or draft the workflow first.',
-  INSUFFICIENT_ROLE: 'You do not have permission to change that workflow, so you cannot create a policy for it.',
+  INSUFFICIENT_ROLE: 'You do not have permission to create a policy for that workflow.',
 }
 
 function errorMessage(error: unknown, overrides: Record<string, string> = {}): string {

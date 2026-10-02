@@ -269,6 +269,31 @@ def test_read_only_grant_on_the_family_is_403(world: RaceWorld) -> None:
     assert _side_effects(world) == effects_before
 
 
+def test_family_with_no_versions_is_authorized_against_its_own_row(world: RaceWorld) -> None:
+    """Fail closed: a family row with no versions is checked against the
+    `workflow_definitions` row's own visibility, not let through."""
+    workflow_id = f"family-{uuid4().hex[:12]}"
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO workflow_definitions (id, workspace_id, workflow_id, created_by, "
+                "created_at, updated_at, owner_id, visibility) "
+                "VALUES (:id, :ws, :wf, :o, now(), now(), :o, 'private')"
+            ),
+            {"id": uuid4(), "ws": world.ws, "wf": workflow_id, "o": world.b},
+        )
+    c_token = _session_token(world, world.c)
+    effects_before = _side_effects(world)
+    with _client(c_token) as client:
+        refused = _create(client, c_token, workflow_id)
+    with _client(world.b_token) as client:
+        allowed = _create(client, world.b_token, workflow_id)
+
+    _assert_refused(refused, 404, "WORKFLOW_NOT_FOUND")
+    assert allowed.status_code == 201, allowed.text
+    assert _side_effects(world)["automation_policies"] == effects_before["automation_policies"] + 1
+
+
 def test_member_may_create_a_policy_for_a_workspace_visible_family(world: RaceWorld) -> None:
     workflow_id, _ = _seed_family(world, owner=world.b, visibility="workspace")
     c_token = _session_token(world, world.c)
