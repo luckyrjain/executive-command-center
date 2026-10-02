@@ -41,10 +41,12 @@ def load_cached(
     digest: str,
 ) -> RecommendationResponse | None:
     """Thin wrapper, not a straight delegation -- every one of this
-    module's own callers (`recommendation_mutations.py`'s `_start`) calls
-    this immediately after `lock_idempotency`, with no `session.begin()`
-    of its own anywhere in between: the `pg_advisory_xact_lock` and this
-    read share one continuous implicit transaction that only ends at the
+    module's own callers (`recommendation_mutations.py`'s `_start`, and
+    `_transition`/`confirm_recommendation`, which read it only after their
+    locked authorization checks) calls this after `lock_idempotency`, with
+    no `session.begin()` of its own anywhere in between: the
+    `pg_advisory_xact_lock` and this read share one continuous implicit
+    transaction that only ends at the
     caller's own explicit `session.commit()` after the real mutation
     runs. A cache HIT (or a conflict) means nothing further happens in
     this transaction, so `session.rollback()` closes the now-done
