@@ -465,20 +465,13 @@ def patch_waiting_link(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         idempotency.lock_idempotency(session, auth, idempotency_key)
-        cached = idempotency.load_cached(
-            session,
-            auth,
-            idempotency_key,
-            request_hash,
-            domain="waiting",
-            response_model=WaitingLink,
-        )
-        if cached is not None:
-            return cached
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. The idempotency
+        # cache is read only after those checks pass, so a caller who has
+        # since lost access (removed, suspended, demoted, or no longer able
+        # to see the link) never has a cached success replayed to them.
         current = (
             session.execute(
                 text(
@@ -500,6 +493,20 @@ def patch_waiting_link(
             session, auth, resource_type="waiting_links", resource_id=link_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        # After authz, before the version/status checks: a same-key replay of
+        # a successful patch finds the link already changed (version bumped,
+        # or superseded by a direction change) and must get the cached 200,
+        # not a 409.
+        cached = idempotency.load_cached(
+            session,
+            auth,
+            idempotency_key,
+            request_hash,
+            domain="waiting",
+            response_model=WaitingLink,
+        )
+        if cached is not None:
+            return cached
         if current["version"] != payload.expected_version:
             raise HTTPException(
                 status_code=409,
