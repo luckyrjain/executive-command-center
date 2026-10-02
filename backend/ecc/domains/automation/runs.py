@@ -491,23 +491,17 @@ def _mutate_run(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session,
-            auth,
-            idempotency_key,
-            req_hash,
-            domain="workflow_run",
-            response_model=RunResponse,
-        )
-        if cached is not None:
-            return cached
 
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row. The run row is the
-        # first row every `mutate` helper locks, so this adds no new lock
-        # ordering. A missing row answers the same 404 as an invisible one.
+        # by checks that ran against the pre-transfer row. Ahead of the
+        # idempotency cache too: it is read only after these checks pass, so
+        # a caller who has since lost access (removed, suspended, demoted, or
+        # no longer able to see the row) never has a cached success replayed.
+        # The run row is the first row every `mutate` helper locks, so this
+        # adds no new lock ordering. A missing row answers the same 404 as an
+        # invisible one.
         locked = session.execute(
             text(
                 "SELECT id FROM workflow_runs "
@@ -525,6 +519,20 @@ def _mutate_run(
             session, auth, resource_type="workflow_runs", resource_id=run_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+        # After authz, before the state checks in the helper below: a
+        # same-key replay of a successful call finds the row already
+        # transitioned and must get the cached 200, not a 409.
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="workflow_run",
+            response_model=RunResponse,
+        )
+        if cached is not None:
+            return cached
 
         result = mutate(session, auth.workspace_id, run_id)
         if isinstance(result, WorkflowRunNotFound):
