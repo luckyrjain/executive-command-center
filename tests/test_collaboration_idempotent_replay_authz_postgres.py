@@ -222,6 +222,34 @@ def test_create_replay_after_suspension_is_refused(world: RaceWorld) -> None:
     assert _side_effect_counts(world.ws) == counts_before
 
 
+def test_create_reusing_a_key_with_a_different_body_is_an_idempotency_conflict(
+    world: RaceWorld,
+) -> None:
+    """Still authorized, the cache read behind the obligation checks still
+    compares the request: the same key with a different `expected_outcome`
+    is 409 IDEMPOTENCY_CONFLICT, and proposes nothing."""
+    incident_id = _seed_incident(world, owner=world.b, visibility="private")
+    body = _proposal(_account(world, world.c), incident_id)
+    request_headers = headers(world.b_token)
+    client = TestClient(app)
+    client.cookies.set("ecc_session", world.b_token)
+    try:
+        first = client.post("/api/v1/delegations", headers=request_headers, json=body)
+        assert first.status_code == 201, first.text
+        counts_before = _side_effect_counts(world.ws)
+        conflicted = client.post(
+            "/api/v1/delegations",
+            headers=request_headers,
+            json={**body, "expected_outcome": "A different outcome"},
+        )
+    finally:
+        client.close()
+
+    assert conflicted.status_code == 409, conflicted.text
+    assert conflicted.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert _side_effect_counts(world.ws) == counts_before
+
+
 # (transition, the party who performs it, the status it starts from)
 _TRANSITIONS = {
     "accept": ("recipient", "proposed"),

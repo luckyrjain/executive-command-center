@@ -227,12 +227,22 @@ def _without_request_id(body: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in body.items() if key != "request_id"}
 
 
+def _send_body(
+    client: TestClient,
+    case: Case,
+    row_id: UUID,
+    request_headers: dict[str, str],
+    body: dict[str, Any],
+) -> httpx.Response:
+    return client.request(
+        case.method, case.path.format(id=row_id), headers=request_headers, json=body
+    )
+
+
 def _send(
     client: TestClient, case: Case, row_id: UUID, request_headers: dict[str, str]
 ) -> httpx.Response:
-    return client.request(
-        case.method, case.path.format(id=row_id), headers=request_headers, json=case.body
-    )
+    return _send_body(client, case, row_id, request_headers, case.body)
 
 
 @pytest.mark.parametrize("loss", ["ownership_transfer", "suspension"])
@@ -320,5 +330,99 @@ def test_idempotent_replay_after_demotion_is_refused_by_the_locked_write_check(
 
     assert refused.status_code == 403, refused.text
     assert refused.json()["error"]["code"] == "INSUFFICIENT_ROLE"
+    assert row_snapshot(case.table, row_id) == row_before
+    assert _side_effect_counts(world.ws) == counts_before
+
+
+# The same key reused with a different body: a different title for the PATCH,
+# a reason the first request did not send for the lifecycle action.
+_DIFFERENT_BODY: dict[str, dict[str, Any]] = {
+    "event_patch": {"expected_version": 1, "title": "a different title"},
+    "task_complete": {"expected_version": 1, "reason": "a different reason"},
+}
+
+
+@pytest.mark.parametrize("loss", ["demotion", "ownership_transfer"])
+@pytest.mark.parametrize("name", list(_DIFFERENT_BODY))
+def test_reused_key_with_a_different_body_after_losing_access_is_refused_not_conflicted(
+    world: RaceWorld, name: str, loss: str
+) -> None:
+    """The conflict check lives in the cache read, which now runs after the
+    locked read (404) and write (403) checks: a caller who has lost access
+    learns nothing about the key's earlier request -- not even that it was
+    different."""
+    case = CASES[name]
+    if loss == "demotion":
+        # Workspace-visible and owned by A: C (`member`) writes it by role
+        # alone, and as a `viewer` can still read it.
+        owner, visibility, actor = world.a, "workspace", world.c
+        token = _c_token(world)
+    else:
+        owner, visibility, actor = world.b, "private", world.b
+        token = world.b_token
+    with engine.begin() as connection:
+        row_id = case.seed(connection, world, owner=owner, visibility=visibility)
+    request_headers = headers(token)
+    client = TestClient(app)
+    client.cookies.set("ecc_session", token)
+    try:
+        first = _send(client, case, row_id, request_headers)
+        assert first.status_code == 200, first.text
+
+        with engine.begin() as connection:
+            if loss == "demotion":
+                connection.execute(
+                    text(
+                        "UPDATE workspace_memberships SET role = 'viewer' "
+                        "WHERE workspace_id = :ws AND users_id = :actor"
+                    ),
+                    {"ws": world.ws, "actor": actor},
+                )
+            else:
+                # The row stays private, now owned by C.
+                connection.execute(
+                    text(f"UPDATE {case.table} SET owner_id = :c WHERE id = :id"),  # noqa: S608
+                    {"c": world.c, "id": row_id},
+                )
+        row_before = row_snapshot(case.table, row_id)
+        counts_before = _side_effect_counts(world.ws)
+        refused = _send_body(client, case, row_id, request_headers, _DIFFERENT_BODY[name])
+    finally:
+        client.close()
+
+    if loss == "demotion":
+        assert refused.status_code == 403, refused.text
+        assert refused.json()["error"]["code"] == "INSUFFICIENT_ROLE"
+    else:
+        assert refused.status_code == 404, refused.text
+        assert refused.json()["error"]["code"] == case.not_found
+    assert row_snapshot(case.table, row_id) == row_before
+    assert _side_effect_counts(world.ws) == counts_before
+
+
+@pytest.mark.parametrize("name", list(_DIFFERENT_BODY))
+def test_authorized_reuse_of_a_key_with_a_different_body_is_an_idempotency_conflict(
+    world: RaceWorld, name: str
+) -> None:
+    """The cache read still runs before the version check: the row's
+    version has moved past `expected_version`, but the reused key answers
+    409 IDEMPOTENCY_CONFLICT, not VERSION_CONFLICT."""
+    case = CASES[name]
+    with engine.begin() as connection:
+        row_id = case.seed(connection, world, owner=world.b, visibility="private")
+    request_headers = headers(world.b_token)
+    client = TestClient(app)
+    client.cookies.set("ecc_session", world.b_token)
+    try:
+        first = _send(client, case, row_id, request_headers)
+        assert first.status_code == 200, first.text
+        row_before = row_snapshot(case.table, row_id)
+        counts_before = _side_effect_counts(world.ws)
+        conflicted = _send_body(client, case, row_id, request_headers, _DIFFERENT_BODY[name])
+    finally:
+        client.close()
+
+    assert conflicted.status_code == 409, conflicted.text
+    assert conflicted.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
     assert row_snapshot(case.table, row_id) == row_before
     assert _side_effect_counts(world.ws) == counts_before
