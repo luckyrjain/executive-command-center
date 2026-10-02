@@ -48,6 +48,7 @@ from json import dumps
 from typing import Any
 from uuid import UUID, uuid4
 
+import automation_scope_support as scope_support
 import pytest
 from fastapi.testclient import TestClient
 from identity_fixtures import create_identity
@@ -57,6 +58,7 @@ from sqlalchemy.exc import IntegrityError, ProgrammingError
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
 from ecc.domains.automation import workflows as automation_workflows
+from ecc.domains.automation.adapters import AdapterRegistry
 from ecc.domains.automation.adapters import registry as production_adapter_registry
 from ecc.main import app
 
@@ -1540,3 +1542,134 @@ def test_create_workflow_rejects_nonexistent_policy_ref(
     )
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "POLICY_NOT_FOUND"
+
+
+# ---------------------------------------------------------------------------
+# Policy scope at publish (scope-enforcement design, Decision 5 item 1).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def scope_world() -> Iterator[scope_support.World]:
+    yield from scope_support.make_world()
+
+
+def _scope_family(world: scope_support.World, workflow_id: str, graph: dict[str, Any]) -> None:
+    """A first, policy-less draft, so the workflow family exists for the
+    policy's foreign key."""
+    with SessionFactory() as session, session.begin():
+        automation_workflows.create_workflow_draft(
+            session,
+            world.workspace_id,
+            world.user_id,
+            workflow_id=workflow_id,
+            graph=graph,
+            trigger_refs=[],
+            policy_ref=None,
+        )
+
+
+def _publish_with_registry(
+    world: scope_support.World,
+    graph: dict[str, Any],
+    registry: AdapterRegistry,
+    *,
+    policy_state: str = "enforced",
+) -> Any:
+    workflow_id = f"test.scope-publish.{uuid4().hex}"
+    _scope_family(world, workflow_id, graph)
+    policy_ref = None
+    if policy_state != "none":
+        policy = scope_support.create_policy(
+            world, workflow_id, action_types=["fake.external"], data_classes=["internal"]
+        )
+        policy_ref = policy.id
+        if policy_state == "legacy":
+            scope_support.make_legacy(policy.id)
+        if policy_state == "revoked":
+            with engine.begin() as connection:
+                connection.execute(
+                    text("UPDATE automation_policies SET revoked_at = now() WHERE id = :id"),
+                    {"id": policy.id},
+                )
+    with SessionFactory() as session, session.begin():
+        draft = automation_workflows.create_workflow_draft(
+            session,
+            world.workspace_id,
+            world.user_id,
+            workflow_id=workflow_id,
+            graph=graph,
+            trigger_refs=[],
+            policy_ref=policy_ref,
+        )
+        return automation_workflows.activate_workflow_version(
+            session, world.workspace_id, draft.id, adapter_registry=registry
+        )
+
+
+def test_publish_refuses_an_out_of_scope_action_and_compensation_step(
+    scope_world: scope_support.World,
+) -> None:
+    in_scope = scope_support.CompensatingFakeAdapter("test.ok")
+    out_action = scope_support.FakeAdapter("test.note", action_type="note.create")
+    out_comp = scope_support.FakeAdapter("test.too-sensitive", data_class="sensitive")
+    registry = scope_support.registry_of(in_scope, out_action, out_comp)
+    graph = {
+        "steps": [
+            scope_support.action_step("s0", "test.ok", compensate_ref="c0"),
+            scope_support.action_step("s1", "test.note"),
+            scope_support.compensation_step("c0", "test.too-sensitive"),
+        ]
+    }
+    result = _publish_with_registry(scope_world, graph, registry)
+    assert isinstance(result, automation_workflows.WorkflowVersionActionOutsidePolicyScope)
+    assert {tuple(sorted(v.items())) for v in result.violations} == {
+        (("action_ref", "test.note"), ("reason", "action_type_not_authorized"), ("step_id", "s1")),
+        (
+            ("action_ref", "test.too-sensitive"),
+            ("reason", "data_class_not_authorized"),
+            ("step_id", "c0"),
+        ),
+    }
+
+
+@pytest.mark.parametrize("policy_state", ["none", "legacy", "revoked"])
+def test_publish_skips_the_scope_check_without_an_enforced_usable_policy(
+    scope_world: scope_support.World, policy_state: str
+) -> None:
+    out_action = scope_support.FakeAdapter("test.note", action_type="note.create")
+    graph = {"steps": [scope_support.action_step("s1", "test.note")]}
+    result = _publish_with_registry(
+        scope_world, graph, scope_support.registry_of(out_action), policy_state=policy_state
+    )
+    assert isinstance(result, automation_workflows.WorkflowVersion)
+
+
+def test_publish_endpoint_maps_scope_violation_to_422(scope_world: scope_support.World) -> None:
+    workflow_id = f"test.scope-publish-http.{uuid4().hex}"
+    graph = {"steps": [scope_support.action_step("s1", "local.create_note")]}
+    _scope_family(scope_world, workflow_id, graph)
+    policy = scope_support.create_policy(
+        scope_world, workflow_id, action_types=["comment.create"], data_classes=["sensitive"]
+    )
+    with SessionFactory() as session, session.begin():
+        draft = automation_workflows.create_workflow_draft(
+            session,
+            scope_world.workspace_id,
+            scope_world.user_id,
+            workflow_id=workflow_id,
+            graph=graph,
+            trigger_refs=[],
+            policy_ref=policy.id,
+        )
+    with scope_support.client_for(scope_world) as client:
+        response = client.post(
+            f"/api/v1/automations/workflows/{draft.id}/publish",
+            headers=scope_support.headers(scope_world, key=f"publish-{uuid4()}"),
+        )
+    assert response.status_code == 422, response.text
+    error = response.json()["error"]
+    assert error["code"] == "ACTION_REF_OUTSIDE_POLICY_SCOPE"
+    assert error["details"]["violations"] == [
+        {"step_id": "s1", "action_ref": "local.create_note", "reason": "action_type_not_authorized"}
+    ]

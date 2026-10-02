@@ -49,7 +49,7 @@ from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 from ecc.platform.request_models import EmptyBody as _EmptyBody
 
-from .adapter_contract import dispatch_value
+from .adapter_contract import ACTION_TYPES, DATA_CLASSES, dispatch_value, has_dispatch_value
 from .adapters import ActionAdapter, AdapterRegistry
 from .adapters import registry as _production_adapter_registry
 from .approvals import evaluate_approval_requirement, evaluate_policy_scope
@@ -198,6 +198,49 @@ class WorkflowVersionHighImpactCompensationAdapter:
     workflow_id: str
     version: int
     violations: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowVersionActionOutsidePolicyScope:
+    """`activate_workflow_version` (with a registry) refused to publish a
+    version an action or compensation step of which names an adapter its
+    own enforced `policy_ref` does not authorize (`approvals.evaluate_
+    policy_scope`; scope-enforcement design, Decision 5 item 1). Each
+    violation is `{step_id, action_ref, reason}`. Catches authoring errors
+    before any run exists; the dispatch gate stays authoritative."""
+
+    workflow_id: str
+    version: int
+    violations: tuple[dict[str, str], ...]
+
+
+def action_refs_outside_policy_scope(
+    graph: dict[str, Any], adapter_registry: AdapterRegistry, policy: AutomationPolicy
+) -> list[dict[str, str]]:
+    """Every `action`/`compensation` step whose registered adapter `policy`
+    does not authorize. A compensation step is checked unconditionally --
+    deliberately stricter than dispatch, where its own adapter only runs
+    when the original adapter has no `compensate()`: publish cannot cheaply
+    tell which branch will run, and an out-of-scope rollback action is an
+    authoring error either way. Unregistered refs are skipped (a separate
+    check owns them)."""
+    violations: list[dict[str, str]] = []
+    for step in graph.get("steps", []):
+        if step.get("step_type") not in ("action", "compensation"):
+            continue
+        adapter = adapter_registry.get(step.get("action_ref") or "")
+        if adapter is None:
+            continue
+        reason = evaluate_policy_scope(adapter, policy)
+        if reason is not None:
+            violations.append(
+                {
+                    "step_id": str(step.get("step_id")),
+                    "action_ref": adapter.adapter_id,
+                    "reason": reason,
+                }
+            )
+    return violations
 
 
 def high_impact_compensation_action_refs(
@@ -709,6 +752,7 @@ def activate_workflow_version(
     | WorkflowVersionNotDraft
     | WorkflowVersionUnregisteredAdapter
     | WorkflowVersionHighImpactCompensationAdapter
+    | WorkflowVersionActionOutsidePolicyScope
 ):
     """Publish a draft version (design doc Decision 2's activation
     mechanism): retires whichever version is currently `active` for this
@@ -803,6 +847,30 @@ def activate_workflow_version(
                 version=target_row["version"],
                 violations=tuple(high_impact_violations),
             )
+        # Scope (third, only with a registry). Skipped -- the dispatch gate
+        # stays authoritative -- when there is no policy_ref, or the policy
+        # is legacy, revoked or expired: those already block at dispatch
+        # with their own reasons, and failing publish for them would be new
+        # behaviour outside the scope-enforcement design.
+        scope_policy = (
+            get_policy(session, workspace_id, target_row["policy_ref"])
+            if target_row["policy_ref"] is not None
+            else None
+        )
+        if (
+            scope_policy is not None
+            and scope_policy.scope_enforced
+            and is_policy_usable(scope_policy)
+        ):
+            scope_violations = action_refs_outside_policy_scope(
+                target_row["graph"], adapter_registry, scope_policy
+            )
+            if scope_violations:
+                return WorkflowVersionActionOutsidePolicyScope(
+                    workflow_id=target_row["workflow_id"],
+                    version=target_row["version"],
+                    violations=tuple(scope_violations),
+                )
 
     now = datetime.now(UTC)
     current_active = (
@@ -970,6 +1038,54 @@ def _policy_ref_exists(session: Session, workspace_id: UUID, policy_ref: UUID) -
             {"workspace_id": workspace_id, "id": policy_ref},
         ).first()
         is not None
+    )
+
+
+class AdapterResponse(BaseModel):
+    adapter_id: str
+    action_type: str
+    data_class: str
+    reversible: bool
+    high_impact_categories: list[str]
+    has_dispatch_value: bool
+
+
+class AdapterListResponse(BaseModel):
+    adapters: list[AdapterResponse]
+    # Closed vocabularies a policy's scope is chosen from; `data_classes`
+    # is ordered by ascending sensitivity (a policy names a ceiling).
+    action_types: list[str]
+    data_classes: list[str]
+
+
+@router.get("/adapters", response_model=AdapterListResponse)
+def list_adapters_endpoint(auth: AuthDep, session: SessionDep) -> AdapterListResponse:
+    """Every registered action adapter's static declarations plus the scope
+    vocabularies, so the policy UI offers closed choices instead of free
+    text (scope-enforcement design, Decision 5 surfacing table). The
+    registry is process-global, so this returns no workspace data; an
+    active membership is still required, like every automation read."""
+    authz.require_active_role(session, auth)
+    session.rollback()
+    adapters = [
+        _production_adapter_registry.get(adapter_id)
+        for adapter_id in _production_adapter_registry.adapter_ids()
+    ]
+    return AdapterListResponse(
+        adapters=[
+            AdapterResponse(
+                adapter_id=adapter.adapter_id,
+                action_type=adapter.action_type,
+                data_class=adapter.data_class,
+                reversible=adapter.reversible,
+                high_impact_categories=sorted(adapter.high_impact_categories),
+                has_dispatch_value=has_dispatch_value(adapter),
+            )
+            for adapter in adapters
+            if adapter is not None
+        ],
+        action_types=sorted(ACTION_TYPES),
+        data_classes=list(DATA_CLASSES),
     )
 
 
@@ -1231,6 +1347,20 @@ def publish_workflow_endpoint(
                     "workflow_id": result.workflow_id,
                     "version": result.version,
                     "violations": list(result.violations),
+                },
+            )
+        if isinstance(result, WorkflowVersionActionOutsidePolicyScope):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "ACTION_REF_OUTSIDE_POLICY_SCOPE",
+                    "message": (
+                        "A step uses an action this workflow's policy does not authorize: "
+                        "its action type or data class is outside the policy's scope."
+                    ),
+                    "workflow_id": result.workflow_id,
+                    "version": result.version,
+                    "violations": [dict(v) for v in result.violations],
                 },
             )
 

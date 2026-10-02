@@ -3285,6 +3285,7 @@ def _write_step_blocked_event(
         },
         now=datetime.now(UTC),
         domain="automation",
+        source="automation",
     )
 
 
