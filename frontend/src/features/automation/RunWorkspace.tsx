@@ -5,6 +5,11 @@ import { ApiError, apiRequest } from '../../api/client'
 import { apiErrorMessage } from '../../api/errorMessage'
 import type { KillSwitchStatus, PolicyListResponse, Run, RunDetail, RunListResponse, RunStatus } from './types'
 
+const SCOPE_BLOCK_TEXT: Record<string, string> = {
+  action_type_not_authorized: "the step's action type is not in the policy's action types",
+  data_class_not_authorized: "the step's data class is above the highest class the policy allows",
+}
+
 // This activation's fixed retry ceiling (`worker.MAX_RETRY_ATTEMPTS = 3`,
 // 2s/4s/8s backoff) -- a static, documented backend constant, not
 // user-configurable, so it is safe to mirror here for display only.
@@ -123,8 +128,9 @@ function RunDetailView({ run }: { run: RunDetail }) {
           {killSwitchUnknown || policiesUnknown ? <p>Whether a kill switch or this run's policy caused this could not be confirmed -- the {killSwitchUnknown && policiesUnknown ? 'kill switch and policy status' : killSwitchUnknown ? 'kill switch status' : 'policy status'} could not be read. Treat the cause as unknown, not ruled out, until this loads.</p> : null}
           {!killSwitchUnknown && killSwitch.data?.killed ? <p>A kill switch is currently active for this workflow ({killSwitch.data.active_global ? 'global' : ''}{killSwitch.data.active_global && killSwitch.data.active_workflow ? ' and ' : ''}{killSwitch.data.active_workflow ? 'per-workflow' : ''}) -- this may be why this run stopped, though the timing is not a guarantee of cause.</p> : null}
           {!policiesUnknown && runningPolicy && runningPolicy.status !== 'active' ? <p>This run's own policy is currently {runningPolicy.status} -- a likely, directly attributable cause.</p> : null}
+          {run.scope_block ? <p>Step {run.scope_block.step_index} was blocked because this run's policy does not authorize it ({SCOPE_BLOCK_TEXT[run.scope_block.reason] ?? run.scope_block.reason.replaceAll('_', ' ')}). Nothing was dispatched for it. Use a policy whose scope covers this step, then start a new run.</p> : null}
           {lastStep?.status === 'unknown' ? <p>The last dispatched step's outcome is unknown -- the underlying action may or may not have happened. Inspect the target system directly before resolving this manually (see the recovery runbook).</p> : null}
-          {!killSwitchUnknown && !policiesUnknown && !killSwitch.data?.killed && (!runningPolicy || runningPolicy.status === 'active') && lastStep?.status !== 'unknown' ? <p>No further cause is determinable from data available to this view.</p> : null}
+          {!run.scope_block && !killSwitchUnknown && !policiesUnknown && !killSwitch.data?.killed && (!runningPolicy || runningPolicy.status === 'active') && lastStep?.status !== 'unknown' ? <p>No further cause is determinable from data available to this view.</p> : null}
         </div>
       ) : null}
 

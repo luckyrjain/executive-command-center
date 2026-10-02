@@ -36,23 +36,28 @@ leaving implicit:
 
 **Every adapter here declares `high_impact_categories = frozenset({
 "public"})`, unconditionally.** This is not merely the honest taxonomy
-answer -- it is the actual, load-bearing access control. `policy.py`'s
-own module docstring discloses that `automation_policies.action_types`/
-`data_classes`/`value_limit` are stored but **never enforced** against a
-dispatching adapter: a policy scoped to `action_types=["note.create"]`
-does not stop a workflow from naming `github.add_issue_comment` once it
-is registered in the shared registry. `evaluate_approval_requirement`
-(`automation/approvals.py`) checks `high_impact_categories` *first*,
-before any policy-mode branch, and returns `True` unconditionally the
-moment it is non-empty -- so declaring `{"public"}` here is what
-guarantees every single dispatch of one of these adapters requires a
-fresh, digest-bound, human-decided approval, regardless of the
-authorizing policy's own `approval_mode`. Omitting this category (leaving
+answer -- it is what guarantees a human sees every write. Policy scope is
+now enforced (`docs/superpowers/specs/2026-10-01-automation-policy-scope-
+enforcement-design.md`): each adapter here declares `action_type =
+"comment.create"` and `data_class = "sensitive"`, so an enforced policy
+must list `comment.create` with a `sensitive` (or `restricted`) ceiling
+before a workflow may name one of them at all -- a policy scoped to
+`action_types=["note.create"]` blocks it (`approvals.evaluate_policy_
+scope`; a legacy, pre-migration-0086 policy is not checked until it
+expires). Scope only narrows *which kinds* of action a policy authorizes;
+it never asks a human. `evaluate_approval_requirement`
+(`automation/approvals.py`) adds the adapter's `high_impact_categories`
+to the approval set before any policy-mode branch, and returns a
+non-`None` (approval required) result the moment that set is non-empty --
+so declaring `{"public"}` here is what still forces every single in-scope
+dispatch of one of these adapters to wait for a fresh, digest-bound,
+human-decided approval, regardless of the authorizing policy's own
+`approval_mode`. Omitting this category (leaving
 `high_impact_categories=frozenset()`, technically defensible on
 "reversible, low blast radius" grounds alone) would let a `bounded_
-recurring` policy dispatch these writes with no per-run approval at all,
-relying entirely on the three unenforced policy fields above -- a real
-gap this module deliberately does not open.
+recurring` policy that lists `comment.create` dispatch these writes with
+no per-run approval at all -- a gap this module deliberately does not
+open.
 
 **Containment is asymmetric across providers, disclosed rather than
 silently uneven.** GitHub's `repository_id` and Jira's `work_item_id`
@@ -317,6 +322,8 @@ class GitHubAddIssueCommentAdapter:
     output_schema: type[BaseModel] = GitHubAddIssueCommentOutput
     reversible = True
     high_impact_categories: frozenset[str] = frozenset({"public"})
+    action_type = "comment.create"
+    data_class = "sensitive"
 
     def __init__(
         self, *, transport: httpx.BaseTransport | None = None, timeout_seconds: float = 10.0
@@ -448,6 +455,8 @@ class GitLabAddNoteAdapter:
     output_schema: type[BaseModel] = GitLabAddNoteOutput
     reversible = True
     high_impact_categories: frozenset[str] = frozenset({"public"})
+    action_type = "comment.create"
+    data_class = "sensitive"
 
     def __init__(
         self,
@@ -583,6 +592,8 @@ class JiraAddCommentAdapter:
     output_schema: type[BaseModel] = JiraAddCommentOutput
     reversible = True
     high_impact_categories: frozenset[str] = frozenset({"public"})
+    action_type = "comment.create"
+    data_class = "sensitive"
 
     def __init__(
         self, *, transport: httpx.BaseTransport | None = None, timeout_seconds: float = 10.0

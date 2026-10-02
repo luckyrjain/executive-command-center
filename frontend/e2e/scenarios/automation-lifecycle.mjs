@@ -185,6 +185,8 @@ export async function run({ page, baseURL }) {
   await assertNoSeriousAccessibilityViolations(page, { include: '#automation-panel' })
   const policiesPanel = automationPanel.locator('section[aria-labelledby="automation-policy-title"]')
   await policiesPanel.getByLabel('Workflow ID', { exact: true }).fill(WORKFLOW_ID)
+  await policiesPanel.getByLabel('notification.send', { exact: true }).check()
+  await policiesPanel.getByLabel('Highest data class allowed', { exact: true }).selectOption('sensitive')
   await policiesPanel.getByRole('button', { name: 'Continue' }).click()
 
   // Line 186's scan only covers the wizard's default Scope step -- Limits
@@ -202,6 +204,8 @@ export async function run({ page, baseURL }) {
   await policiesPanel.getByText('per run · revoked').waitFor()
   const revokedPolicy = fixtures.automation.policies.find((p) => p.workflow_id === WORKFLOW_ID)
   assert.equal(revokedPolicy.status, 'revoked')
+  assert.deepEqual(revokedPolicy.action_types, ['notification.send'])
+  assert.deepEqual(revokedPolicy.data_classes, ['sensitive'])
 
   // A real worker would discover the revoked policy mid-dispatch and stop
   // the run at needs_review -- scripted directly here, matching this

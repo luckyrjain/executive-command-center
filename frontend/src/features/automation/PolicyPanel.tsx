@@ -1,27 +1,29 @@
-import { useRef, useState, type FormEvent } from 'react'
+import { useId, useRef, useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
 import { apiErrorMessage } from '../../api/errorMessage'
 import { applyWizardFieldInvalidState, useWizardStepFocus } from '../../lib/wizardFocus'
-import type { ApprovalMode, Policy, PolicyListResponse } from './types'
+import type { AdapterListResponse, ApprovalMode, Policy, PolicyListResponse } from './types'
 
 const APPROVAL_MODES: ApprovalMode[] = ['preview_only', 'per_run', 'bounded_recurring']
 
 type Draft = {
   workflowId: string
-  actionTypes: string
-  dataClasses: string
+  actionTypes: string[]
+  /** The highest data class the policy allows (an ordinal ceiling). */
+  dataClass: string
   valueLimit: string
   countLimit: string
   approvalMode: ApprovalMode
   schedule: string
 }
 
-const emptyDraft: Draft = { workflowId: '', actionTypes: '', dataClasses: '', valueLimit: '0', countLimit: '10', approvalMode: 'per_run', schedule: '' }
+const emptyDraft: Draft = { workflowId: '', actionTypes: [], dataClass: '', valueLimit: '0', countLimit: '10', approvalMode: 'per_run', schedule: '' }
 const CREATE_STEPS = ['scope', 'limits', 'review'] as const
 const CREATE_STEP_LABELS: Record<(typeof CREATE_STEPS)[number], string> = { scope: 'Scope', limits: 'Limits', review: 'Review' }
 const CREATE_ERROR_ID = 'create-policy-error'
+const DATA_CLASS_LABEL = 'Highest data class allowed'
 
 function errorMessage(error: unknown): string {
   if (error instanceof ApiError && error.code === 'POLICY_REVOKED') {
@@ -32,7 +34,12 @@ function errorMessage(error: unknown): string {
     const details = error.current as { expires_at?: string } | undefined
     return `This policy already expired${details?.expires_at ? ` at ${new Date(details.expires_at).toLocaleString()}` : ''} and cannot be revoked further.`
   }
+  if (error instanceof ApiError && error.code === 'POLICY_SCOPE_UNKNOWN_VALUE') {
+    const details = error.current as { field?: string; values?: string[] } | undefined
+    return `Unknown ${details?.field === 'data_classes' ? 'data class' : 'action type'}: ${(details?.values ?? []).join(', ') || 'unrecognised value'}.`
+  }
   return apiErrorMessage(error, {
+    POLICY_SCOPE_EMPTY: 'Choose at least one action type and the highest data class this policy allows.',
     WORKFLOW_NOT_FOUND: 'That workflow ID does not exist in this workspace yet -- draft the workflow first.',
     POLICY_NOT_FOUND: 'That policy no longer exists in this workspace.',
     OFFLINE: 'You are offline, so policies could not be read or changed.',
@@ -54,6 +61,7 @@ export default function PolicyPanel() {
   const [formError, setFormError] = useState<string | null>(null)
   const [createStepIndex, setCreateStepIndex] = useState(0)
   const createFormRef = useRef<HTMLFormElement>(null)
+  const scopeIdPrefix = useId()
   const createStep = CREATE_STEPS[createStepIndex] ?? 'scope'
   const [invalidField, setInvalidField] = useState<string | null>(null)
   const createStepHeadingRef = useWizardStepFocus(
@@ -66,6 +74,19 @@ export default function PolicyPanel() {
     queryFn: () => apiRequest<PolicyListResponse>(`/api/v1/automations/policies${workflowFilter ? `?workflow_id=${encodeURIComponent(workflowFilter)}` : ''}`),
     retry: 1,
   })
+
+  // The closed scope vocabularies; the registry is global, so this never
+  // changes within a session.
+  const adaptersQuery = useQuery({
+    queryKey: ['automation', 'adapters'],
+    queryFn: () => apiRequest<AdapterListResponse>('/api/v1/automations/adapters'),
+    staleTime: Infinity,
+    retry: 1,
+  })
+  const actionTypes = adaptersQuery.data?.action_types ?? []
+  const dataClasses = adaptersQuery.data?.data_classes ?? []
+  const adaptersByType = (actionType: string) =>
+    (adaptersQuery.data?.adapters ?? []).filter((a) => a.action_type === actionType).map((a) => a.adapter_id)
 
   const createMutation = useMutation({
     mutationFn: (body: Record<string, unknown>) => apiRequest<Policy>('/api/v1/automations/policies', { method: 'POST', body }),
@@ -99,6 +120,8 @@ export default function PolicyPanel() {
     event.preventDefault()
     if (createStep !== 'review') return
     if (!draft.workflowId.trim()) { fail('Workflow ID is required.', 'Workflow ID', 'scope'); return }
+    if (draft.actionTypes.length === 0) { fail('Choose at least one action type this policy authorizes.', actionTypes[0] ?? 'Workflow ID', 'scope'); return }
+    if (!draft.dataClass) { fail('Choose the highest data class this policy allows.', DATA_CLASS_LABEL, 'scope'); return }
     const valueLimit = Number(draft.valueLimit)
     const countLimit = Number(draft.countLimit)
     if (!Number.isFinite(valueLimit) || valueLimit < 0) { fail('Value limit must be zero or a positive number.', 'Value limit', 'limits'); return }
@@ -107,8 +130,8 @@ export default function PolicyPanel() {
     setInvalidField(null)
     createMutation.mutate({
       workflow_id: draft.workflowId.trim(),
-      action_types: draft.actionTypes.split(',').map((v) => v.trim()).filter(Boolean),
-      data_classes: draft.dataClasses.split(',').map((v) => v.trim()).filter(Boolean),
+      action_types: draft.actionTypes,
+      data_classes: [draft.dataClass],
       value_limit: valueLimit,
       count_limit: countLimit,
       approval_mode: draft.approvalMode,
@@ -157,6 +180,9 @@ export default function PolicyPanel() {
               <small>
                 action types: {policy.action_types.join(', ') || 'none'} · data classes: {policy.data_classes.join(', ') || 'none'}
               </small>
+              {policy.scope_enforced ? null : (
+                <small className="status-badge is-degraded">Legacy scope: not enforced, expires {new Date(policy.expires_at).toLocaleDateString()}</small>
+              )}
               <small>expires {new Date(policy.expires_at).toLocaleString()}{policy.revoked_at ? ` · revoked ${new Date(policy.revoked_at).toLocaleString()}` : ''}</small>
             </div>
             <div className="work-actions">
@@ -192,12 +218,41 @@ export default function PolicyPanel() {
             <label>Workflow ID
               <input value={draft.workflowId} onChange={(e) => setDraft({ ...draft, workflowId: e.target.value })} />
             </label>
-            <label>Action types (comma separated)
-              <input value={draft.actionTypes} onChange={(e) => setDraft({ ...draft, actionTypes: e.target.value })} />
-            </label>
-            <label>Data classes (comma separated)
-              <input value={draft.dataClasses} onChange={(e) => setDraft({ ...draft, dataClasses: e.target.value })} />
-            </label>
+            {adaptersQuery.isLoading ? <p role="status">Loading action types…</p> : null}
+            {adaptersQuery.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(adaptersQuery.error)}</div> : null}
+            {actionTypes.length ? (
+              <fieldset>
+                <legend>Action types this policy authorizes</legend>
+                {actionTypes.map((actionType) => (
+                  <div key={actionType}>
+                    <label>{actionType}
+                      <input
+                        type="checkbox"
+                        aria-describedby={`${scopeIdPrefix}-${actionType}-adapters`}
+                        checked={draft.actionTypes.includes(actionType)}
+                        onChange={(e) => setDraft({
+                          ...draft,
+                          actionTypes: e.target.checked
+                            ? [...draft.actionTypes, actionType]
+                            : draft.actionTypes.filter((t) => t !== actionType),
+                        })}
+                      />
+                    </label>
+                    <small id={`${scopeIdPrefix}-${actionType}-adapters`}>{adaptersByType(actionType).join(', ')}</small>
+                  </div>
+                ))}
+              </fieldset>
+            ) : null}
+            {dataClasses.length ? (
+              <label><span id={`${scopeIdPrefix}-data-class-label`}>{DATA_CLASS_LABEL}</span>
+                {/* aria-labelledby: a select nested in its label would otherwise
+                    also take the selected option's text into its name. */}
+                <select aria-labelledby={`${scopeIdPrefix}-data-class-label`} value={draft.dataClass} onChange={(e) => setDraft({ ...draft, dataClass: e.target.value })}>
+                  <option value="">Choose a data class</option>
+                  {dataClasses.map((dataClass) => <option key={dataClass} value={dataClass}>{dataClass}</option>)}
+                </select>
+              </label>
+            ) : null}
             <div className="work-actions"><button type="button" className="btn-primary" onClick={goCreateNext}>Continue</button></div>
           </div>
         ) : createStep === 'limits' ? (
@@ -226,8 +281,8 @@ export default function PolicyPanel() {
             <h4 ref={createStepHeadingRef} tabIndex={-1}>Review and create</h4>
             <dl>
               <div><dt>Workflow ID</dt><dd className="is-machine-value">{draft.workflowId || '—'}</dd></div>
-              <div><dt>Action types</dt><dd>{draft.actionTypes || '—'}</dd></div>
-              <div><dt>Data classes</dt><dd>{draft.dataClasses || '—'}</dd></div>
+              <div><dt>Action types</dt><dd>{draft.actionTypes.join(', ') || '—'}</dd></div>
+              <div><dt>{DATA_CLASS_LABEL}</dt><dd>{draft.dataClass || '—'}</dd></div>
               <div><dt>Value limit</dt><dd>{draft.valueLimit}</dd></div>
               <div><dt>Count limit</dt><dd>{draft.countLimit}</dd></div>
               <div><dt>Approval mode</dt><dd>{draft.approvalMode.replaceAll('_', ' ')}</dd></div>

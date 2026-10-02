@@ -35,6 +35,7 @@ from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
 from ecc.domains.automation import policy as automation_policy
 from ecc.domains.automation import workflows as automation_workflows
+from ecc.domains.automation.adapter_contract import ACTION_TYPES
 from ecc.main import app
 
 settings = get_settings()
@@ -190,8 +191,8 @@ def _publish_workflow(w: World, workflow_id: str) -> automation_workflows.Workfl
             w.ws,
             w.b,
             workflow_id=workflow_id,
-            action_types=[],
-            data_classes=[],
+            action_types=sorted(ACTION_TYPES),
+            data_classes=["sensitive"],
             value_limit=Decimal("1000000"),
             count_limit=1000,
             rate_limit=None,

@@ -44,6 +44,7 @@ from ecc.domains.automation import approvals as automation_approvals
 from ecc.domains.automation import policy as automation_policy
 from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
+from ecc.domains.automation.adapter_contract import ACTION_TYPES
 from ecc.domains.automation.adapters import ActionAdapter, AdapterRegistry
 from ecc.main import app
 
@@ -155,6 +156,8 @@ class _HighImpactAdapter:
     output_schema = _Output
     reversible = False
     high_impact_categories: frozenset[str] = frozenset({"person-directed"})
+    action_type = "fake.external"
+    data_class = "internal"
 
     def __init__(self) -> None:
         self.execute_calls = 0
@@ -192,8 +195,8 @@ def _create_policy(
             workspace_id,
             user_id,
             workflow_id=workflow_id,
-            action_types=[],
-            data_classes=[],
+            action_types=sorted(ACTION_TYPES),
+            data_classes=["sensitive"],
             value_limit=Decimal("1000000"),
             count_limit=count_limit,
             rate_limit=None,
@@ -275,6 +278,8 @@ def _fake_adapter(categories: frozenset[str]) -> ActionAdapter:
         output_schema = _Output
         reversible = True
         high_impact_categories = categories
+        action_type = "fake.external"
+        data_class = "internal"
 
         def simulate(self, action_input: _Input) -> _Output:  # noqa: D102
             return _Output(value=action_input.value)
@@ -293,8 +298,9 @@ def _fake_policy(
         id=uuid4(),
         workspace_id=uuid4(),
         workflow_id="test.workflow",
-        action_types=(),
-        data_classes=(),
+        action_types=tuple(sorted(ACTION_TYPES)),
+        data_classes=("sensitive",),
+        scope_enforced=True,
         value_limit=Decimal("0"),
         count_limit=count_limit,
         rate_limit={"runs_per_workflow_per_hour": 10},
@@ -316,23 +322,13 @@ def test_high_impact_always_requires_approval_regardless_of_mode(
 ) -> None:
     adapter = _fake_adapter(frozenset({"person-directed"}))
     policy = _fake_policy(approval_mode=approval_mode)
-    assert (
-        automation_approvals.evaluate_approval_requirement(
-            adapter, policy, action_step_count_so_far=0
-        )
-        is True
-    )
+    assert _requirement(adapter, policy, count=0) == frozenset({"person-directed"})
 
 
 def test_bounded_step_needs_no_approval_under_bounded_recurring_within_count_limit() -> None:
     adapter = _fake_adapter(frozenset())
     policy = _fake_policy(approval_mode="bounded_recurring", count_limit=10)
-    assert (
-        automation_approvals.evaluate_approval_requirement(
-            adapter, policy, action_step_count_so_far=0
-        )
-        is False
-    )
+    assert _requirement(adapter, policy, count=0) is None
 
 
 @pytest.mark.parametrize("approval_mode", ["preview_only", "per_run"])
@@ -341,28 +337,39 @@ def test_bounded_step_still_requires_approval_under_preview_only_and_per_run(
 ) -> None:
     adapter = _fake_adapter(frozenset())
     policy = _fake_policy(approval_mode=approval_mode)
-    assert (
-        automation_approvals.evaluate_approval_requirement(
-            adapter, policy, action_step_count_so_far=0
-        )
-        is True
-    )
+    # An empty set -- falsy, yet "approval required". Callers test `is None`.
+    assert _requirement(adapter, policy, count=0) == frozenset()
 
 
 def test_bounded_step_requires_approval_once_count_limit_reached() -> None:
     adapter = _fake_adapter(frozenset())
     policy = _fake_policy(approval_mode="bounded_recurring", count_limit=2)
-    assert (
-        automation_approvals.evaluate_approval_requirement(
-            adapter, policy, action_step_count_so_far=1
-        )
-        is False
+    assert _requirement(adapter, policy, count=1) is None
+    assert _requirement(adapter, policy, count=2) == frozenset({"policy-limit-exceeding"})
+
+
+def test_high_impact_step_past_count_limit_records_both_categories() -> None:
+    adapter = _fake_adapter(frozenset({"person-directed"}))
+    policy = _fake_policy(approval_mode="bounded_recurring", count_limit=1)
+    assert _requirement(adapter, policy, count=1) == frozenset(
+        {"person-directed", "policy-limit-exceeding"}
     )
-    assert (
-        automation_approvals.evaluate_approval_requirement(
-            adapter, policy, action_step_count_so_far=2
-        )
-        is True
+
+
+def _requirement(
+    adapter: ActionAdapter,
+    policy: automation_policy.AutomationPolicy,
+    *,
+    count: int,
+    run_value: Decimal = Decimal("0"),
+    step_value: Decimal = Decimal("0"),
+) -> frozenset[str] | None:
+    return automation_approvals.evaluate_approval_requirement(
+        adapter,
+        policy,
+        action_step_count_so_far=count,
+        run_value_so_far=run_value,
+        step_value=step_value,
     )
 
 

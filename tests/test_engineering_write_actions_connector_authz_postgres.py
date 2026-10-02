@@ -37,6 +37,7 @@ from ecc.domains.automation import approvals as automation_approvals
 from ecc.domains.automation import policy as automation_policy
 from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
+from ecc.domains.automation.adapter_contract import ACTION_TYPES
 from ecc.domains.automation.adapters import AdapterRegistry
 from ecc.domains.engineering.crypto import encrypt_credential
 from ecc.domains.engineering.write_actions import (
@@ -429,8 +430,8 @@ def _publish_workflow(ws: _Workspace, workflow_id: str, graph: dict[str, Any]) -
             ws.workspace_id,
             author,
             workflow_id=workflow_id,
-            action_types=[],
-            data_classes=[],
+            action_types=sorted(ACTION_TYPES),
+            data_classes=["sensitive"],
             value_limit=Decimal("1000000"),
             count_limit=1000,
             rate_limit=None,

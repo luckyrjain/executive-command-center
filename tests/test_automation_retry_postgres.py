@@ -60,6 +60,7 @@ from ecc.database import SessionFactory, engine
 from ecc.domains.automation import policy as automation_policy
 from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
+from ecc.domains.automation.adapter_contract import ACTION_TYPES
 from ecc.domains.automation.adapters import AdapterRegistry, TransientAdapterError
 
 settings = get_settings()
@@ -93,6 +94,8 @@ class TransientNTimesThenSucceedAdapter:
     output_schema = EchoOutput
     reversible = True
     high_impact_categories: frozenset[str] = frozenset()
+    action_type = "fake.external"
+    data_class = "internal"
 
     def __init__(self, fail_count: int) -> None:
         self._fail_count = fail_count
@@ -116,6 +119,8 @@ class AlwaysTransientAdapter:
     output_schema = EchoOutput
     reversible = True
     high_impact_categories: frozenset[str] = frozenset()
+    action_type = "fake.external"
+    data_class = "internal"
 
     def __init__(self) -> None:
         self.execute_calls = 0
@@ -183,6 +188,8 @@ class _RetryDispatchProbeAdapter:
     output_schema = EchoOutput
     reversible = True
     high_impact_categories: frozenset[str] = frozenset()
+    action_type = "fake.external"
+    data_class = "internal"
 
     def __init__(self, run_id: UUID, step_index: int) -> None:
         self._run_id = run_id
@@ -345,8 +352,8 @@ def _publish_workflow(
             workspace_id,
             user_id,
             workflow_id=workflow_id,
-            action_types=[],
-            data_classes=[],
+            action_types=sorted(ACTION_TYPES),
+            data_classes=["sensitive"],
             value_limit=Decimal("1000000"),
             count_limit=1000,
             rate_limit=None,

@@ -845,12 +845,30 @@ function makeAutomationApi(overrides = {}) {
       return { status: 200, body: switchObj }
     }
 
+    if (pathname === '/api/v1/automations/adapters' && method === 'GET') {
+      return {
+        status: 200,
+        body: {
+          adapters: [
+            { adapter_id: 'local.create_note', action_type: 'note.create', data_class: 'sensitive', reversible: true, high_impact_categories: [], has_dispatch_value: false },
+            { adapter_id: 'local.send_test_notification', action_type: 'notification.send', data_class: 'sensitive', reversible: false, high_impact_categories: ['person-directed'], has_dispatch_value: false },
+          ],
+          action_types: ['note.create', 'notification.send'],
+          data_classes: ['public', 'internal', 'sensitive', 'restricted'],
+        },
+      }
+    }
     if (pathname === '/api/v1/automations/policies' && method === 'GET') {
       const workflowId = params.get('workflow_id')
       const items = policies.filter((p) => !workflowId || p.workflow_id === workflowId)
       return { status: 200, body: { policies: items } }
     }
     if (pathname === '/api/v1/automations/policies' && method === 'POST') {
+      // Mirrors the backend's create-time scope check, so a panel that sent
+      // no scope fails here instead of passing the scenario.
+      if (!(body.action_types ?? []).length || !(body.data_classes ?? []).length) {
+        return { status: 422, body: { error: { code: 'POLICY_SCOPE_EMPTY', message: 'Policy Scope Empty' } } }
+      }
       const created = {
         id: `automation-policy-${policies.length + 1}`,
         workflow_id: body.workflow_id,
@@ -867,6 +885,7 @@ function makeAutomationApi(overrides = {}) {
         version: 1,
         created_at: nowIso(),
         updated_at: nowIso(),
+        scope_enforced: true,
       }
       policies.push(created)
       return { status: 201, body: created }

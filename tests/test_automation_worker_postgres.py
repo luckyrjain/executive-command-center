@@ -61,6 +61,7 @@ from ecc.domains.automation import approvals as automation_approvals
 from ecc.domains.automation import policy as automation_policy
 from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
+from ecc.domains.automation.adapter_contract import ACTION_TYPES
 from ecc.domains.automation.adapters import (
     AdapterAlreadyRegistered,
     AdapterCategoryInvalid,
@@ -100,6 +101,8 @@ class EchoAdapter:
     output_schema = EchoOutput
     reversible = True
     high_impact_categories: frozenset[str] = frozenset()
+    action_type = "fake.external"
+    data_class = "internal"
 
     def __init__(self) -> None:
         self.execute_calls = 0
@@ -124,6 +127,8 @@ class FailingAdapter:
     output_schema = EchoOutput
     reversible = True
     high_impact_categories: frozenset[str] = frozenset()
+    action_type = "fake.external"
+    data_class = "internal"
 
     def __init__(self) -> None:
         self.execute_calls = 0
@@ -148,6 +153,8 @@ class HighImpactAdapter:
     output_schema = EchoOutput
     reversible = False
     high_impact_categories: frozenset[str] = frozenset({"person-directed"})
+    action_type = "fake.external"
+    data_class = "internal"
 
     def __init__(self) -> None:
         self.execute_calls = 0
@@ -182,6 +189,8 @@ class DigestVisibilityProbeAdapter:
     output_schema = EchoOutput
     reversible = True
     high_impact_categories: frozenset[str] = frozenset()
+    action_type = "fake.external"
+    data_class = "internal"
 
     def __init__(self, run_id: UUID, step_index: int) -> None:
         self._run_id = run_id
@@ -232,6 +241,8 @@ class LeaseHandoverAdapter:
     output_schema = EchoOutput
     reversible = True
     high_impact_categories: frozenset[str] = frozenset()
+    action_type = "fake.external"
+    data_class = "internal"
 
     def __init__(self, run_id: UUID, *, stolen_by: str = "worker-b") -> None:
         self._run_id = run_id
@@ -389,8 +400,8 @@ def _create_policy(
             workspace_id,
             user_id,
             workflow_id=workflow_id,
-            action_types=[],
-            data_classes=[],
+            action_types=sorted(ACTION_TYPES),
+            data_classes=["sensitive"],
             value_limit=Decimal("1000000"),
             count_limit=count_limit,
             rate_limit=rate_limit,
@@ -1677,6 +1688,8 @@ def test_adapter_registry_rejects_unknown_high_impact_category() -> None:
         output_schema = EchoOutput
         reversible = True
         high_impact_categories = frozenset({"not-a-real-category"})
+        action_type = "fake.external"
+        data_class = "internal"
 
         def simulate(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
             return EchoOutput(value=action_input.value)

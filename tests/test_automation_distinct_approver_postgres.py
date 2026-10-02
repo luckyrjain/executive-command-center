@@ -34,6 +34,7 @@ from ecc.domains.automation import scheduler as automation_scheduler
 from ecc.domains.automation import triggers as automation_triggers
 from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
+from ecc.domains.automation.adapter_contract import ACTION_TYPES
 from ecc.domains.automation.adapters import AdapterRegistry
 from ecc.main import app
 from ecc.platform.connector_security import membership_mutation_lock_key
@@ -168,6 +169,8 @@ class _HighImpactAdapter:
     output_schema: type[BaseModel] = _Output
     reversible = True
     high_impact_categories: frozenset[str] = frozenset({"public"})
+    action_type = "fake.external"
+    data_class = "internal"
 
     def __init__(self) -> None:
         self.execute_calls = 0
@@ -217,8 +220,8 @@ def _pause_run(
             world.workspace_id,
             author,
             workflow_id=workflow_id,
-            action_types=[],
-            data_classes=[],
+            action_types=sorted(ACTION_TYPES),
+            data_classes=["sensitive"],
             value_limit=Decimal("1000000"),
             count_limit=1000,
             rate_limit=None,

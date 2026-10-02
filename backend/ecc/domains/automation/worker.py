@@ -677,11 +677,13 @@ and `_count_runs_in_rate_limit_window` for exactly which rows count.
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from hashlib import sha256
 from json import dumps
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
+from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -698,11 +700,12 @@ from ecc.observability import (
     record_step_retry,
     record_unknown_outcome,
 )
-from ecc.platform import authz
+from ecc.platform import audit_outbox, authz
 from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
 
 from . import kill_switches
 from . import policy as policy_module
+from .adapter_contract import dispatch_value
 from .adapters import (
     ActionAdapter,
     AdapterRegistry,
@@ -714,6 +717,7 @@ from .approvals import (
     approval_lifecycle_status,
     create_approval_request,
     evaluate_approval_requirement,
+    evaluate_policy_scope,
     get_approved_request,
     get_pending_approval,
 )
@@ -966,15 +970,53 @@ class StepAwaitingApproval:
     approval_id: UUID
 
 
+PolicyBlockReason = Literal[
+    "no_policy",
+    "policy_revoked",
+    "policy_expired",
+    "action_type_not_authorized",
+    "data_class_not_authorized",
+]
+
+
 @dataclass(frozen=True, slots=True)
 class StepBlockedByPolicy:
     """`run_step` did not dispatch `step_index` -- the run's policy is
-    unusable (module docstring: unset, not found, revoked, or expired). No
-    `workflow_run_steps` row is written for this outcome either.
+    unusable (module docstring: unset, not found, revoked, or expired), or
+    usable but does not authorize this kind of adapter (`action_type_not_
+    authorized`/`data_class_not_authorized`, `approvals.evaluate_policy_
+    scope`). Every reason means the same thing operationally -- an operator
+    must investigate -- so all map to `needs_review`. No `workflow_run_steps`
+    row is written for this outcome either.
     """
 
     step_index: int
-    reason: Literal["no_policy", "policy_revoked", "policy_expired"]
+    reason: PolicyBlockReason
+
+
+@dataclass(frozen=True, slots=True)
+class StepCleared:
+    """`_evaluate_dispatch_gate`'s "cleared to really dispatch" result for a
+    registered adapter: the input validated once inside the gate, and the
+    `dispatch_value` it moves (persisted on the `dispatched` row and summed
+    against `value_limit`). `run_step` reuses `action_input` rather than
+    validating again. (`None` stays the cleared result for an unregistered
+    `action_ref`, which `run_step` fails as `AdapterNotRegistered`.)"""
+
+    action_input: BaseModel
+    dispatch_value: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class StepInputInvalid:
+    """The step's static `input_mapping` failed the adapter's `input_schema`
+    (or its `dispatch_value`) inside the gate -- after policy usability and
+    scope, before value/approval. `run_step` writes the step row straight
+    to `failed` with `error_class` and returns an ordinary failed
+    `StepOutcome`; this value is never returned out of `run_step`."""
+
+    step_index: int
+    error_class: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1951,27 +1993,24 @@ def _resolve_step(session: Session, run: WorkflowRun, step_index: int) -> dict[s
     return steps[step_index]
 
 
-def _count_dispatched_action_steps(session: Session, workspace_id: UUID, run_id: UUID) -> int:
-    """How many `workflow_run_steps` rows (any status) this run has
-    already written -- every row this module ever inserts is for an
-    `action` step (module docstring / `UnsupportedStepType`), so this is
-    exactly "how many action steps has this run already attempted," the
-    count `policy-limit-exceeding` (`approvals.evaluate_approval_
-    requirement`) needs. Counts rows for the step currently being gated
-    too if one somehow already existed (it never does here -- this is only
-    ever called from the `else:` branch below, which is only reached when
-    no row exists yet for this exact `step_index`), so it is exactly the
-    count of *prior* steps, never off-by-one against the step under
-    evaluation.
-    """
-    result = session.execute(
+def _run_dispatch_totals(session: Session, workspace_id: UUID, run_id: UUID) -> tuple[int, Decimal]:
+    """`(row count, summed dispatch_value)` over this run's
+    `workflow_run_steps` rows of **any** status -- the two per-run figures
+    `policy-limit-exceeding` needs (`approvals.evaluate_approval_
+    requirement`). Any status fails closed: a failed/unknown/retrying step
+    may still have moved value. NULL values (compensation rows, rejected
+    approvals, failed validation, pre-migration rows) count as 0. Every row
+    this module inserts is for an `action` step, and the gate only runs
+    when no row exists yet for the step under evaluation, so this counts
+    exactly the *prior* steps -- never off-by-one against that step."""
+    row = session.execute(
         text(
-            "SELECT COUNT(*) FROM workflow_run_steps "
+            "SELECT COUNT(*), COALESCE(SUM(dispatch_value), 0) FROM workflow_run_steps "
             "WHERE workspace_id = :workspace_id AND run_id = :run_id"
         ),
         {"workspace_id": workspace_id, "run_id": run_id},
-    ).scalar()
-    return int(result or 0)
+    ).one()
+    return int(row[0] or 0), Decimal(row[1] or 0)
 
 
 def _resolve_usable_policy(
@@ -2027,6 +2066,7 @@ def _evaluate_approval_gate(
     digest: str,
     adapter: ActionAdapter,
     policy_row: policy_module.AutomationPolicy,
+    step_value: Decimal,
 ) -> StepAwaitingApproval | None:
     """The approval half of Task 3's gate, extracted verbatim from
     `_evaluate_dispatch_gate` so that function's own single `return None`
@@ -2045,10 +2085,19 @@ def _evaluate_approval_gate(
     call sites that must both enforce "is this policy still usable" share
     one implementation rather than two drifting copies.
     """
-    action_step_count_so_far = _count_dispatched_action_steps(session, run.workspace_id, run.id)
-    if not evaluate_approval_requirement(
-        adapter, policy_row, action_step_count_so_far=action_step_count_so_far
-    ):
+    action_step_count_so_far, run_value_so_far = _run_dispatch_totals(
+        session, run.workspace_id, run.id
+    )
+    categories = evaluate_approval_requirement(
+        adapter,
+        policy_row,
+        action_step_count_so_far=action_step_count_so_far,
+        run_value_so_far=run_value_so_far,
+        step_value=step_value,
+    )
+    # `is None`, never truthiness: an empty set (a bounded adapter under
+    # per_run/preview_only) still means "approval required".
+    if categories is None:
         return None
 
     approved = get_approved_request(session, run.workspace_id, run.id, step_index, digest)
@@ -2059,8 +2108,10 @@ def _evaluate_approval_gate(
     if pending is not None:
         return StepAwaitingApproval(step_index, pending.id)
 
+    # The effective category set -- including `policy-limit-exceeding`
+    # when a count/value limit tripped -- so the approver sees why.
     created = create_approval_request(
-        session, run.workspace_id, run.id, step_index, digest, adapter.high_impact_categories
+        session, run.workspace_id, run.id, step_index, digest, categories
     )
     # Durable immediately -- module docstring's "Task 3's approval/policy
     # gate" section: a crash here must never strand the run in
@@ -2077,7 +2128,14 @@ def _evaluate_dispatch_gate(
     digest: str,
     step: dict[str, Any],
     adapter_registry: AdapterRegistry,
-) -> StepBlockedByPolicy | StepAwaitingApproval | StepBlockedByPreviewOnlyPolicy | None:
+) -> (
+    StepBlockedByPolicy
+    | StepAwaitingApproval
+    | StepBlockedByPreviewOnlyPolicy
+    | StepInputInvalid
+    | StepCleared
+    | None
+):
     """Task 3's gate (module docstring's own section has the full
     reasoning) -- only ever called from `run_step`'s `else:` branch, i.e.
     only when no `workflow_run_steps` row exists yet for this step at all.
@@ -2122,6 +2180,19 @@ def _evaluate_dispatch_gate(
     same helper `run_step`'s retry-resume path calls to re-enforce exactly
     this check on every resumed attempt, not just first dispatch -- so
     there is one implementation of "is this policy still usable," not two.
+
+    **Scope enforcement** (`docs/superpowers/specs/2026-10-01-automation-
+    policy-scope-enforcement-design.md`, Decision 5) fixes the order:
+    usability -> adapter resolution -> **scope** -> **input validation** ->
+    value and approval -> `preview_only` exit. Scope needs no input, so an
+    out-of-scope step blocks (`needs_review`) before it can create an
+    approval a human could grant, and even when its input is also invalid.
+    Validation happens once, here, so `dispatch_value` sees the validated
+    model; invalid input is `StepInputInvalid` (a `failed` row, written by
+    `run_step`) except under `preview_only`, where it is the preview block
+    instead -- a `failed` row would start compensation, which dispatches for
+    real (point 2 above). The `preview_only` check guards both cleared
+    exits, `StepCleared` and `None`.
     """
     resolved = _resolve_usable_policy(session, run, step_index)
     if isinstance(resolved, StepBlockedByPolicy):
@@ -2129,19 +2200,36 @@ def _evaluate_dispatch_gate(
     policy_row = resolved
 
     adapter = adapter_registry.get(step["action_ref"])
-    if adapter is not None:
-        awaiting = _evaluate_approval_gate(session, run, step_index, digest, adapter, policy_row)
-        if awaiting is not None:
-            return awaiting
+    if adapter is None:
+        # `run_step`'s own AdapterNotRegistered branch handles this for every
+        # mode except preview_only -- see point 2 in this docstring.
+        if policy_row.approval_mode == "preview_only":
+            return StepBlockedByPreviewOnlyPolicy(step_index)
+        return None
 
-    # Reaching here means one of exactly two things: this step's approval
-    # requirement (if it had one) is satisfied for this exact live digest, or
-    # its `action_ref` does not resolve in the registry at all (which
-    # `run_step`'s own AdapterNotRegistered branch handles for every mode
-    # except preview_only -- see point 2 in this function's docstring).
+    scope_reason = evaluate_policy_scope(adapter, policy_row)
+    if scope_reason is not None:
+        return StepBlockedByPolicy(step_index, scope_reason)
+
+    try:
+        action_input = adapter.input_schema.model_validate(step.get("input_mapping", {}))
+        step_value = dispatch_value(adapter, action_input)
+    except Exception as exc:  # noqa: BLE001 -- classified exactly like run_step's own branch
+        if policy_row.approval_mode == "preview_only":
+            return StepBlockedByPreviewOnlyPolicy(step_index)
+        return StepInputInvalid(step_index, type(exc).__name__)
+
+    awaiting = _evaluate_approval_gate(
+        session, run, step_index, digest, adapter, policy_row, step_value
+    )
+    if awaiting is not None:
+        return awaiting
+
+    # Reaching here means this step's approval requirement (if it had one)
+    # is satisfied for this exact live digest.
     if policy_row.approval_mode == "preview_only":
         return StepBlockedByPreviewOnlyPolicy(step_index)
-    return None
+    return StepCleared(action_input, step_value)
 
 
 def run_step(
@@ -2259,6 +2347,9 @@ def run_step(
     # Task 6: `attempt_count` carries forward across a retry-resume; a
     # fresh dispatch (no existing row, or a first-ever attempt) starts at 0.
     attempt_count = existing["attempt_count"] if existing is not None else 0
+    # Set only on first dispatch, where the gate already validated the
+    # input; the retry-resume path validates in the `try` below as before.
+    cleared_input: BaseModel | None = None
 
     if existing is not None:
         if existing["status"] == "succeeded":
@@ -2325,6 +2416,13 @@ def run_step(
         blocked = _resolve_usable_policy(session, run, step_index)
         if isinstance(blocked, StepBlockedByPolicy):
             return blocked
+        # Scope too (defence in depth): an adapter reclassified by a deploy
+        # landing during the backoff window must not resume out of scope.
+        resume_adapter = adapter_registry.get(step["action_ref"])
+        if resume_adapter is not None:
+            resume_scope = evaluate_policy_scope(resume_adapter, blocked)
+            if resume_scope is not None:
+                return StepBlockedByPolicy(step_index, resume_scope)
 
         now = datetime.now(UTC)
         session.execute(
@@ -2361,8 +2459,48 @@ def run_step(
         # approval-paused step indistinguishable from Task 2's own
         # crash-in-the-gap 'unknown' case on any later re-examination).
         gate = _evaluate_dispatch_gate(session, run, step_index, digest, step, adapter_registry)
-        if gate is not None:
+        if isinstance(gate, StepInputInvalid):
+            # Nothing executed and no row exists yet: write the step straight
+            # to 'failed' (never through 'dispatched'), so
+            # process_claimed_run's ordinary 'failed' branch handles the
+            # run -- and compensation of earlier steps -- unchanged.
+            now = datetime.now(UTC)
+            session.execute(
+                text(
+                    f"""
+                    INSERT INTO workflow_run_steps (
+                        id, workspace_id, run_id, step_index, step_type, status,
+                        action_digest, input, error_class, started_at, finished_at,
+                        created_at, updated_at, owner_id, visibility
+                    ) VALUES (
+                        :id, :workspace_id, :run_id, :step_index, :step_type, 'failed',
+                        :digest, CAST(:input AS jsonb), :error_class, :now, :now,
+                        :now, :now, {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
+                    )
+                    """
+                ),
+                {
+                    "id": uuid4(),
+                    "workspace_id": run.workspace_id,
+                    "run_id": run.id,
+                    "step_index": step_index,
+                    "step_type": step["step_type"],
+                    "digest": digest,
+                    "input": dumps(_redact_payload(resolved_input)),
+                    "error_class": gate.error_class,
+                    "now": now,
+                },
+            )
+            session.commit()
+            record_step_outcome("failed")
+            return StepOutcome(step_index, "failed", None, gate.error_class)
+        if isinstance(gate, StepCleared):
+            cleared_input = gate.action_input
+            step_dispatch_value: Decimal | None = gate.dispatch_value
+        elif gate is not None:
             return gate
+        else:
+            step_dispatch_value = None
 
         now = datetime.now(UTC)
         session.execute(
@@ -2370,11 +2508,11 @@ def run_step(
                 f"""
                 INSERT INTO workflow_run_steps (
                     id, workspace_id, run_id, step_index, step_type, status,
-                    action_digest, input, started_at, created_at, updated_at,
-                    owner_id, visibility
+                    action_digest, input, dispatch_value, started_at, created_at,
+                    updated_at, owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :run_id, :step_index, :step_type, 'dispatched',
-                    :digest, CAST(:input AS jsonb), :now, :now, :now,
+                    :digest, CAST(:input AS jsonb), :dispatch_value, :now, :now, :now,
                     {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
                 )
                 """
@@ -2387,6 +2525,7 @@ def run_step(
                 "step_type": step["step_type"],
                 "digest": digest,
                 "input": dumps(_redact_payload(resolved_input)),
+                "dispatch_value": step_dispatch_value,
                 "now": now,
             },
         )
@@ -2423,7 +2562,11 @@ def run_step(
         return StepOutcome(step_index, "failed", None, "AdapterNotRegistered")
 
     try:
-        action_input = adapter.input_schema.model_validate(resolved_input)
+        action_input = (
+            cleared_input
+            if cleared_input is not None
+            else adapter.input_schema.model_validate(resolved_input)
+        )
         # Defense-in-depth confused-deputy backstop (Task 5's own
         # self-review addition, extracted into _enforce_workspace_scope by
         # Task 6 so compensation dispatch can reuse it verbatim) -- see
@@ -2948,6 +3091,33 @@ def _dispatch_compensation_step(
         )
         return StepOutcome(compensation_index, "failed", None, "AdapterNotRegistered")
 
+    # Scope (design Decision 5 item 4): only when the compensation step's
+    # own adapter will run through execute(). An original adapter's own
+    # compensate() undoes an action the gate already authorized, and
+    # denying the undo would leave the side effect behind.
+    # An unregistered compensation adapter is left to the `try` below, which
+    # records it as a failed compensation exactly as before.
+    if (
+        not (original_adapter is not None and compensable(original_adapter))
+        and compensation_adapter is not None
+    ):
+        scope_policy = (
+            policy_module.get_policy(session, run.workspace_id, run.policy_id)
+            if run.policy_id is not None
+            else None
+        )
+        if scope_policy is not None and evaluate_policy_scope(compensation_adapter, scope_policy):
+            _fail_compensation_row(
+                session,
+                run,
+                original_index=original_index,
+                compensation_index=compensation_index,
+                error_class="PolicyScopeViolationDuringCompensation",
+            )
+            return StepOutcome(
+                compensation_index, "failed", None, "PolicyScopeViolationDuringCompensation"
+            )
+
     try:
         if original_adapter is not None and compensable(original_adapter):
             original_resolved_input: dict[str, Any] = original_step.get("input_mapping", {})
@@ -3068,6 +3238,63 @@ def _run_compensation_sequence(
 # ---------------------------------------------------------------------------
 
 
+_SCOPE_BLOCK_REASONS: frozenset[str] = frozenset(
+    {"action_type_not_authorized", "data_class_not_authorized"}
+)
+
+
+def _write_step_blocked_event(
+    session: Session, run: WorkflowRun, outcome: StepBlockedByPolicy
+) -> None:
+    """`automation.step_blocked` for a scope block: a blocked step writes no
+    step row, so without this the reason is unrecoverable for an operator.
+    Written on the caller's open transaction, which `_pause_run`'s
+    `needs_review` write then commits (or rolls back, with it, on a lost
+    lease). Attributed to the run's starter. Only the two scope reasons
+    emit it; the existing usability reasons keep their behaviour."""
+    audit_outbox.write_audit_and_outbox(
+        session,
+        AuthContext(workspace_id=run.workspace_id, user_id=run.created_by, timezone="UTC"),
+        None,
+        event_type="automation.step_blocked",
+        aggregate_type="workflow_run",
+        aggregate_id=run.id,
+        aggregate_version=1,
+        changed_fields=["status"],
+        payload={
+            "run_id": str(run.id),
+            "step_index": outcome.step_index,
+            "reason": outcome.reason,
+        },
+        now=datetime.now(UTC),
+        domain="automation",
+        source="automation",
+        # Also on the durable audit row (the outbox is a delivery queue), so
+        # the run detail can show an operator why the run stopped.
+        metadata={"step_index": outcome.step_index, "reason": outcome.reason},
+    )
+
+
+def latest_scope_block(
+    session: Session, workspace_id: UUID, run_id: UUID
+) -> tuple[int, str] | None:
+    """`(step_index, reason)` of the most recent `automation.step_blocked`
+    audit row for this run, or `None`. A scope block writes no step row, so
+    this is the only place its cause survives."""
+    row = session.execute(
+        text(
+            "SELECT metadata FROM audit_events WHERE workspace_id = :workspace_id "
+            "AND aggregate_type = 'workflow_run' AND aggregate_id = :run_id "
+            "AND event_type = 'automation.step_blocked' "
+            "ORDER BY occurred_at DESC LIMIT 1"
+        ),
+        {"workspace_id": workspace_id, "run_id": run_id},
+    ).scalar_one_or_none()
+    if not row or "reason" not in row:
+        return None
+    return int(row["step_index"]), str(row["reason"])
+
+
 def process_claimed_run(
     session: Session, run: WorkflowRun, adapter_registry: AdapterRegistry, worker_id: str
 ) -> WorkflowRun:
@@ -3162,6 +3389,8 @@ def process_claimed_run(
             # (module docstring's "Resuming a waiting_approval run" note).
             return _stop(_pause_run(session, run, "waiting_approval", worker_id))
         if isinstance(outcome, StepBlockedByPolicy):
+            if outcome.reason in _SCOPE_BLOCK_REASONS:
+                _write_step_blocked_event(session, run, outcome)
             return _stop(_pause_run(session, run, "needs_review", worker_id))
         if isinstance(outcome, StepBlockedByPreviewOnlyPolicy):
             # The run's policy is healthy and authorizes exactly what its

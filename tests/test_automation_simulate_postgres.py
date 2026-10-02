@@ -45,6 +45,7 @@ from hmac import new
 from typing import Any
 from uuid import UUID, uuid4
 
+import automation_scope_support as scope_support
 import pytest
 from fastapi.testclient import TestClient
 from identity_fixtures import create_identity
@@ -53,10 +54,12 @@ from sqlalchemy import text
 
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
+from ecc.domains.automation import approvals as automation_approvals
 from ecc.domains.automation import kill_switches as automation_kill_switches
 from ecc.domains.automation import policy as automation_policy
 from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
+from ecc.domains.automation.adapter_contract import ACTION_TYPES
 from ecc.domains.automation.adapters import AdapterRegistry
 from ecc.main import app
 
@@ -252,8 +255,8 @@ def _publish_workflow_direct(
             workspace_id,
             user_id,
             workflow_id=workflow_id,
-            action_types=[],
-            data_classes=[],
+            action_types=sorted(ACTION_TYPES),
+            data_classes=["sensitive"],
             value_limit=Decimal("1000000"),
             count_limit=count_limit,
             rate_limit=None,
@@ -873,6 +876,8 @@ class _SucceedingAdapter:
         self.output_schema = _EchoOutput
         self.reversible = True
         self.high_impact_categories: frozenset[str] = frozenset()
+        self.action_type = "fake.external"
+        self.data_class = "internal"
 
     def simulate(self, action_input: _EchoInput) -> _EchoOutput:  # noqa: D102
         return _EchoOutput(value=action_input.value)
@@ -888,6 +893,8 @@ class _FailingAdapter:
         self.output_schema = _EchoOutput
         self.reversible = True
         self.high_impact_categories: frozenset[str] = frozenset()
+        self.action_type = "fake.external"
+        self.data_class = "internal"
 
     def simulate(self, action_input: _EchoInput) -> _EchoOutput:  # noqa: D102
         return _EchoOutput(value=action_input.value)
@@ -903,6 +910,8 @@ class _CompensatableAdapter:
         self.output_schema = _EchoOutput
         self.reversible = True
         self.high_impact_categories: frozenset[str] = frozenset()
+        self.action_type = "fake.external"
+        self.data_class = "internal"
 
     def simulate(self, action_input: _EchoInput) -> _EchoOutput:  # noqa: D102
         return _EchoOutput(value=action_input.value)
@@ -1004,3 +1013,129 @@ def test_run_detail_compensation_ledger_workspace_isolation(
             other_client.close()
     finally:
         _cleanup_workspace(other_workspace_id)
+
+
+# ---------------------------------------------------------------------------
+# Scope-enforcement parity (design Decision 5 item 5): for the same graph and
+# policy, /simulate reports the same first block reason and the same
+# approval points up to that block as real dispatch.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def scope_world() -> Iterator[scope_support.World]:
+    yield from scope_support.make_world()
+
+
+def _simulate(
+    world: scope_support.World, workflow_id: str, registry: AdapterRegistry
+) -> list[automation_workflows.SimulateStepResult]:
+    with SessionFactory() as session:
+        version = automation_workflows.get_active_workflow_version(
+            session, world.workspace_id, workflow_id
+        )
+        assert version is not None
+        return automation_workflows._simulate_steps(session, version, registry)
+
+
+@pytest.mark.parametrize(
+    ("adapter_kwargs", "reason"),
+    [
+        ({"action_type": "note.create"}, "action_type_not_authorized"),
+        ({"data_class": "sensitive"}, "data_class_not_authorized"),
+    ],
+)
+def test_simulate_reports_the_same_scope_block_as_dispatch(
+    scope_world: scope_support.World, adapter_kwargs: dict[str, str], reason: str
+) -> None:
+    ok = scope_support.FakeAdapter("test.ok", categories=frozenset({"public"}))
+    blocked = scope_support.FakeAdapter("test.blocked", **adapter_kwargs)
+    registry = scope_support.registry_of(ok, blocked)
+    workflow_id, _ = scope_support.publish(
+        scope_world,
+        {
+            "steps": [
+                scope_support.action_step("s0", "test.ok"),
+                scope_support.action_step("s1", "test.blocked"),
+            ]
+        },
+    )
+    simulated = _simulate(scope_world, workflow_id, registry)
+    assert [(r.dispatch_gate, r.policy_block_reason) for r in simulated] == [
+        ("requires_approval", None),
+        ("policy_blocked", reason),
+    ]
+    assert (simulated[1].action_type, simulated[1].data_class) == (
+        blocked.action_type,
+        blocked.data_class,
+    )
+
+    paused = scope_support.run_once(scope_world, workflow_id, registry)
+    assert paused.status == "waiting_approval"  # the same first approval point
+    with SessionFactory() as session, session.begin():
+        pending = automation_approvals.get_pending_approval(
+            session, scope_world.workspace_id, paused.id, 0
+        )
+        assert pending is not None
+        automation_approvals.decide_approval(
+            session,
+            scope_world.workspace_id,
+            scope_world.user_id,
+            pending.id,
+            "approved",
+            current_action_digest=pending.action_digest,
+        )
+    finished = scope_support.resume(scope_world, paused.id, registry)
+    assert finished.status == "needs_review"
+    assert scope_support.step_blocked_payloads(scope_world, finished.id)[0]["reason"] == reason
+
+
+def test_simulate_reports_input_invalid_and_scope_wins_over_it(
+    scope_world: scope_support.World,
+) -> None:
+    valid_scope = scope_support.FakeAdapter("test.v")
+    out_of_scope = scope_support.FakeAdapter("test.o", action_type="note.create")
+    registry = scope_support.registry_of(valid_scope, out_of_scope)
+    bad = {"unexpected": 1}
+    workflow_id, _ = scope_support.publish(
+        scope_world,
+        {
+            "steps": [
+                scope_support.action_step("s0", "test.v", input_mapping=bad),
+                scope_support.action_step("s1", "test.o", input_mapping=bad),
+            ]
+        },
+    )
+    simulated = _simulate(scope_world, workflow_id, registry)
+    assert [(r.dispatch_gate, r.policy_block_reason, r.error) for r in simulated] == [
+        ("input_invalid", None, "ValidationError"),
+        ("policy_blocked", "action_type_not_authorized", "ValidationError"),
+    ]
+    assert simulated[0].dispatch_value is None
+
+    finished = scope_support.run_once(scope_world, workflow_id, registry)
+    assert finished.status == "failed"
+    rows = scope_support.step_rows(scope_world, finished.id)
+    assert [(r["status"], r["error_class"]) for r in rows] == [("failed", "ValidationError")]
+
+
+def test_simulate_reports_dispatch_value_and_accumulates_it(
+    scope_world: scope_support.World,
+) -> None:
+    money = scope_support.FinancialFakeAdapter("test.pay")
+    registry = scope_support.registry_of(money)
+    workflow_id, _ = scope_support.publish(
+        scope_world,
+        {
+            "steps": [
+                scope_support.action_step("s0", "test.pay", input_mapping={"amount": "70"}),
+                scope_support.action_step(
+                    "s1", "test.pay", input_mapping={"amount": "70", "value": "2"}
+                ),
+            ]
+        },
+        value_limit=Decimal("100"),
+    )
+    simulated = _simulate(scope_world, workflow_id, registry)
+    assert [r.dispatch_value for r in simulated] == [Decimal("70"), Decimal("70")]
+    assert [r.dispatch_gate for r in simulated] == ["requires_approval", "requires_approval"]
