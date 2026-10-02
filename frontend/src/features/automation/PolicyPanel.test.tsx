@@ -159,6 +159,28 @@ describe('PolicyPanel', () => {
     expect(body.workflow_id).toBe('weekly-digest')
   })
 
+  it.each([
+    ['WORKFLOW_NOT_FOUND', 404, 'Workflow Not Found', 'No workflow with that ID exists that you can see. Check the ID, or draft the workflow first.'],
+    ['INSUFFICIENT_ROLE', 403, 'Insufficient Role', 'You do not have permission to change that workflow, so you cannot create a policy for it.'],
+  ])('maps a create refused with %s to a readable sentence', async (code, status, raw, expected) => {
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ policies: [] }))
+      .mockImplementationOnce(() => response({ error: { code, message: raw } }, status))
+      .mockImplementation(() => response({ policies: [] }))
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await waitFor(() => expect(screen.getByText('No policies recorded yet.')).toBeTruthy())
+    fireEvent.change(screen.getByLabelText('Workflow ID'), { target: { value: 'weekly-digest' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Create policy' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toBe(expected)
+    expect(alert.textContent).not.toContain(raw)
+  })
+
   it('on failed final submit, navigates back to Scope (where the missing Workflow ID lives) and focuses it', async () => {
     vi.stubGlobal('fetch', vi.fn(() => response({ policies: [] })))
     renderPanel()

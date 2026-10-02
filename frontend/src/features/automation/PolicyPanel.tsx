@@ -23,7 +23,15 @@ const CREATE_STEPS = ['scope', 'limits', 'review'] as const
 const CREATE_STEP_LABELS: Record<(typeof CREATE_STEPS)[number], string> = { scope: 'Scope', limits: 'Limits', review: 'Review' }
 const CREATE_ERROR_ID = 'create-policy-error'
 
-function errorMessage(error: unknown): string {
+// A create is refused 404 both for a workflow ID that does not exist and for
+// one the caller cannot see (the backend answers them identically), and 403
+// for a workflow the caller can see but not change.
+const CREATE_ERROR_MESSAGES: Record<string, string> = {
+  WORKFLOW_NOT_FOUND: 'No workflow with that ID exists that you can see. Check the ID, or draft the workflow first.',
+  INSUFFICIENT_ROLE: 'You do not have permission to change that workflow, so you cannot create a policy for it.',
+}
+
+function errorMessage(error: unknown, overrides: Record<string, string> = {}): string {
   if (error instanceof ApiError && error.code === 'POLICY_REVOKED') {
     const details = error.current as { revoked_at?: string } | undefined
     return `This policy was already revoked${details?.revoked_at ? ` at ${new Date(details.revoked_at).toLocaleString()}` : ''}.`
@@ -38,6 +46,7 @@ function errorMessage(error: unknown): string {
     OFFLINE: 'You are offline, so policies could not be read or changed.',
     NETWORK_ERROR: 'Could not reach the server, so policies could not be read or changed.',
     '401': 'Your session is no longer valid. Sign in again to review policies.',
+    ...overrides,
   })
 }
 
@@ -173,7 +182,7 @@ export default function PolicyPanel() {
       <form ref={createFormRef} noValidate onSubmit={attemptCreate} aria-labelledby="create-policy-title">
         <h3 id="create-policy-title">Create a policy</h3>
         {formError ? <div id={CREATE_ERROR_ID} role="alert" className="inline-status error-panel">{formError}</div> : null}
-        {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div> : null}
+        {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error, CREATE_ERROR_MESSAGES)}</div> : null}
 
         <ol className="wizard-stepper" aria-label="Create policy progress">
           {CREATE_STEPS.map((step, i) => (

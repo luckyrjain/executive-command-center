@@ -51,6 +51,7 @@ from ecc.platform.request_models import EmptyBody as _EmptyBody
 from .adapters import ActionAdapter, AdapterRegistry
 from .adapters import registry as _production_adapter_registry
 from .approvals import evaluate_approval_requirement
+from .family_authz import lock_and_authorize_family
 from .policy import AutomationPolicy, get_policy, is_policy_usable, policy_status
 
 # Task 7a: safe to import `.adapters`/`.policy`/`.approvals` here -- confirmed
@@ -605,7 +606,7 @@ def create_workflow_draft(
 
     Does no authorization of its own: it will append to any family in
     `workspace_id`. The HTTP endpoint authorizes the caller against an
-    existing family first (`_lock_and_authorize_family`).
+    existing family first (`family_authz.lock_and_authorize_family`).
     """
     now = datetime.now(UTC)
     family = (
@@ -963,75 +964,6 @@ def _to_response(version: WorkflowVersion) -> WorkflowVersionResponse:
     )
 
 
-def _lock_and_authorize_family(session: Session, auth: AuthContext, workflow_id: str) -> None:
-    """Gate appending a draft to an existing `workflow_id` family: the
-    caller must be able to read (else `404 WORKFLOW_NOT_FOUND`) and write
-    (else `403 INSUFFICIENT_ROLE`) both the family's latest version and its
-    active version. The latest is the one the new draft supersedes (and
-    whose number the response's `version` discloses); the active one is
-    what publishing the new draft would retire. Checking only the latest
-    would let a visible draft stacked on someone else's private active
-    version open the family. A family that does not exist yet passes: the
-    caller is creating it.
-
-    All read checks run before any write check, so a family with any
-    version the caller cannot see answers the same 404, never a 403 that
-    shows part of it is visible. That 404 is the one an unknown
-    `version_id` answers, and carries no version number. A taken slug
-    still cannot be created as a new family -- `workflow_id` is unique per
-    workspace -- so that one bit is inherent; nothing else is disclosed.
-
-    Must run inside the write transaction, after the membership and
-    idempotency locks and before `load_cached` (ADR-0014). The family row
-    and both version rows are locked first, so an ownership or visibility
-    change committed while this waits is what the checks see.
-    `create_workflow_draft` re-locks the same rows (a no-op).
-    """
-    # NO KEY UPDATE: still serializes concurrent appends to this family,
-    # without also waiting on every transaction that holds a foreign-key
-    # share lock on it (any write to one of its version rows).
-    family = session.execute(
-        text(
-            "SELECT id FROM workflow_definitions "
-            "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id "
-            "FOR NO KEY UPDATE"
-        ),
-        {"workspace_id": auth.workspace_id, "workflow_id": workflow_id},
-    ).one_or_none()
-    if family is None:
-        return
-    params = {"workspace_id": auth.workspace_id, "workflow_id": workflow_id}
-    # Latest first, then active: the same order `activate_workflow_version`
-    # takes (its target, then the active row), so the two cannot deadlock.
-    latest_id = session.execute(
-        text(
-            "SELECT id FROM workflow_versions "
-            "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id "
-            "ORDER BY version DESC LIMIT 1 FOR UPDATE"
-        ),
-        params,
-    ).scalar_one_or_none()
-    active_id = session.execute(
-        text(
-            "SELECT id FROM workflow_versions "
-            "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id "
-            "AND status = 'active' FOR UPDATE"
-        ),
-        params,
-    ).scalar_one_or_none()
-    version_ids = list(dict.fromkeys(v for v in (latest_id, active_id) if v is not None))
-    for version_id in version_ids:
-        if not authz.authorize(
-            session, auth, resource_type="workflow_versions", resource_id=version_id, action="read"
-        ):
-            raise HTTPException(status_code=404, detail="WORKFLOW_NOT_FOUND")
-    for version_id in version_ids:
-        if not authz.authorize(
-            session, auth, resource_type="workflow_versions", resource_id=version_id, action="write"
-        ):
-            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-
-
 def _lock_and_authorize_policy_ref(session: Session, auth: AuthContext, policy_ref: UUID) -> None:
     """A `policy_ref` must name a policy the caller can read: one that does
     not exist and one they cannot see both answer `404 POLICY_NOT_FOUND`,
@@ -1141,9 +1073,9 @@ def create_workflow_endpoint(
 
     Appending to an existing family requires read and write on its latest
     and active versions, and a `policy_ref` must be readable
-    (`_lock_and_authorize_family`/`_lock_and_authorize_policy_ref`). Both
-    run before the idempotency cache, so a same-key replay is
-    re-authorized (ADR-0014).
+    (`lock_and_authorize_family`/`_lock_and_authorize_policy_ref`). Both run
+    before the idempotency cache, so a same-key replay is re-authorized
+    (ADR-0014).
     """
     authz.require_role_action(session, auth, "write")
     graph_dict = payload.graph.model_dump(mode="json")
@@ -1158,7 +1090,7 @@ def create_workflow_endpoint(
     with session.begin():
         authz.lock_membership_for_write(session, auth, role_action="write")
         lock_idempotency(session, auth, idempotency_key)
-        _lock_and_authorize_family(session, auth, payload.workflow_id)
+        lock_and_authorize_family(session, auth, payload.workflow_id)
         if payload.policy_ref is not None:
             _lock_and_authorize_policy_ref(session, auth, payload.policy_ref)
         cached = load_cached(

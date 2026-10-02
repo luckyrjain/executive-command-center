@@ -100,6 +100,8 @@ from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 from ecc.platform.request_models import EmptyBody as _EmptyBody
 
+from .family_authz import lock_and_authorize_family
+
 ApprovalMode = Literal["preview_only", "per_run", "bounded_recurring"]
 PolicyLifecycleStatus = Literal["active", "expired", "revoked"]
 
@@ -233,19 +235,6 @@ def list_policies(
     )
     session.rollback()
     return [_row_to_policy(dict(row)) for row in rows]
-
-
-def workflow_family_exists(session: Session, workspace_id: UUID, workflow_id: str) -> bool:
-    return (
-        session.execute(
-            text(
-                "SELECT 1 FROM workflow_definitions WHERE workspace_id = :workspace_id "
-                "AND workflow_id = :workflow_id LIMIT 1"
-            ),
-            {"workspace_id": workspace_id, "workflow_id": workflow_id},
-        ).first()
-        is not None
-    )
 
 
 def create_policy(
@@ -443,12 +432,23 @@ def create_policy_endpoint(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> PolicyResponse:
+    """A policy is standing authority to run its workflow family, so
+    creating one is authorized as a write to that family, not a read: the
+    caller must be able to read and write its latest and active versions
+    (`lock_and_authorize_family`). A family the caller cannot see answers
+    the same `404 WORKFLOW_NOT_FOUND` as a `workflow_id` that does not
+    exist, so this endpoint is not an existence oracle. The check runs
+    under the row locks and before the idempotency cache, so a same-key
+    replay is re-authorized (ADR-0014).
+    """
     authz.require_role_action(session, auth, "write")
     req_hash = request_hash(payload, "create_policy")
     now = datetime.now(UTC)
     with session.begin():
         authz.lock_membership_for_write(session, auth, role_action="write")
         lock_idempotency(session, auth, idempotency_key)
+        if not lock_and_authorize_family(session, auth, payload.workflow_id):
+            raise HTTPException(status_code=404, detail="WORKFLOW_NOT_FOUND")
         cached = load_cached(
             session,
             auth,
@@ -459,9 +459,6 @@ def create_policy_endpoint(
         )
         if cached is not None:
             return cached
-
-        if not workflow_family_exists(session, auth.workspace_id, payload.workflow_id):
-            raise HTTPException(status_code=404, detail="WORKFLOW_NOT_FOUND")
 
         created = create_policy(
             session,
