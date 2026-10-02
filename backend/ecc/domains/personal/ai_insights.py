@@ -55,7 +55,7 @@ from json import dumps
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -65,6 +65,7 @@ from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.config import get_settings
 from ecc.domains.ai_runtime.runtime import OllamaAdapterDep, execute_run
 from ecc.platform import authz
+from ecc.platform.connector_security import MembershipInactiveError
 from ecc.platform.idempotency import (
     held_idempotency_lock,
     load_cached,
@@ -196,14 +197,22 @@ def generate_insight_endpoint(
             )
             else "sensitive"
         )
-        run = execute_run(
-            "personal.generate_insight",
-            data_class,
-            {"source_domain_keys": list(payload.source_domain_keys)},
-            session=session,
-            auth=auth,
-            ollama_adapter=adapter,
-        )
+        # `require_active_actor`: the run's terminal persist re-checks the
+        # caller's membership under the shared lock (after the model call,
+        # never across it), so a member removed meanwhile leaves no
+        # `ai_runs` row behind -- answered like the insert's own re-check.
+        try:
+            run = execute_run(
+                "personal.generate_insight",
+                data_class,
+                {"source_domain_keys": list(payload.source_domain_keys)},
+                session=session,
+                auth=auth,
+                ollama_adapter=adapter,
+                require_active_actor=True,
+            )
+        except MembershipInactiveError as exc:
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE") from exc
         if run.status != "completed" or run.output is None:
             response = InsightGenerateResponse(
                 available=False, insight=None, error_code=run.error_code

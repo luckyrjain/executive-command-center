@@ -177,6 +177,29 @@ describe('SharingReview', () => {
     await waitFor(() => expect((screen.getByLabelText('Resource type') as HTMLInputElement).value).toBe(''))
   })
 
+  it('explains a refused share of email-derived or personal data as private to that member, for every caller including its owner', async () => {
+    stubFetch({
+      grants: [],
+      onPost: (input) => {
+        if (String(input).includes('/grants/preview')) return response(preview())
+        if (String(input).endsWith('/api/v1/sharing/grants')) {
+          return response({ error: { code: 'RESOURCE_TYPE_NOT_GRANTABLE', message: 'Resource Type Not Grantable' } }, 400)
+        }
+        return undefined
+      },
+    })
+    renderPanel()
+    await screen.findByText('No grants shared yet.')
+    fillForm()
+    fireEvent.click(screen.getByRole('button', { name: 'Preview sharing' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Confirm and share' }))
+
+    const message = await screen.findByText(/This item can't be shared, transferred or delegated\./)
+    expect(message.textContent).toContain("created from a member's email, stay private to that member")
+    expect(message.textContent).toContain('including their owner')
+    expect(screen.queryByText(/RESOURCE_TYPE_NOT_GRANTABLE/)).toBeNull()
+  })
+
   it('revokes a grant', async () => {
     const fetch = stubFetch({
       grants: [grant()],

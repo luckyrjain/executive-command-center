@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Iterator
+from typing import get_args
 from uuid import uuid4
 
 import pytest
@@ -942,3 +943,79 @@ def test_task_idempotency_conflict_emits_metric(
 
     after = _metric_line_value(render_metrics(), label)
     assert after == before + 1
+
+
+def test_connector_security_series_exist_at_zero_before_any_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spec A's rare-event counters are pre-initialised at boot: before any
+    event /metrics already lists each bounded series at 0, so Prometheus
+    `increase()` sees the first event (0 -> 1) instead of a series born at 1.
+    """
+    import ecc.main as main
+    from ecc import observability
+    from ecc.platform.connector_security import (
+        PERSONAL_PROVIDERS,
+        SHARE_REFUSED_RESOURCE_TYPES,
+    )
+
+    counters = (
+        observability.connector_enrollment_refused_total,
+        observability.personal_data_share_refused_total,
+        observability.connector_revoke_total,
+        observability.connector_access_denied_total,
+        observability.gmail_refresh_rejected_total,
+    )
+    # Importing ecc.main already pre-initialised every series (other tests
+    # in this process may have counted some since, so only presence is
+    # checked here).
+    assert ("gmail", "removal", "error") in observability.connector_revoke_total._values
+    # A fresh process: no event counted yet.
+    for counter in counters:
+        monkeypatch.setattr(counter, "_values", {})
+    observability.preinitialise_connector_security_counters(
+        PERSONAL_PROVIDERS, SHARE_REFUSED_RESOURCE_TYPES
+    )
+    monkeypatch.setattr(main.settings, "metrics_token", "")
+    client = TestClient(main.app)
+
+    before = client.get("/metrics").text
+    for line in (
+        'ecc_connector_revoke_total{provider="gmail",site="removal",result="error"} 0.0',
+        'ecc_connector_revoke_total{provider="gmail",site="adapter_callback",'
+        'result="skipped_unsafe"} 0.0',
+        'ecc_connector_enrollment_refused_total{provider="gmail",reason="identity_mismatch"} 0.0',
+        'ecc_connector_enrollment_refused_total{provider="gmail",'
+        'reason="owned_by_another_member"} 0.0',
+        'ecc_connector_access_denied_total{provider="gmail",route="disable"} 0.0',
+        'ecc_personal_data_share_refused_total{resource_type="connector_accounts",'
+        'path="transfer"} 0.0',
+        'ecc_gmail_refresh_rejected_total{error="invalid_grant",since_reconnect="gt_24h"} 0.0',
+    ):
+        assert line in before.splitlines()
+    assert len(observability.connector_revoke_total._values) == len(PERSONAL_PROVIDERS) * len(
+        get_args(observability.RevokeSite)
+    ) * len(get_args(observability.RevokeResult))
+    assert len(observability.gmail_refresh_rejected_total._values) == len(
+        get_args(observability.GmailRefreshRejectedError)
+    ) * len(get_args(observability.GmailRefreshSinceReconnect))
+    assert len(observability.personal_data_share_refused_total._values) == len(
+        SHARE_REFUSED_RESOURCE_TYPES
+    ) * len(get_args(observability.PersonalDataSharePath))
+    # Unbounded labels are never pre-initialised: no engineering provider.
+    assert 'provider="github"' not in before
+
+    observability.record_connector_revoke("gmail", "removal", "error")
+    observability.record_gmail_refresh_rejected("invalid_grant", "gt_24h")
+    # Pre-initialising again (ecc.main reload) never lowers a counted value.
+    observability.preinitialise_connector_security_counters(
+        PERSONAL_PROVIDERS, SHARE_REFUSED_RESOURCE_TYPES
+    )
+
+    after = client.get("/metrics").text.splitlines()
+    assert 'ecc_connector_revoke_total{provider="gmail",site="removal",result="error"} 1.0' in after
+    assert (
+        'ecc_gmail_refresh_rejected_total{error="invalid_grant",since_reconnect="gt_24h"} 1.0'
+        in after
+    )
+    assert 'ecc_connector_revoke_total{provider="gmail",site="removal",result="ok"} 0.0' in after

@@ -488,20 +488,13 @@ def _mutate_commitment(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session,
-            auth,
-            idempotency_key,
-            req_hash,
-            domain="commitments",
-            response_model=CommitmentResponse,
-        )
-        if cached is not None:
-            return cached
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. Ahead of the
+        # idempotency cache too: a caller who has since lost access (removed,
+        # suspended, demoted, or no longer able to see the row) must not have
+        # a cached success replayed to them.
         current = _get_row(session, auth, commitment_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="COMMITMENT_NOT_FOUND")
@@ -513,6 +506,21 @@ def _mutate_commitment(
             session, auth, resource_type="commitments", resource_id=commitment_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+        # After authz, before the version/state checks: a same-key replay of a
+        # successful update finds the version already bumped and must get
+        # the cached 200, not a 409.
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="commitments",
+            response_model=CommitmentResponse,
+        )
+        if cached is not None:
+            return cached
+
         _check_version(current, payload.expected_version)
         if current["archived_at"] is not None:
             raise HTTPException(status_code=409, detail="COMMITMENT_ARCHIVED")
@@ -613,10 +621,36 @@ def lifecycle_write(
     scheme; nesting a second `session.begin()` here would raise) -- mirrors
     `insert_commitment`'s own precedent exactly.
     """
+    current = _lock_authorized_row(session, auth, commitment_id)
+    return _apply_lifecycle(
+        session,
+        auth,
+        current,
+        commitment_id,
+        action,
+        expected_version=expected_version,
+        reason=reason,
+        request_id=request_id,
+        correlation_id=correlation_id,
+        idempotency_key=idempotency_key,
+        now=now,
+    )
+
+
+def _lock_authorized_row(
+    session: Session, auth: AuthContext, commitment_id: UUID
+) -> dict[str, Any]:
+    """Lock the commitment row and run the read (404) and write (403)
+    checks against it, returning the locked row. Split out of
+    `lifecycle_write` so `_lifecycle` can authorize before reading its
+    idempotency cache."""
     # Lock before authorizing: an ownership transfer that commits while
     # this request waits on the row lock must be seen by the checks below
     # (READ COMMITTED: each later statement reads the committed row), not
-    # by checks that ran against the pre-transfer row.
+    # by checks that ran against the pre-transfer row. Ahead of the
+    # idempotency cache too (see `_lifecycle`): a caller who has since lost
+    # access (removed, suspended, demoted, or no longer able to see the
+    # commitment) must not have a cached success replayed to them.
     current = _get_row(session, auth, commitment_id, for_update=True)
     if current is None:
         raise HTTPException(status_code=404, detail="COMMITMENT_NOT_FOUND")
@@ -628,6 +662,25 @@ def lifecycle_write(
         session, auth, resource_type="commitments", resource_id=commitment_id, action="write"
     ):
         raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+    return current
+
+
+def _apply_lifecycle(
+    session: Session,
+    auth: AuthContext,
+    current: dict[str, Any],
+    commitment_id: UUID,
+    action: Literal["confirm", "fulfil", "cancel", "break", "archive", "restore"],
+    *,
+    expected_version: int,
+    reason: str | None,
+    request_id: UUID,
+    correlation_id: UUID,
+    idempotency_key: str,
+    now: datetime,
+) -> CommitmentResponse:
+    """`lifecycle_write`'s guards, row write and audit/outbox emission, run
+    against a row `_lock_authorized_row` already locked and authorized."""
     _check_version(current, expected_version)
 
     target_reached = (
@@ -757,6 +810,10 @@ def _lifecycle(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
+        current = _lock_authorized_row(session, auth, commitment_id)
+        # After authz, before the version/state checks: a same-key replay of a
+        # successful transition finds the version already bumped and must get
+        # the cached 200, not a 409.
         cached = load_cached(
             session,
             auth,
@@ -767,9 +824,10 @@ def _lifecycle(
         )
         if cached is not None:
             return cached
-        response = lifecycle_write(
+        response = _apply_lifecycle(
             session,
             auth,
+            current,
             commitment_id,
             action,
             expected_version=payload.expected_version,

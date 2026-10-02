@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { ApiError, apiRequest } from '../../api/client'
+import { apiRequest } from '../../api/client'
 import { isStale, statusPanelClass } from '../../lib/connectorStatus'
 import { useWizardStepFocus } from '../../lib/wizardFocus'
 import RecommendationPanel from '../governance/RecommendationPanel'
 import type { ConnectorAccount, ConnectorAccountListResponse, SyncRun, SyncRunListResponse } from '../engineering/types'
-import { personalErrorMessage, formatTimestamp } from './errors'
+import { gmailOAuthReturnErrorMessage, personalErrorMessage, formatTimestamp } from './errors'
 import { DOMAIN_LABELS } from './types'
 import type {
   DomainListResponse,
@@ -215,7 +215,11 @@ export default function GmailPanel() {
         method: 'POST',
         body: { run_type: neverSynced || since ? 'backfill' : 'incremental', resource_type: 'message', since },
       }),
-    onSuccess: refresh,
+    // `onSettled`, not `onSuccess`: a refused sync (e.g. 403 `MEMBERSHIP_
+    // INACTIVE`, which also closes the reserved run as `failed`, or a consent
+    // withdrawn mid-sync) still changed connector and run state server-side,
+    // so the panel must refetch it rather than keep showing the old status.
+    onSettled: refresh,
   })
 
   const disconnectMutation = useMutation({
@@ -253,7 +257,7 @@ export default function GmailPanel() {
       ) : null}
       {oauthReturn?.kind === 'error' ? (
         <div role="alert" className="inline-status error-panel">
-          {personalErrorMessage(new ApiError(0, oauthReturn.code, oauthReturn.code))}
+          {gmailOAuthReturnErrorMessage(oauthReturn.code)}
         </div>
       ) : null}
 
@@ -349,7 +353,7 @@ export default function GmailPanel() {
           <ul className="work-list">
             <li>
               <strong>Message metadata</strong>
-              <small>Subjects, senders, timestamps and thread structure, synced automatically once connected.</small>
+              <small>Subjects, senders, timestamps and thread structure, fetched each time you run a sync -- nothing syncs in the background.</small>
             </li>
             <li>
               <strong>Message bodies</strong>

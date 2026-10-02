@@ -251,6 +251,9 @@ _SHARE_REFUSED_STATEMENTS: Final[dict[str, str]] = {
         for table, fragment in PERSONAL_DERIVED_PREDICATES.items()
     },
 }
+# Every `resource_type` a share refusal can carry (the label set of
+# `ecc_personal_data_share_refused_total`, pre-initialised by `ecc.main`).
+SHARE_REFUSED_RESOURCE_TYPES: Final[frozenset[str]] = frozenset(_SHARE_REFUSED_STATEMENTS)
 
 # `owner_id` of a personal-data row by id (no row -> not personal data).
 _PERSONAL_OWNER_STATEMENTS: Final[dict[str, str]] = {
@@ -780,10 +783,14 @@ def personal_data_share_guard(
 # `resolve_or_create_person`, `fetch_and_store_body`); action detection's
 # evidence write (`personal/gmail_action_detection`) and, opt-in via
 # `require_active_actor=True`, its `ai_runs`/`ai_run_steps` persist
-# (`ai_runtime/runtime._persist_terminal`) and recommendation insert
+# (`ai_runtime/runtime._persist_terminal`; personal insight generation
+# opts in too) and recommendation insert
 # (`governance/recommendation_mutations.create_recommendation`, through
 # `authz.lock_membership_for_write` as for every caller, raising
-# `MembershipInactiveError` for an inactive actor); ownership transfer
+# `MembershipInactiveError` for an inactive actor); the automation
+# scheduler's fire transaction (`automation/scheduler.run_scheduler_once`,
+# before the trigger row lock, guarding `enqueue_run`'s creator check);
+# ownership transfer
 # (`platform/authz_grants`); and every authorized write transaction in the modules below, through
 # `authz.lock_membership_for_write`, which can also re-check the caller's
 # role under the lock (ADR-0014; adopted module by module, each set guarded

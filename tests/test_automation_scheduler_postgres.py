@@ -38,6 +38,7 @@ Covers, per this task's own required minimum:
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -48,7 +49,9 @@ from uuid import UUID, uuid4
 
 import pytest
 from identity_fixtures import create_identity
+from membership_lock_race_support import membership_waiters
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
 from ecc.auth import AuthContext
 from ecc.config import get_settings
@@ -58,6 +61,7 @@ from ecc.domains.automation import scheduler as automation_scheduler
 from ecc.domains.automation import triggers as automation_triggers
 from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
+from ecc.platform.connector_security import membership_mutation_lock_key
 
 settings = get_settings()
 pytestmark = pytest.mark.skipif(
@@ -926,3 +930,136 @@ def test_scheduler_never_writes_a_run_into_the_wrong_workspace(
     finally:
         with engine.begin() as connection:
             connection.execute(text("DELETE FROM workspaces WHERE id = :id"), {"id": workspace_b})
+
+
+# ---------------------------------------------------------------------------
+# Membership lock (ADR-0014): a removal racing the fire transaction.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("remove", [True, False])
+def test_scheduled_fire_waits_on_membership_lock_and_rechecks_the_creator(
+    scheduler_test_context: tuple[UUID, UUID], remove: bool
+) -> None:
+    """A removal holds the membership lock exclusively and removes the
+    trigger's creator; the scheduler's fire transaction takes the shared
+    side first, so it waits (observed via `pg_blocking_pids` scoped to the
+    holder), then sees the committed removal and enqueues nothing. Without
+    the lock it would enqueue a run for the removed member after the
+    removal's own run cancellation had already swept. Control
+    (`remove=False`): the same wait still fires the run."""
+    workspace_id, user_id = scheduler_test_context
+    workflow_id = f"test.sched-memlock.{uuid4().hex}"
+    _publish_workflow(workspace_id, user_id, workflow_id)
+    trigger = _create_schedule_trigger(
+        workspace_id, user_id, workflow_id, schedule_expression="0 * * * *", timezone="UTC"
+    )
+    _set_created_at(trigger.id, datetime(2026, 3, 1, 0, 0, tzinfo=UTC))
+    tick_now = datetime(2026, 3, 1, 1, 30, tzinfo=UTC)
+
+    with ThreadPoolExecutor(max_workers=1) as pool, engine.connect() as holder:
+        holder_tx = holder.begin()
+        try:
+            holder_pid = int(holder.execute(text("SELECT pg_backend_pid()")).scalar_one())
+            holder.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                {"key": membership_mutation_lock_key(workspace_id)},
+            )
+            if remove:
+                holder.execute(
+                    text(
+                        "UPDATE workspace_memberships SET status = 'removed', "
+                        "removed_at = now() WHERE workspace_id = :ws AND users_id = :u"
+                    ),
+                    {"ws": workspace_id, "u": user_id},
+                )
+            tick = pool.submit(
+                automation_scheduler.run_scheduler_once, SessionFactory, now=tick_now
+            )
+            deadline = time.monotonic() + 15
+            while membership_waiters(holder_pid) < 1:
+                assert not tick.done(), f"tick finished without waiting: {tick.result()}"
+                assert time.monotonic() < deadline, "tick never waited on the membership lock"
+                time.sleep(0.05)
+            holder_tx.commit()
+        finally:
+            if holder_tx.is_active:
+                holder_tx.rollback()
+        outcomes = tick.result(timeout=15)
+
+    mine = [o for o in outcomes if getattr(o, "trigger_id", None) == trigger.id]
+    with engine.connect() as connection:
+        runs = connection.execute(
+            text("SELECT count(*) FROM workflow_runs WHERE workspace_id = :ws"),
+            {"ws": workspace_id},
+        ).scalar_one()
+    if remove:
+        assert [type(o) for o in mine] == [automation_scheduler.TriggerFireFailedActorInactive]
+        assert runs == 0
+    else:
+        assert [type(o) for o in mine] == [automation_scheduler.TriggerFired]
+        assert runs == 1
+
+
+def test_fire_transaction_db_error_defers_the_trigger_without_stopping_the_tick(
+    scheduler_test_context: tuple[UUID, UUID], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fire transaction that fails with an `OperationalError` (e.g. its
+    membership-lock wait hitting the statement timeout behind a long
+    removal) rolls back whole and is reported as `TriggerFireDeferred`:
+    no run, anchor unchanged, and the tick still fires the next due trigger
+    instead of raising. The next tick fires the deferred occurrence."""
+    workspace_id, user_id = scheduler_test_context
+    workflow_id = f"test.sched-deferred.{uuid4().hex}"
+    _publish_workflow(workspace_id, user_id, workflow_id)
+    triggers = [
+        _create_schedule_trigger(
+            workspace_id, user_id, workflow_id, schedule_expression="0 * * * *", timezone="UTC"
+        )
+        for _ in range(2)
+    ]
+    for trigger in triggers:
+        _set_created_at(trigger.id, datetime(2026, 3, 1, 0, 0, tzinfo=UTC))
+    tick_now = datetime(2026, 3, 1, 1, 30, tzinfo=UTC)
+    original = automation_scheduler.lock_membership_shared
+    failed: list[bool] = []
+
+    def time_out_once(session: Any, ws: UUID) -> None:
+        if ws == workspace_id and not failed:
+            failed.append(True)
+            raise OperationalError("SELECT pg_advisory_xact_lock_shared", {}, Exception("timeout"))
+        original(session, ws)
+
+    monkeypatch.setattr(automation_scheduler, "lock_membership_shared", time_out_once)
+    outcomes = automation_scheduler.run_scheduler_once(SessionFactory, now=tick_now)
+    mine = {
+        o.trigger_id: type(o)
+        for o in outcomes
+        if getattr(o, "trigger_id", None) in {t.id for t in triggers}
+    }
+    assert sorted(mine.values(), key=lambda t: t.__name__) == [
+        automation_scheduler.TriggerFireDeferred,
+        automation_scheduler.TriggerFired,
+    ]
+    deferred = next(
+        t for t, kind in mine.items() if kind is automation_scheduler.TriggerFireDeferred
+    )
+    with engine.connect() as connection:
+        assert (
+            connection.execute(
+                text("SELECT last_fired_at FROM triggers WHERE id = :id"), {"id": deferred}
+            ).scalar_one()
+            is None
+        )
+        assert (
+            connection.execute(
+                text("SELECT count(*) FROM workflow_runs WHERE trigger_ref = :ref"),
+                {"ref": f"schedule:{deferred}"},
+            ).scalar_one()
+            == 0
+        )
+
+    retry = automation_scheduler.run_scheduler_once(SessionFactory, now=tick_now)
+    assert [type(o) for o in retry if getattr(o, "trigger_id", None) == deferred] == [
+        automation_scheduler.TriggerFired
+    ]

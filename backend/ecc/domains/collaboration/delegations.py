@@ -742,11 +742,6 @@ def create_delegation_endpoint(
         # role gate proper is `authorize(..., "write")` on the obligation.
         authz.lock_membership_for_write(session, auth, role_action="read")
         idempotency.lock_idempotency(session, auth, idempotency_key)
-        cached = idempotency.load_cached(
-            session, auth, idempotency_key, request_hash, domain="collaboration_delegations"
-        )
-        if cached is not None:
-            return DelegationResponse.model_validate(cached)
 
         delegator_account_id = _account_id_for(
             session, workspace_id=auth.workspace_id, users_id=auth.user_id
@@ -785,6 +780,16 @@ def create_delegation_endpoint(
             action="write",
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+        # The idempotency cache is read only after the locked obligation
+        # checks above: a caller who has since lost access to the obligation
+        # (demoted to `viewer`, an ownership transfer, a revoked grant) must
+        # not have a cached proposal replayed to them.
+        cached = idempotency.load_cached(
+            session, auth, idempotency_key, request_hash, domain="collaboration_delegations"
+        )
+        if cached is not None:
+            return DelegationResponse.model_validate(cached)
 
         recipient_membership = (
             session.execute(
@@ -1010,11 +1015,6 @@ def accept_delegation_endpoint(
         # Party-gated, not role-gated: any active member (ADR-0014).
         authz.lock_membership_for_write(session, auth, role_action="read")
         idempotency.lock_idempotency(session, auth, idempotency_key)
-        cached = idempotency.load_cached(
-            session, auth, idempotency_key, request_hash, domain="collaboration_delegations"
-        )
-        if cached is not None:
-            return DelegationResponse.model_validate(cached)
 
         account_id = _account_id_for(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
         row = _get_delegation(session, auth.workspace_id, delegation_id)
@@ -1026,6 +1026,16 @@ def accept_delegation_endpoint(
         row = _maybe_expire_single(session, workspace_id=auth.workspace_id, delegation=row, now=now)
         if row["recipient_account_id"] != account_id:
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        # Cache after the party checks, before the state check: a same-key
+        # replay finds the delegation already transitioned and must get the
+        # cached 200, not a 409. (The parties never change and the membership
+        # lock above already requires an active member, so this is defense
+        # in depth: no replay is served without the endpoint's own checks.)
+        cached = idempotency.load_cached(
+            session, auth, idempotency_key, request_hash, domain="collaboration_delegations"
+        )
+        if cached is not None:
+            return DelegationResponse.model_validate(cached)
         if row["status"] != "proposed":
             raise HTTPException(status_code=409, detail="DELEGATION_NOT_PROPOSED")
 
@@ -1116,11 +1126,6 @@ def reject_delegation_endpoint(
         # Party-gated, not role-gated: any active member (ADR-0014).
         authz.lock_membership_for_write(session, auth, role_action="read")
         idempotency.lock_idempotency(session, auth, idempotency_key)
-        cached = idempotency.load_cached(
-            session, auth, idempotency_key, request_hash, domain="collaboration_delegations"
-        )
-        if cached is not None:
-            return DelegationResponse.model_validate(cached)
 
         account_id = _account_id_for(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
         row = _get_delegation(session, auth.workspace_id, delegation_id)
@@ -1132,6 +1137,13 @@ def reject_delegation_endpoint(
         row = _maybe_expire_single(session, workspace_id=auth.workspace_id, delegation=row, now=now)
         if row["recipient_account_id"] != account_id:
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        # Cache after the party checks, before the state check -- see
+        # accept_delegation_endpoint.
+        cached = idempotency.load_cached(
+            session, auth, idempotency_key, request_hash, domain="collaboration_delegations"
+        )
+        if cached is not None:
+            return DelegationResponse.model_validate(cached)
         if row["status"] != "proposed":
             raise HTTPException(status_code=409, detail="DELEGATION_NOT_PROPOSED")
 
@@ -1202,11 +1214,6 @@ def revoke_delegation_endpoint(
         # Party-gated, not role-gated: any active member (ADR-0014).
         authz.lock_membership_for_write(session, auth, role_action="read")
         idempotency.lock_idempotency(session, auth, idempotency_key)
-        cached = idempotency.load_cached(
-            session, auth, idempotency_key, request_hash, domain="collaboration_delegations"
-        )
-        if cached is not None:
-            return DelegationResponse.model_validate(cached)
 
         account_id = _account_id_for(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
         row = _get_delegation(session, auth.workspace_id, delegation_id)
@@ -1217,6 +1224,13 @@ def revoke_delegation_endpoint(
             raise HTTPException(status_code=404, detail="DELEGATION_NOT_FOUND")
         if row["delegator_account_id"] != account_id:
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        # Cache after the party checks, before the state check -- see
+        # accept_delegation_endpoint.
+        cached = idempotency.load_cached(
+            session, auth, idempotency_key, request_hash, domain="collaboration_delegations"
+        )
+        if cached is not None:
+            return DelegationResponse.model_validate(cached)
         # No lazy-expiry check here -- revoke is only ever valid from
         # `accepted`, a state `_maybe_expire_single` never transitions out
         # of (it only ever touches `proposed`).
@@ -1297,11 +1311,6 @@ def complete_delegation_endpoint(
         # Party-gated, not role-gated: any active member (ADR-0014).
         authz.lock_membership_for_write(session, auth, role_action="read")
         idempotency.lock_idempotency(session, auth, idempotency_key)
-        cached = idempotency.load_cached(
-            session, auth, idempotency_key, request_hash, domain="collaboration_delegations"
-        )
-        if cached is not None:
-            return DelegationResponse.model_validate(cached)
 
         account_id = _account_id_for(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
         row = _get_delegation(session, auth.workspace_id, delegation_id)
@@ -1312,6 +1321,13 @@ def complete_delegation_endpoint(
             raise HTTPException(status_code=404, detail="DELEGATION_NOT_FOUND")
         if row["recipient_account_id"] != account_id:
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        # Cache after the party checks, before the state check -- see
+        # accept_delegation_endpoint.
+        cached = idempotency.load_cached(
+            session, auth, idempotency_key, request_hash, domain="collaboration_delegations"
+        )
+        if cached is not None:
+            return DelegationResponse.model_validate(cached)
         if row["status"] != "accepted":
             raise HTTPException(status_code=409, detail="DELEGATION_NOT_ACCEPTED")
 

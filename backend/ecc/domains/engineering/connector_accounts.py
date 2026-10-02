@@ -1566,9 +1566,9 @@ def _run_connector_sync(
     pre-checks itself, and passes `authorize_route` so the authoritative
     check (`_locked_connector_denial`) is re-run here in phase 1 on the
     locked account row, before anything is written or the adapter is
-    called. `_run_auto_backfill`'s call passes none: it has no separate
-    actor to authorize against, only the same one who just created the
-    connector account this call is for.
+    called. `_run_auto_backfill` passes it too, for the account's creator:
+    its resource types run one after another, and an ownership or grant
+    change that commits during one of them must stop the rest.
     """
     # --- Phase 1: validate, reserve the run, read the cursor -------------
     with session.begin():
@@ -1605,15 +1605,6 @@ def _run_connector_sync(
             raise _membership_inactive_skip(account_id, 1) from None
         if idempotency is not None:
             lock_idempotency(session, auth, idempotency.key)
-            cached = load_cached(
-                session,
-                auth,
-                idempotency.key,
-                idempotency.req_hash,
-                domain="engineering_connector_account",
-            )
-            if cached is not None:
-                return SyncRunResponse.model_validate(cached)
 
         # `for_update=True`: locks this account's row for this short
         # transaction, serializing a second concurrent `/sync` call for the
@@ -1635,6 +1626,22 @@ def _run_connector_sync(
             denial = _locked_connector_denial(session, auth, account, authorize_route)
             if denial is not None:
                 raise SyncSkipped(denial[1], denial[0])
+        # The idempotency cache is read only after the locked checks above:
+        # the endpoint's pre-checks ran in an earlier, rolled-back
+        # transaction, so a caller who lost access since (demoted, a
+        # transfer, a revoked grant) must not have a cached run replayed to
+        # them. Before the status check: a replay must still get its cached
+        # response after the account was disconnected.
+        if idempotency is not None:
+            cached = load_cached(
+                session,
+                auth,
+                idempotency.key,
+                idempotency.req_hash,
+                domain="engineering_connector_account",
+            )
+            if cached is not None:
+                return SyncRunResponse.model_validate(cached)
         if account.status == "disconnected":
             raise SyncSkipped("CONNECTOR_DISCONNECTED", 409)
         # The personal connector's owner too (still under the shared lock
@@ -2437,6 +2444,17 @@ def _run_auto_backfill(
                 now=datetime.now(UTC),
                 idempotency=None,
                 source="system",
+                # Re-authorize the creator on the locked row in every
+                # resource type's phase 1: these runs are sequential and
+                # each calls the provider, so an ownership, visibility,
+                # grant or role change that removes the creator's access
+                # and commits during one type's sync must stop the types
+                # after it, not let them keep running. A denial is
+                # a `SyncSkipped`, logged below like every other skip.
+                # The route label only reaches the personal-connector
+                # metric, and no `PERSONAL_PROVIDERS` member auto-
+                # backfills (`_AUTO_SYNC_RESOURCE_TYPES`).
+                authorize_route="sync",
             )
         except SyncSkipped as exc:
             _logger.info(
@@ -2983,7 +3001,11 @@ def _lock_and_authorize_suggestion_candidates(
             f"SELECT id FROM {table} WHERE workspace_id = :workspace_id "  # noqa: S608 -- see docstring
             f"AND ({visibility_sql}) "
             "AND suggested_team_name = :suggested_team_name "
-            "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL FOR UPDATE"
+            # `ORDER BY id`: the same per-table lock order the replay check
+            # (`_reauthorized_team_suggestion_replay`) uses, so two requests
+            # locking overlapping rows cannot deadlock.
+            "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL "
+            "ORDER BY id FOR UPDATE"
         ),
         {
             "workspace_id": auth.workspace_id,
@@ -3009,6 +3031,56 @@ _TEAM_SUGGESTION_TABLES: tuple[
 )
 
 
+def _reauthorized_team_suggestion_replay(
+    session: Session, auth: AuthContext, cached: dict[str, Any]
+) -> TeamSuggestionActionResponse:
+    """Serves a team-suggestion bulk action's idempotent replay only if the
+    caller could still have produced it: `write` on every row it reported
+    `updated` and `read` on every row it reported `skipped_unauthorized`
+    (the same per-row checks `_lock_and_authorize_suggestion_candidates`
+    ran the first time), else `403 INSUFFICIENT_ROLE` with nothing written.
+    The bulk endpoints' membership lock only requires an active member, and
+    a `viewer` (or a caller who lost a row to a transfer or a revoked grant)
+    re-running the action fresh would just see those rows skipped or no
+    longer listed -- so the cached success must not be replayed to them.
+
+    The rows are named by the cached response itself (the caller's own ids
+    from the first request), so they are locked `FOR SHARE` -- by id, one
+    table at a time in `_TEAM_SUGGESTION_TABLES` order, as the first request
+    locked them -- before authorizing, so a transfer that commits during the
+    wait is seen. A row that no longer exists fails the check too.
+    """
+    response = TeamSuggestionActionResponse.model_validate(cached)
+    ids = [*response.updated, *response.skipped_unauthorized]
+    if not ids:
+        return response
+    table_of: dict[UUID, Literal["repositories", "engineering_work_items"]] = {}
+    for table, _aggregate_type, _event_type in _TEAM_SUGGESTION_TABLES:
+        for (row_id,) in session.execute(
+            text(
+                f"SELECT id FROM {table} WHERE workspace_id = :workspace_id "  # noqa: S608 -- table from _TEAM_SUGGESTION_TABLES
+                "AND id = ANY(:ids) ORDER BY id FOR SHARE"
+            ),
+            {"workspace_id": auth.workspace_id, "ids": ids},
+        ):
+            table_of[row_id] = table
+    checks: list[tuple[UUID, authz.Action]] = [
+        *((row_id, "write") for row_id in response.updated),
+        *((row_id, "read") for row_id in response.skipped_unauthorized),
+    ]
+    for row_id, action in checks:
+        row_table = table_of.get(row_id)
+        if row_table is None or not authz.authorize(
+            session,
+            auth,
+            resource_type=row_table,
+            resource_id=row_id,
+            action=action,
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+    return response
+
+
 @router.post("/team-suggestions/confirm", response_model=TeamSuggestionActionResponse)
 def confirm_team_suggestion_endpoint(
     payload: TeamSuggestionConfirmRequest,
@@ -3028,15 +3100,18 @@ def confirm_team_suggestion_endpoint(
     req_hash = request_hash(payload, "confirm_team_suggestion")
     now = datetime.now(UTC)
     with session.begin():
-        authz.lock_membership_for_write(session, auth)
+        authz.lock_membership_for_write(session, auth, role_action="read")
         lock_idempotency(session, auth, idempotency_key)
+        # The team entity is re-checked ahead of the idempotency cache, and a
+        # cached response is served only once its rows re-authorize: a
+        # caller who has since lost access to the team or the rows must not
+        # have a cached success replayed to them.
+        _validate_team_entity(session, auth, payload.team_entity_id)
         cached = load_cached(
             session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
         )
         if cached is not None:
-            return TeamSuggestionActionResponse.model_validate(cached)
-
-        _validate_team_entity(session, auth, payload.team_entity_id)
+            return _reauthorized_team_suggestion_replay(session, auth, cached)
 
         updated: list[UUID] = []
         skipped: list[UUID] = []
@@ -3119,13 +3194,14 @@ def dismiss_team_suggestion_endpoint(
     req_hash = request_hash(payload, "dismiss_team_suggestion")
     now = datetime.now(UTC)
     with session.begin():
-        authz.lock_membership_for_write(session, auth)
+        authz.lock_membership_for_write(session, auth, role_action="read")
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
             session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
         )
         if cached is not None:
-            return TeamSuggestionActionResponse.model_validate(cached)
+            # See confirm_team_suggestion_endpoint.
+            return _reauthorized_team_suggestion_replay(session, auth, cached)
 
         updated: list[UUID] = []
         skipped: list[UUID] = []

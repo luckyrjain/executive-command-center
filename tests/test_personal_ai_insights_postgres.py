@@ -19,7 +19,7 @@ Covers:
 """
 
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import new
@@ -186,7 +186,10 @@ def _enable_and_grant_habits(
 
 
 def _mock_adapter_citing(
-    record_id: UUID, *, professional_referral_note: str | None = None
+    record_id: UUID,
+    *,
+    professional_referral_note: str | None = None,
+    on_request: Callable[[], None] | None = None,
 ) -> OllamaAdapter:
     payload = {
         "kind": "trend",
@@ -201,6 +204,8 @@ def _mock_adapter_citing(
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if on_request is not None:
+            on_request()
         body = (
             json.dumps(
                 {
@@ -303,6 +308,55 @@ def test_generate_insight_happy_path_persists_insight(
             )
         assert row["kind"] == "trend"
         assert row["professional_referral_note"] is None
+    finally:
+        get_settings.cache_clear()
+
+
+def test_generate_insight_removed_during_model_call_persists_no_run(
+    personal_test_context: tuple[TestClient, UUID, UUID, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The caller is removed while the model call runs (ADR-0014). The run's
+    terminal persist re-checks membership under the shared lock
+    (`require_active_actor=True`) and writes nothing: 403, and neither an
+    `ai_runs` row nor an insight is left behind."""
+    monkeypatch.setenv("ECC_PERSONAL_AI_INSIGHT_GENERATION_ENABLED", "true")
+    get_settings.cache_clear()
+    try:
+        client, workspace_id, owner_id, token = personal_test_context
+        record_id = _enable_and_grant_habits(
+            client, token, workspace_id=workspace_id, owner_id=owner_id
+        )
+
+        def remove_caller() -> None:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE workspace_memberships SET status = 'removed', "
+                        "removed_at = now() WHERE workspace_id = :ws AND users_id = :u"
+                    ),
+                    {"ws": workspace_id, "u": owner_id},
+                )
+
+        model = _mock_adapter_citing(record_id, on_request=remove_caller)
+        app.dependency_overrides[get_ollama_adapter] = lambda: model
+        try:
+            resp = client.post(
+                "/api/v1/personal/insights/generate",
+                json={"source_domain_keys": ["habits"]},
+                headers=_headers(token, str(uuid4())),
+            )
+        finally:
+            app.dependency_overrides.pop(get_ollama_adapter, None)
+
+        assert resp.status_code == 403, resp.text
+        assert resp.json()["error"]["code"] == "INSUFFICIENT_ROLE"
+        with engine.connect() as connection:
+            for table in ("ai_runs", "personal_insights"):
+                count = connection.execute(
+                    text(f"SELECT count(*) FROM {table} WHERE workspace_id = :ws"),  # noqa: S608
+                    {"ws": workspace_id},
+                ).scalar_one()
+                assert count == 0, table
     finally:
         get_settings.cache_clear()
 

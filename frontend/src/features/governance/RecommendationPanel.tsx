@@ -3,7 +3,6 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ApiError, apiRequest } from '../../api/client'
 import { apiErrorMessage } from '../../api/errorMessage'
 import type { EvidenceItem } from '../knowledge/types'
-import { EMAIL_CONSENT_NOT_ACTIVE_MESSAGE } from '../personal/errors'
 
 type RecommendationStatus =
   | 'proposed'
@@ -136,8 +135,13 @@ export function recommendationErrorMessage(error: unknown): string {
     VERSION_CONFLICT: 'This recommendation changed while you were reviewing it. The latest version has been reloaded.',
     TARGET_VERSION_CONFLICT: 'This recommendation changed while you were reviewing it. The latest version has been reloaded.',
     // Confirming an email-derived recommendation re-checks the mailbox
-    // owner's email consent (403 when it was withdrawn).
-    EMAIL_CONSENT_NOT_ACTIVE: `${EMAIL_CONSENT_NOT_ACTIVE_MESSAGE} This recommendation came from email, so it cannot be confirmed until email consent is granted again.`,
+    // owner's state (`gmail_shared.require_email_consent_locked`), not the
+    // confirmer's: 403 when that owner's email consent was withdrawn OR
+    // their Gmail connector is disconnected (e.g. the owner was removed).
+    // Re-enabling Email alone fixes neither (withdrawal already ran the
+    // cascade, which deletes pending email recommendations, and re-enabling
+    // does not reconnect Gmail), so no remedy is offered.
+    EMAIL_CONSENT_NOT_ACTIVE: "This recommendation came from a member's email, and that member's email consent was withdrawn or their Gmail connection was disconnected, so it can no longer be confirmed, and it may no longer be available.",
   })
 }
 

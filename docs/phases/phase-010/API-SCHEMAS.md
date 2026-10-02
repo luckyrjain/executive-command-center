@@ -2,9 +2,9 @@
 id: PHASE-010-API-SCHEMAS
 title: Phase 10 Gmail API Schemas
 status: Approved for Implementation
-version: 1.6.0
+version: 1.7.0
 owner: Lucky Jain
-updated: 2026-09-28
+updated: 2026-10-01
 depends_on:
   - PHASE-010
   - PHASE-006-API-SCHEMAS
@@ -78,7 +78,36 @@ Response is the existing `ConnectorAccountResponse`:
 
 Errors: `403 GMAIL_OAUTH_STATE_INVALID`, `422` with `{code:
 GMAIL_OAUTH_FAILED, error: <sanitized>}`, authorization errors, or standard
-validation errors.
+validation errors. Security remediation Spec A adds the responses below.
+None of them returns row data or either email address. The four refusals
+(identity mismatch, owner conflict, membership inactive, insufficient role)
+each write a `denied` `connector_account.enrollment_refused` audit event and
+count `ecc_connector_enrollment_refused_total{provider="gmail",reason}`; the
+last two items are errors, not refusals, and write neither (see
+[Security remediation (Spec A)](#security-remediation-spec-a)):
+
+- `403 GMAIL_ACCOUNT_IDENTITY_MISMATCH` -- with
+  `ECC_GMAIL_REQUIRE_IDENTITY_MATCH` on, the Google account's email differs
+  from the caller's ECC account email, or the caller has none (S1.1).
+- `409 CONNECTOR_OWNED_BY_ANOTHER_MEMBER` -- another member of this
+  workspace already has a connector row for this Google account, in any
+  status; it is never returned, reactivated or overwritten (S1.2, unflagged).
+- `403 MEMBERSHIP_INACTIVE` -- the caller was removed from the workspace
+  while the OAuth round trip was in flight; nothing is written (S1.11).
+- `403 INSUFFICIENT_ROLE` -- the caller was demoted below write while the
+  round trip was in flight (ADR-0014).
+- `500 CONNECTOR_ACCOUNT_PERSIST_FAILED` -- a database integrity error other
+  than the duplicate-account unique violation (previously reported as a
+  `409` duplicate); only SQLSTATE and constraint name are logged (S1.5/S1.6).
+  No `enrollment_refused` audit event and no refusal metric.
+- `409 GMAIL_ACCOUNT_ALREADY_CONNECTED` (pre-existing, not reachable in
+  practice): the conflicting row could not be re-read. No `enrollment_refused`
+  audit event and no refusal metric.
+
+On every one of these responses the just-minted Google grant is revoked only if
+`revoke_is_safe` allows it: under the default `ECC_GMAIL_REVOKE_SCOPE=global`,
+only when no non-disconnected row in any workspace uses that Google account,
+so another member's live grant is never revoked.
 
 ### `GET /api/v1/personal/gmail/oauth/complete?code=...&state=...` (later addition)
 
@@ -91,7 +120,8 @@ converting the result into a browser-usable response -- **not** JSON. A
 browser landing here is redirected (`302`) to `{ECC_FRONTEND_URL}/` with a
 query marker instead: `?gmail=connected` on success, `?gmail=error&code=
 <the same error code /oauth/callback would have returned>` on failure (state
-invalid, Google rejection, missing scope, not allowlisted). `GmailPanel.tsx`
+invalid, Google rejection, missing scope, not allowlisted, and the Spec A
+refusal codes above; an unexpected exception reports `GMAIL_OAUTH_FAILED`). `GmailPanel.tsx`
 reads and clears this marker on mount. Requires no new settings beyond
 `ECC_FRONTEND_URL` (default `http://localhost:5173`, matching
 `ECC_CORS_ORIGINS`'s own default -- a separate setting, not a reuse of that
@@ -107,10 +137,18 @@ to navigate back to the frontend manually.
 
 | Endpoint | Gmail contract |
 |---|---|
-| `GET /api/v1/engineering/connectors` | Lists authorized visible accounts; never returns credentials |
+| `GET /api/v1/engineering/connectors` | Lists authorized visible accounts; never returns credentials. With `ECC_PERSONAL_DATA_ISOLATION` on, a `gmail` connector (and its sync runs and cursors) is written `private` to its owner, so other members, including workspace owners and admins, no longer see it here or in `GET /sync-runs` / effective permissions once the backfill has run |
 | `POST /api/v1/engineering/connectors/{id}/sync` | Body `{"run_type":"backfill|incremental","resource_type":"message","since":null}`; requires `Idempotency-Key` and CSRF. `since` (Task 8, optional, defaults `null`) is `GmailAdapter.backfill`'s own "expand history" parameter (accepted since Task 1's own `connectors.py` Protocol widening -- a pure Python signature change, not a migration) finally reaching an HTTP caller -- only meaningful with `run_type: "backfill"`; `incremental_sync` has no `since` parameter at all (it resumes from `cursor` instead), so this field is silently ignored for `run_type: "incremental"` |
 | `GET /api/v1/engineering/sync-runs` | Lists redacted run outcome and item count |
 | `POST /api/v1/engineering/connectors/{id}/disable` | For every other provider: revokes the token best-effort and marks the account disconnected. For `gmail` specifically: if the account is not already `disconnected` **and** the owner has a `personal_domains` row for `email`, rejected with `409 GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT` and no mutation (Loop 2 round 1 review found this generic endpoint could otherwise disconnect a `gmail` account, and revoke its live Google grant, without running the consent revocation cascade below); an already-`disconnected` `gmail` account is unaffected by this guard and still returns the same idempotent `200` no-op as every other provider (Loop 2 round 2 review); an owner who completed the Gmail OAuth flow without ever calling `POST /domains`/`POST /consents` for `email` has no `personal_domains` row at all, so this guard falls through and the account is disconnected the same way any other provider's is -- there is nothing for the cascade to purge or revoke in that case, and without this carve-out such a connector had no HTTP-reachable way to disconnect it at all, since the domain-level endpoints 404 `DOMAIN_NOT_FOUND` for an owner with no domain row (Loop 2 round 25 review). Callers with an `email` domain must use the domain-level endpoints instead, which reach `gmail_revocation.cascade_email_revocation` |
+
+With `ECC_PERSONAL_DATA_ISOLATION` on, `sync` and `disable` on another
+member's `gmail` connector return `404 CONNECTOR_NOT_FOUND` (the same as a
+nonexistent id) and count `ecc_connector_access_denied_total{provider,route}`.
+This owner check runs before every other check, so a non-owner's `disable`
+of a Gmail connector now gets `404` where it used to get `409
+GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT`; the owner still gets the `409`.
+With the flag off, the behaviour described in the table is unchanged.
 
 Manual `webhook` sync is not accepted. A second running sync for the same
 account returns `409 CONNECTOR_SYNC_IN_PROGRESS`. Provider errors are
@@ -267,6 +305,34 @@ account whose `Idempotency-Key` is reused after it stops being
 account's OAuth reconnect, since no other provider has a way to leave
 `disconnected` once entered (Loop 2 round 27 review).
 
+## Security remediation (Spec A)
+
+Connector ownership and personal-data isolation (security remediation Spec
+A, plan tasks T01-T21 and fix wave FX1-FX6). Rollout and flags:
+`docs/runbooks/SPEC-A-ROLLOUT.md`. "Flag" means `ECC_PERSONAL_DATA_ISOLATION`
+unless stated; everything marked unflagged is live as soon as the code is
+deployed.
+
+| Endpoint | Change |
+|---|---|
+| Gmail `/oauth/callback`, `/oauth/complete` | `403 GMAIL_ACCOUNT_IDENTITY_MISMATCH` (`ECC_GMAIL_REQUIRE_IDENTITY_MATCH`), `409 CONNECTOR_OWNED_BY_ANOTHER_MEMBER` (unflagged), `403 MEMBERSHIP_INACTIVE`, `403 INSUFFICIENT_ROLE`, `500 CONNECTOR_ACCOUNT_PERSIST_FAILED` -- see the callback section above. With the flag on, a new connector is written `private` to the caller |
+| `POST /api/v1/engineering/connectors` (reactivating a `disconnected` row) | Unflagged (S1.7): a caller who cannot read the existing row gets `404 CONNECTOR_NOT_FOUND`, one who can read but not write it `403 INSUFFICIENT_ROLE` (refusal audited as `connector_account.enrollment_refused`, reasons `not_found` / `access_denied`). An integrity error other than the duplicate-account unique violation is `500 CONNECTOR_ACCOUNT_PERSIST_FAILED` instead of a `409`. The pre-existing `409 CONNECTOR_ALREADY_CONNECTED` for an active row is unchanged |
+| `GET /api/v1/engineering/connectors`, `GET /sync-runs`, effective permissions | Flag: other members' Gmail connectors, runs and cursors are hidden (private to the owner) |
+| `POST .../connectors/{id}/sync`, `.../disable` | Flag: `404 CONNECTOR_NOT_FOUND` for a non-owner of a Gmail connector (see above). Sync, unflagged: `403 MEMBERSHIP_INACTIVE`, `403 EMAIL_CONSENT_NOT_ACTIVE` (see "Sync skips") |
+| `POST /api/v1/sharing/grants`, grant preview, `POST /api/v1/ownership/transfers`, `POST /api/v1/delegations` | Flag: `400 RESOURCE_TYPE_NOT_GRANTABLE` for a personal row (a Gmail connector, its sync runs/cursors, an email attention item, an `email_action_detected` recommendation, an `email.*` AI run or step, Gmail evidence) or an email-derived row (a task/commitment/risk created by confirming an `email_action_detected` recommendation, feedback on an email recommendation or email attention item). Each refusal writes a `denied` `personal_data.share_refused` audit event and counts `ecc_personal_data_share_refused_total{resource_type,path}`. Delegation accept skips such items. The refusal applies to the row's own owner too |
+| `DELETE /api/v1/identity/workspaces/{id}/members/{user_id}` | Flag: personal and email-derived rows no longer block removal (no `409 OWNED_RESOURCES_BLOCK_REMOVAL` for them). Removal disconnects the member's Gmail connectors (revoked at Google if safe), re-owns their Gmail-only person nodes and those nodes' Gmail-derived aliases to the earliest other active workspace owner, and keeps their other Gmail-derived rows, private to them (not purged) |
+| `POST /api/v1/recommendations` | Unflagged: `422 VALIDATION_ERROR` for `recommendation_type="email_action_detected"` (reserved for the detection hook; `docs/phases/phase-001/API-SCHEMAS.md`) |
+| `POST /api/v1/recommendations/{id}/confirm` (`email_action_detected`) | Unflagged: `403 EMAIL_CONSENT_NOT_ACTIVE`, `409 RECOMMENDATION_OWNER_CHANGED`. Flag: the created task/commitment/risk is owned by the recommendation's owner and `private` |
+| Recommendations, AI runs, evidence (list, detail, resolve, delete) | Flag: email recommendations, `email.*` AI runs and their steps, and Gmail evidence are visible only to the mailbox owner (`404` to others) |
+| Knowledge readers (entity tool, retrieval, meeting prep evidence) and evidence citations (claims, relationships, risk reviews, commitments) | Flag: other members' private evidence is excluded; citing evidence the caller cannot read is rejected |
+| Global search | Unflagged: every result type is filtered by the caller's visibility |
+| Meeting prep (`/api/v1/meetings/{id}/prep`) | Unflagged: the stored pack holds only workspace-visible sources, plus a per-caller live overlay (`docs/phases/phase-003/MEETING-PREP-CONTRACT.md`) |
+| Member removal, role change | Unflagged: can return a retryable `409 MEMBERSHIP_CHANGE_BUSY` (ADR-0014) while a sync holds the membership lock during a token refresh |
+
+Unchanged on purpose: person entities and their aliases stay workspace
+knowledge (DS3), so `GET /entities` and `/entities/{id}/aliases` (which
+returns `source_id`, not content) still list Gmail correspondents.
+
 ## Planned APIs
 
 None. Task 8 -- the plan's final task -- is documented above; this section
@@ -292,3 +358,4 @@ is now closed out.
 | 1.4.2 | 2026-08-11 | Task 8 Loop 2 round 10 review: the `sync` endpoint row credited `since`'s acceptance to "migration `0069`'s Task 1 Protocol widening" -- migration `0069` is a database schema migration; the `since` parameter is a pure Python `Protocol` signature change with no accompanying migration at all. Corrected to credit Task 1's `connectors.py` widening directly, matching how this same fact is stated correctly elsewhere in this PR | Lucky Jain |
 | 1.5.0 | 2026-08-11 | Later addition: documented `GET /api/v1/personal/gmail/oauth/complete`, the real Google-facing redirect target that closes the "browser stranded on raw backend JSON" gap `/oauth/callback`'s own section already disclosed | Lucky Jain |
 | 1.6.0 | 2026-09-28 | Security Remediation FX5: documented the sync endpoint's `403 MEMBERSHIP_INACTIVE` and `403 EMAIL_CONSENT_NOT_ACTIVE` skips (run closed `failed`, cursor not advanced, no outcome/audit writes), replacing the previous `201` failed/partial/succeeded outcomes | Lucky Jain |
+| 1.7.0 | 2026-10-01 | Security Remediation Spec A (T19; review fix: only the four refusals write `enrollment_refused`, not `CONNECTOR_ACCOUNT_PERSIST_FAILED` / `GMAIL_ACCOUNT_ALREADY_CONNECTED`): documented the callback refusals (`GMAIL_ACCOUNT_IDENTITY_MISMATCH`, `CONNECTOR_OWNED_BY_ANOTHER_MEMBER`, `MEMBERSHIP_INACTIVE`, `INSUFFICIENT_ROLE`, `CONNECTOR_ACCOUNT_PERSIST_FAILED`), engineering reactivation `404`/`403`, the non-owner Gmail `sync`/`disable` `404` (was `409` for `disable`), and a Spec A summary table across sharing, removal, recommendations, readers, search and meeting prep | Lucky Jain |

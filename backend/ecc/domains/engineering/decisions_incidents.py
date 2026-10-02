@@ -448,17 +448,26 @@ def resolve_incident_endpoint(
     now = datetime.now(UTC)
     with session.begin():
         authz.lock_membership_for_write(session, auth)
+        # Fast-fail, not authoritative: a caller who cannot see the incident
+        # (or a nonexistent id) gets its 404 before taking the idempotency or
+        # row lock, so never queues behind -- or times -- a writer holding
+        # the row. (The membership lock above is workspace-wide and shared;
+        # it waits only on a pending member removal -- and so, transitively,
+        # on the writers that removal waits for -- never on this row.) The
+        # read/write checks after the row lock below still decide.
+        if not authz.authorize(
+            session, auth, resource_type="incidents", resource_id=incident_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="INCIDENT_NOT_FOUND")
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session, auth, idempotency_key, req_hash, domain="engineering_decisions_incidents"
-        )
-        if cached is not None:
-            return IncidentResponse.model_validate(cached)
 
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. Ahead of the
+        # idempotency cache too: a caller who has since lost access (removed,
+        # suspended, demoted, or no longer able to see the incident) must
+        # not have a cached success replayed to them.
         existing = _get_incident(session, auth.workspace_id, incident_id, for_update=True)
         if existing is None:
             raise HTTPException(status_code=404, detail="INCIDENT_NOT_FOUND")
@@ -483,6 +492,16 @@ def resolve_incident_endpoint(
             session, auth, resource_type="incidents", resource_id=incident_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+        # After authz, before the state checks: a same-key replay of a
+        # successful resolve finds the incident already resolved and must
+        # get the cached 200, not a 409.
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="engineering_decisions_incidents"
+        )
+        if cached is not None:
+            return IncidentResponse.model_validate(cached)
+
         if existing["status"] == "resolved":
             raise HTTPException(status_code=409, detail="INCIDENT_ALREADY_RESOLVED")
         if payload.resolved_at < existing["detected_at"]:
@@ -693,17 +712,21 @@ def decide_decision_endpoint(
     now = datetime.now(UTC)
     with session.begin():
         authz.lock_membership_for_write(session, auth)
+        # Fast-fail before the idempotency and row locks -- see resolve_
+        # incident_endpoint's identical check. Not authoritative: the
+        # read/write checks after the row lock below still decide.
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="engineering_decisions",
+            resource_id=decision_id,
+            action="read",
+        ):
+            raise HTTPException(status_code=404, detail="DECISION_NOT_FOUND")
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session, auth, idempotency_key, req_hash, domain="engineering_decisions_incidents"
-        )
-        if cached is not None:
-            return DecisionResponse.model_validate(cached)
 
-        # Lock before authorizing: an ownership transfer that commits while
-        # this request waits on the row lock must be seen by the checks below
-        # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # Lock before authorizing, and authorize before the idempotency
+        # cache -- see resolve_incident_endpoint's identical comment.
         existing = _get_decision(session, auth.workspace_id, decision_id, for_update=True)
         if existing is None:
             raise HTTPException(status_code=404, detail="DECISION_NOT_FOUND")
@@ -726,6 +749,15 @@ def decide_decision_endpoint(
             action="write",
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+        # After authz, before the state checks (a replay finds the decision
+        # already decided) -- see resolve_incident_endpoint.
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="engineering_decisions_incidents"
+        )
+        if cached is not None:
+            return DecisionResponse.model_validate(cached)
+
         if existing["status"] != "proposed":
             raise HTTPException(status_code=409, detail="DECISION_NOT_PROPOSED")
         # Mirrors resolve_incident_endpoint's identical `resolved_at <

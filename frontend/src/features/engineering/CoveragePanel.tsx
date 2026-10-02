@@ -2,6 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 
 import { apiRequest } from '../../api/client'
 import { apiErrorMessage } from '../../api/errorMessage'
+import { withoutPersonalProviders } from './personalProviders'
 import type {
   ConnectorAccount,
   ConnectorAccountListResponse,
@@ -89,7 +90,8 @@ export default function CoveragePanel() {
   const loading = connectors.isLoading || repositories.isLoading || workItems.isLoading
   const anyError = connectors.error ?? repositories.error ?? workItems.error
 
-  const connectorList = connectors.data?.connectors ?? []
+  // Personal providers (Gmail) never appear in engineering views (Spec A S1.8(e)).
+  const connectorList = withoutPersonalProviders(connectors.data?.connectors ?? [])
   const repositoryList = repositories.data?.repositories ?? []
   const workItemList = workItems.data?.work_items ?? []
 

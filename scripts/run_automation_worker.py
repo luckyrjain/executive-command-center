@@ -94,6 +94,10 @@ def main() -> int:
                         f"{worker_id}\tscheduler\tworkflow-not-active\t"
                         f"{outcome.trigger_id}\t{outcome.workflow_id}"
                     )
+                elif isinstance(outcome, scheduler_module.TriggerFireDeferred):
+                    # Rolled back (e.g. a lock wait behind a long member
+                    # removal); the next tick retries the same occurrence.
+                    print(f"{worker_id}\tscheduler\tdeferred\t{outcome.trigger_id}")
                 elif isinstance(outcome, scheduler_module.TriggerFireFailedRateLimited):
                     # Enqueue-time rate limiting (`worker.RunRateLimited`).
                     # Printed rather than silently dropped specifically

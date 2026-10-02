@@ -81,9 +81,14 @@ from ecc.http_security import (
     security_headers_middleware,
 )
 from ecc.logging import configure_logging
-from ecc.observability import render_metrics, request_observability_middleware
+from ecc.observability import (
+    preinitialise_connector_security_counters,
+    render_metrics,
+    request_observability_middleware,
+)
 from ecc.platform.authz_grants import ownership_router
 from ecc.platform.authz_grants import router as authz_router
+from ecc.platform.connector_security import PERSONAL_PROVIDERS, SHARE_REFUSED_RESOURCE_TYPES
 from ecc.platform.notifications import router as notifications_router
 from ecc.search import router as search_router
 
@@ -116,6 +121,10 @@ validate_production_settings(settings)
 # trigger") by construction rather than by never being called twice.
 if "gmail" not in engineering_connector_registry:
     engineering_connector_registry.register(GmailAdapter())
+# Spec A's rare-event counters exist at 0 from boot, so Prometheus
+# `increase()` sees each one's first event after a restart (see
+# `preinitialise_connector_security_counters`). Idempotent under reload.
+preinitialise_connector_security_counters(PERSONAL_PROVIDERS, SHARE_REFUSED_RESOURCE_TYPES)
 app = FastAPI(title="Executive Command Center", version="0.2.0")
 # The dev-bootstrap router is only ever functional in development (each of
 # its routes calls _require_development() and 404s otherwise) -- but

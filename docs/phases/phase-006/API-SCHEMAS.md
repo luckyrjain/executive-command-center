@@ -2,8 +2,9 @@
 id: PHASE-006-API-SCHEMAS
 title: Phase 6 Engineering Workspace API
 status: Approved for Implementation
-version: 0.9.0
+version: 0.10.0
 owner: Lucky Jain
+updated: 2026-10-01
 ---
 
 # Phase 6 API Schemas
@@ -49,3 +50,25 @@ GET /engineering/dashboards
 **Team suggestions review page status (migration `0072_team_suggestion_dismissal.py`, later addition)**: `GET /engineering/team-suggestions`, `POST /engineering/team-suggestions/confirm`, `POST /engineering/team-suggestions/dismiss` are new -- a grouped, bulk-action sibling of the per-item `POST .../{id}/team` endpoints above, not a replacement (see `CONNECTOR-CONTRACT.md`'s matching "Team suggestions review page" section for why). `GET` returns `{"items": [{"suggested_team_name", "repository_count", "work_item_count", "sample_items": [{"id", "resource_type": "repository"|"work_item", "name"}]}]}`, one entry per distinct pending `suggested_team_name` across `repositories`/`engineering_work_items` combined (dismissed and already-confirmed rows excluded). `POST .../confirm` body: `{"suggested_team_name": "<str>", "team_entity_id": "<uuid>"}`; `POST .../dismiss` body: `{"suggested_team_name": "<str>"}`. Both mutations respond `{"updated": ["<uuid>", ...], "skipped_unauthorized": ["<uuid>", ...]}` -- every currently-eligible row sharing that suggested name is locked and re-authorized individually for `action="write"` inside one transaction; a row the caller cannot write to is silently excluded from `updated` and reported in `skipped_unauthorized` instead of failing the whole batch. **Requires `Idempotency-Key`**, matching every other mutating endpoint in this router; no `expected_version` -- a set-based confirm has no single row version to check against, unlike the per-item endpoint.
 
 Connector creation returns required scopes and authorization state, never token values. Queries expose source coverage, freshness, definitions and evidence. Optional mutations route through approved automation policies. Signed cursors, isolation, redaction, idempotency and concurrency rules apply.
+
+## Security remediation (Spec A) status codes
+
+Codes added or changed on the connector routes by security remediation Spec A (raise sites in `ecc.domains.engineering.connector_accounts`). "Flag" means `ECC_PERSONAL_DATA_ISOLATION`; the rest is unflagged. Gmail-specific detail: `docs/phases/phase-010/API-SCHEMAS.md`; rollout: `docs/runbooks/SPEC-A-ROLLOUT.md`.
+
+| Route | Status / code | When |
+|---|---|---|
+| `POST /engineering/connectors` | `404 CONNECTOR_NOT_FOUND` | The request would reactivate an existing `disconnected` row the caller cannot read (S1.7). Audited as `connector_account.enrollment_refused` (reason `not_found`), counted in `ecc_connector_enrollment_refused_total` |
+| `POST /engineering/connectors` | `403 INSUFFICIENT_ROLE` | Reactivation of a row the caller can read but not write (reason `access_denied`, audited and counted the same way); also any caller demoted below write while waiting for the membership lock (ADR-0014, not audited as a refusal) |
+| `POST /engineering/connectors` | `500 CONNECTOR_ACCOUNT_PERSIST_FAILED` | An `IntegrityError` other than the duplicate-account unique violation (`uq_connector_accounts_workspace_provider_external_id`); previously reported as a `409` duplicate. Only SQLSTATE and constraint name are logged. The pre-existing `409 CONNECTOR_ALREADY_CONNECTED` for an active row is unchanged |
+| `POST /engineering/connectors/{id}/sync`, `.../disable` | `404 CONNECTOR_NOT_FOUND` | Flag on, a personal (`gmail`) connector, and the caller is not its owner, whatever their role or grants; counted in `ecc_connector_access_denied_total{provider,route}`. `sync`: checked before any transaction (`_deny_non_owner_personal_connector`) and again on the row locked in phase 1 (`_locked_connector_denial`). `disable`: one check, on the locked row, ahead of the Gmail `409 GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT` -- so a non-owner's Gmail `disable` gets `404` where it used to get that `409` |
+| `POST /engineering/connectors/{id}/sync` | `403 MEMBERSHIP_INACTIVE` | The acting member, or the personal connector's owner, is no longer an active workspace member (re-checked under the shared membership lock in phases 1 and 3). A phase-1 skip happens before any `sync_runs` row is reserved, so it writes nothing; a phase-3 skip closes the already-reserved run `failed`. Either way no outcome, cursor or audit is written |
+| `POST /engineering/connectors/{id}/sync` | `403 EMAIL_CONSENT_NOT_ACTIVE` | Gmail only: the mailbox owner's `email` consent is not active, or the connector was disconnected, at any point during the sync (FX5). Nothing is written, except that a run already reserved is closed `failed` |
+| `POST /engineering/connectors/{id}/sync`, `.../disable` | `403 INSUFFICIENT_ROLE` | Read but not write on the (locked) row, as before; also a role lowered while the request waited for the membership lock (ADR-0014) |
+
+`409 MEMBERSHIP_CHANGE_BUSY` is **not** returned by these routes: it is the member-removal / role-change response when such a change gives up waiting (3 s) for writers holding the membership lock, for example a sync refreshing an OAuth token. A connector write that queues behind a waiting removal can instead hit the 5 s statement timeout and return a generic `500` (safe to retry).
+
+## Changelog
+
+| Version | Date | Summary | Author |
+|---|---|---|---|
+| 0.10.0 | 2026-10-01 | Security remediation Spec A (T19; review wording: phase-1 vs phase-3 skip, sync pre-check vs disable locked-row check): documented the connector routes' new codes -- reactivation `404`/`403`, `500 CONNECTOR_ACCOUNT_PERSIST_FAILED`, non-owner Gmail `sync`/`disable` `404`, sync `403 MEMBERSHIP_INACTIVE` / `EMAIL_CONSENT_NOT_ACTIVE`, the ADR-0014 role re-check -- and that `MEMBERSHIP_CHANGE_BUSY` does not apply here | Lucky Jain |

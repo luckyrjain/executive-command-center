@@ -141,6 +141,7 @@ from sqlalchemy.orm import Session
 # import exists solely to force the safe ordering; nothing in this module
 # uses the `connectors` module itself.
 import ecc.domains.engineering.connectors  # noqa: F401
+from ecc.auth import AuthContext
 from ecc.database import SessionFactory
 from ecc.domains.automation.adapter_contract import TransientAdapterError
 from ecc.domains.engineering.connectors import AdapterAuthorizationError
@@ -157,6 +158,7 @@ from ecc.domains.engineering.gitlab_adapter import (
     reject_private_host as _reject_private_gitlab_host,
 )
 from ecc.domains.engineering.jira_adapter import parse_credential as _parse_jira_credential
+from ecc.platform import authz
 
 # `TransientAdapterError` is imported above from `automation.adapter_
 # contract`, not from `automation.adapters`. `adapters.py` is the
@@ -181,23 +183,68 @@ class WriteActionRejected(ValueError):
 
 
 def _load_credential(
-    session: Session, *, workspace_id: UUID, connector_account_id: UUID, expected_provider: str
+    session: Session,
+    *,
+    workspace_id: UUID,
+    actor_id: UUID,
+    connector_account_id: UUID,
+    expected_provider: str,
 ) -> str:
+    """Load and decrypt the connector's credential -- only if `actor_id`
+    may read *and* write that `connector_accounts` row.
+
+    Workspace membership alone is not enough: a connector can be shared
+    explicitly (`authz_grants` flips it to `shared_explicitly`), and the
+    graph-authored `input_mapping` can name any `connector_account_id`, so
+    without this check any write-role member could start (and, approvals
+    being workspace-visible, approve) a run that posts under a connector
+    they cannot even see. `actor_id` is trustworthy here: `worker.
+    _enforce_actor_scope` has already pinned it to the run's `created_by`.
+
+    Lock before authorizing (`connector_accounts._locked_connector_denial`'s
+    rule): `FOR SHARE` makes an ownership transfer / grant / visibility
+    change that commits while this waits visible to the checks below, and
+    blocks one from committing until this session closes. `FOR SHARE`, not
+    `FOR UPDATE`, so concurrent write actions on one connector do not
+    serialize on each other. The locked read is the authorization point:
+    the caller closes this session before its provider call (no network
+    call under a row lock), so a revocation that commits after it does not
+    stop an already-authorized post. A denial reads exactly like a missing row --
+    it must not reveal the provider/status of a connector the actor cannot
+    see.
+    """
     row = (
         session.execute(
             text(
                 "SELECT provider, status, encrypted_credentials FROM connector_accounts "
-                "WHERE workspace_id = :workspace_id AND id = :id"
+                "WHERE workspace_id = :workspace_id AND id = :id FOR SHARE"
             ),
             {"workspace_id": workspace_id, "id": connector_account_id},
         )
         .mappings()
         .one_or_none()
     )
-    if row is None:
+    actor = AuthContext(workspace_id=workspace_id, user_id=actor_id, timezone="UTC")
+    if (
+        row is None
+        or not authz.authorize(
+            session,
+            actor,
+            resource_type="connector_accounts",
+            resource_id=connector_account_id,
+            action="read",
+        )
+        or not authz.authorize(
+            session,
+            actor,
+            resource_type="connector_accounts",
+            resource_id=connector_account_id,
+            action="write",
+        )
+    ):
         raise WriteActionRejected(
             f"connector_account_id {connector_account_id} does not belong to workspace "
-            f"{workspace_id}"
+            f"{workspace_id} or is not usable by actor {actor_id}"
         )
     if row["provider"] != expected_provider:
         raise WriteActionRejected(
@@ -303,6 +350,7 @@ class GitHubAddIssueCommentAdapter:
             credential = _load_credential(
                 session,
                 workspace_id=action_input.workspace_id,
+                actor_id=action_input.actor_id,
                 connector_account_id=action_input.connector_account_id,
                 expected_provider="github",
             )
@@ -447,6 +495,7 @@ class GitLabAddNoteAdapter:
             credential = _load_credential(
                 session,
                 workspace_id=action_input.workspace_id,
+                actor_id=action_input.actor_id,
                 connector_account_id=action_input.connector_account_id,
                 expected_provider="gitlab",
             )
@@ -558,6 +607,7 @@ class JiraAddCommentAdapter:
             credential = _load_credential(
                 session,
                 workspace_id=action_input.workspace_id,
+                actor_id=action_input.actor_id,
                 connector_account_id=action_input.connector_account_id,
                 expected_provider="jira",
             )

@@ -12,7 +12,7 @@ function response(body: unknown, status = 200) {
 }
 
 function workspace(overrides: Partial<Workspace> = {}): Workspace {
-  return { id: 'workspace-1', name: 'Acme', timezone: 'UTC', role: 'owner', created_at: '2026-01-01T00:00:00Z', current: true, ...overrides }
+  return { id: 'workspace-1', name: 'Acme', timezone: 'UTC', require_distinct_approver: false, role: 'owner', created_at: '2026-01-01T00:00:00Z', current: true, ...overrides }
 }
 
 function member(overrides: Partial<Member> = {}): Member {
@@ -275,6 +275,34 @@ describe('MembersPanel', () => {
 
     expect(await screen.findByText('Transferred. Try removal again.')).toBeTruthy()
     expect(screen.getByText('2 × incidents')).toBeTruthy()
+  })
+
+  it('explains a refused ownership transfer of email-derived data as private to that member', async () => {
+    stubFetch({
+      members: [member()],
+      onDelete: (input) =>
+        String(input).includes('/members/user-1')
+          ? Promise.resolve(new Response(
+              JSON.stringify({ error: { code: 'OWNED_RESOURCES_BLOCK_REMOVAL', details: { owned_resources: [{ resource_type: 'tasks', count: 1 }] } } }),
+              { status: 409, headers: { 'Content-Type': 'application/json' } },
+            ))
+          : undefined,
+      onPost: (input) => (String(input).endsWith('/ownership/transfers')
+        ? response({ error: { code: 'RESOURCE_TYPE_NOT_GRANTABLE', message: 'Resource Type Not Grantable' } }, 400)
+        : undefined),
+    })
+    renderPanel()
+    await screen.findByText('Ada')
+    fireEvent.click(screen.getByRole('button', { name: 'Remove' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Confirm removal' }))
+    await screen.findByText('1 × tasks')
+
+    fireEvent.change(screen.getByLabelText('Resource type to transfer'), { target: { value: 'tasks' } })
+    fireEvent.change(screen.getByLabelText('Resource ID to transfer'), { target: { value: 'task-1' } })
+    fireEvent.change(screen.getByLabelText('Transfer to account ID'), { target: { value: 'account-2' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Transfer ownership' }))
+
+    expect(await screen.findByText(/created from a member's email, stay private to that member -- no one can share or transfer them, including their owner/)).toBeTruthy()
   })
 
   it('shows a dismissible export snapshot after removing a non-self member', async () => {

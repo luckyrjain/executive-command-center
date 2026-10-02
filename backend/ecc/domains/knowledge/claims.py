@@ -189,20 +189,13 @@ def create_claim(
     with embed_after_commit(session), session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session,
-            auth,
-            idempotency_key,
-            req_hash,
-            domain="knowledge_claims",
-            response_model=ClaimResponse,
-        )
-        if cached is not None:
-            return cached
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. The idempotency
+        # cache is read only after these checks too: a caller who has since
+        # lost access (removed, suspended, demoted, or no longer able to see
+        # the row) must not have a cached success replayed to them.
         # The lock is on the subject entity (the authorization boundary
         # checked below), which also holds a transfer of it off until this
         # transaction commits. Entity before claim is the order
@@ -225,6 +218,22 @@ def create_claim(
             session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+        # After authz on the subject entity, before the status/evidence
+        # checks: a same-key replay of a successful create must still get the
+        # cached 201 even if the entity has since been archived or the cited
+        # evidence deleted.
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="knowledge_claims",
+            response_model=ClaimResponse,
+        )
+        if cached is not None:
+            return cached
+
         entity_version = _entity_version(session, auth, entity_id)
         if entity_version is None:
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
@@ -371,20 +380,13 @@ def supersede_claim(
     with embed_after_commit(session), session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session,
-            auth,
-            idempotency_key,
-            req_hash,
-            domain="knowledge_claims",
-            response_model=ClaimResponse,
-        )
-        if cached is not None:
-            return cached
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. The idempotency
+        # cache is read only after these checks too: a caller who has since
+        # lost access (removed, suspended, demoted, or no longer able to see
+        # the row) must not have a cached success replayed to them.
         # The lock is on the subject entity (the authorization boundary
         # checked below), which also holds a transfer of it off until this
         # transaction commits. Entity before claim is the order
@@ -402,6 +404,22 @@ def supersede_claim(
             session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+        # After authz on the subject entity, before the claim's own lock and
+        # state checks: a same-key replay of a successful supersede finds the
+        # claim already superseded and must still get the cached 201, not a
+        # 409.
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="knowledge_claims",
+            response_model=ClaimResponse,
+        )
+        if cached is not None:
+            return cached
+
         current = (
             session.execute(
                 text(

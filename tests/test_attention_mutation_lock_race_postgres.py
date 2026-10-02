@@ -18,7 +18,6 @@ observed in `pg_stat_activity`, not assumed from timing.
 from __future__ import annotations
 
 import threading
-import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -30,6 +29,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.testclient import TestClient
 from identity_fixtures import create_identity
+from lock_race_support import holder_backend_pid, wait_for_lock_waiter
 from sqlalchemy import text
 
 from ecc.config import get_settings
@@ -155,28 +155,6 @@ def _seed_item(ws: UUID, owner_id: UUID, visibility: str) -> UUID:
     return item_id
 
 
-def _item_lock_waiters() -> int:
-    with engine.connect() as probe:
-        return int(
-            probe.execute(
-                text(
-                    "SELECT count(*) FROM pg_stat_activity "
-                    "WHERE datname = current_database() AND wait_event_type = 'Lock' "
-                    "AND wait_event IN ('transactionid', 'tuple') "
-                    "AND query ~* 'FROM attention_items ai.*FOR UPDATE'"
-                )
-            ).scalar_one()
-        )
-
-
-def _wait_for_item_lock_waiter() -> None:
-    deadline = time.monotonic() + _WAIT_SECONDS
-    while _item_lock_waiters() < 1:
-        if time.monotonic() > deadline:
-            raise AssertionError("mutation never blocked on the attention item's row lock")
-        time.sleep(0.05)
-
-
 def _item_state(item_id: UUID) -> dict[str, Any]:
     with engine.connect() as connection:
         return dict(
@@ -247,13 +225,14 @@ def test_mutation_waiting_on_item_lock_rechecks_authorization(
         batch_tx = batch.begin()
         thread = threading.Thread(target=fire)
         try:
+            batch_pid = holder_backend_pid(batch)
             batch.execute(
                 text("SELECT id FROM attention_items WHERE id = :id FOR UPDATE"),
                 {"id": item_id},
             )
             batch.execute(text(update_sql), {"id": item_id, "c": w.c})
             thread.start()
-            _wait_for_item_lock_waiter()
+            wait_for_lock_waiter("attention_items", holder_pid=batch_pid)
             batch_tx.commit()
         finally:
             if batch_tx.is_active:

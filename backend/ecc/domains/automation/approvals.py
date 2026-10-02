@@ -216,6 +216,19 @@ class ApprovalExpired:
     expires_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class ApprovalSelfApprovalForbidden:
+    """The workspace has `require_distinct_approver` on and the approving
+    member either started the run this request gates (`run_starter`:
+    `workflow_runs.created_by`, for a scheduled run the trigger's creator)
+    or authored the workflow version the run is pinned to
+    (`version_author`: `workflow_versions.created_by`) -- the person who
+    wrote the step must not be its only reviewer either. Only `"approved"`
+    is refused; rejecting is always safe."""
+
+    reason: Literal["run_starter", "version_author"]
+
+
 def approval_lifecycle_status(
     approval: ApprovalRequest, *, now: datetime | None = None
 ) -> LifecycleStatus:
@@ -438,6 +451,7 @@ def decide_approval(
     | ApprovalDigestMismatch
     | ApprovalAlreadyDecided
     | ApprovalExpired
+    | ApprovalSelfApprovalForbidden
 ):
     """Records a human decision. `current_action_digest` is required for
     `decision == "approved"` (echoed by the caller -- `API-SCHEMAS.md`:
@@ -485,6 +499,38 @@ def decide_approval(
         return ApprovalDigestMismatch(
             expected_digest=approval.action_digest, provided_digest=current_action_digest
         )
+
+    if decision == "approved":
+        # Separation of duties, opt-in per workspace (migration
+        # `0085_distinct_approver`). `FOR SHARE` on the workspace row: an
+        # owner flipping the setting either commits before this read (and
+        # applies) or waits until this decision commits -- never applies
+        # half-way through it. The run's `created_by` and its pinned
+        # version's `created_by` need no lock: each is written once, at
+        # insert, and never updated.
+        requires_distinct_approver = session.execute(
+            text("SELECT require_distinct_approver FROM workspaces WHERE id = :id FOR SHARE"),
+            {"id": workspace_id},
+        ).scalar_one()
+        if requires_distinct_approver:
+            people = (
+                session.execute(
+                    text(
+                        "SELECT r.created_by AS run_starter, v.created_by AS version_author "
+                        "FROM workflow_runs r JOIN workflow_versions v "
+                        "ON v.workspace_id = r.workspace_id AND v.workflow_id = r.workflow_id "
+                        "AND v.version = r.workflow_version "
+                        "WHERE r.workspace_id = :workspace_id AND r.id = :run_id"
+                    ),
+                    {"workspace_id": workspace_id, "run_id": approval.run_id},
+                )
+                .mappings()
+                .one()
+            )
+            if people["run_starter"] == actor_id:
+                return ApprovalSelfApprovalForbidden(reason="run_starter")
+            if people["version_author"] == actor_id:
+                return ApprovalSelfApprovalForbidden(reason="version_author")
 
     session.execute(
         text(
@@ -729,21 +775,14 @@ def approve_endpoint(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session,
-            auth,
-            idempotency_key,
-            req_hash,
-            domain="approval_request",
-            response_model=ApprovalResponse,
-        )
-        if cached is not None:
-            return cached
 
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. Ahead of the
+        # idempotency cache too: it is read only after these checks pass, so
+        # a caller who has since lost access (removed, suspended, demoted, or
+        # no longer able to see the row) never has a cached success replayed.
         # (`decide_approval` re-selects this row FOR UPDATE below:
         # a no-op re-lock within this transaction.)
         locked = session.execute(
@@ -767,6 +806,20 @@ def approve_endpoint(
             action="write",
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+        # After authz, before the state checks in the helper below: a
+        # same-key replay of a successful call finds the row already
+        # transitioned and must get the cached 200, not a 409.
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="approval_request",
+            response_model=ApprovalResponse,
+        )
+        if cached is not None:
+            return cached
 
         result = decide_approval(
             session,
@@ -800,6 +853,11 @@ def approve_endpoint(
             raise HTTPException(
                 status_code=409,
                 detail={"code": "APPROVAL_EXPIRED", "expires_at": result.expires_at.isoformat()},
+            )
+        if isinstance(result, ApprovalSelfApprovalForbidden):
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "SELF_APPROVAL_FORBIDDEN", "reason": result.reason},
             )
 
         response = _to_response(result)
@@ -837,21 +895,14 @@ def reject_endpoint(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session,
-            auth,
-            idempotency_key,
-            req_hash,
-            domain="approval_request",
-            response_model=ApprovalResponse,
-        )
-        if cached is not None:
-            return cached
 
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. Ahead of the
+        # idempotency cache too: it is read only after these checks pass, so
+        # a caller who has since lost access (removed, suspended, demoted, or
+        # no longer able to see the row) never has a cached success replayed.
         # (`decide_approval` re-selects this row FOR UPDATE below:
         # a no-op re-lock within this transaction.)
         locked = session.execute(
@@ -875,6 +926,20 @@ def reject_endpoint(
             action="write",
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+        # After authz, before the state checks in the helper below: a
+        # same-key replay of a successful call finds the row already
+        # transitioned and must get the cached 200, not a 409.
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="approval_request",
+            response_model=ApprovalResponse,
+        )
+        if cached is not None:
+            return cached
 
         result = decide_approval(
             session,
@@ -904,6 +969,15 @@ def reject_endpoint(
             raise HTTPException(
                 status_code=409,
                 detail={"code": "APPROVAL_EXPIRED", "expires_at": result.expires_at.isoformat()},
+            )
+        if isinstance(result, ApprovalSelfApprovalForbidden):
+            # Unreachable for decision="rejected" (only approving a step of
+            # a run you started, or of a version you wrote, is refused) --
+            # handled for exhaustiveness, like
+            # ApprovalDigestMismatch above.
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "SELF_APPROVAL_FORBIDDEN", "reason": result.reason},
             )
 
         response = _to_response(result)

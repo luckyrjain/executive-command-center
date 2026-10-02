@@ -221,6 +221,49 @@ describe('GmailPanel', () => {
     expect(await screen.findByText('This Gmail sign-in link expired or was already used. Start again.')).toBeTruthy()
   })
 
+  it.each([
+    ['GMAIL_ACCOUNT_IDENTITY_MISMATCH', "The Google account you chose isn't the one signed in to ECC."],
+    ['GMAIL_ACCOUNT_ALREADY_CONNECTED', 'This Google account is already connected in this workspace.'],
+    ['CONNECTOR_OWNED_BY_ANOTHER_MEMBER', 'Another member of this workspace has already connected this Google account'],
+    ['CONNECTOR_ACCOUNT_PERSIST_FAILED', 'Gmail could not be saved because of a server error.'],
+    ['MEMBERSHIP_INACTIVE', 'Your membership in this workspace is no longer active'],
+    ['INSUFFICIENT_ROLE', 'Your workspace role does not allow connecting Gmail'],
+  ])('maps the %s OAuth-return code to readable copy, never the raw code', async (code, expected) => {
+    Object.defineProperty(window, 'location', {
+      value: { ...window.location, href: '', search: `?gmail=error&code=${code}`, pathname: '/' },
+      writable: true,
+    })
+    stubFetch({ domains: [], connectors: [] })
+    renderPanel()
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain(expected)
+    expect(alert.textContent).not.toContain(code)
+  })
+
+  it('keeps the owned-by-another-member and already-connected copy neutral (no dead-end remedy, no "reload to see it")', async () => {
+    for (const [code, forbidden] of [['CONNECTOR_OWNED_BY_ANOTHER_MEMBER', /Choose a different Google account/], ['GMAIL_ACCOUNT_ALREADY_CONNECTED', /Reload/]] as const) {
+      Object.defineProperty(window, 'location', {
+        value: { ...window.location, href: '', search: `?gmail=error&code=${code}`, pathname: '/' },
+        writable: true,
+      })
+      stubFetch({ domains: [], connectors: [] })
+      const view = renderPanel()
+      const alert = await screen.findByRole('alert')
+      expect(alert.textContent).not.toMatch(forbidden)
+      if (code === 'CONNECTOR_OWNED_BY_ANOTHER_MEMBER') expect(alert.textContent).toContain('Ask that member or a workspace admin')
+      view.unmount()
+    }
+  })
+
+  it('does not promise automatic syncing in the connect wizard -- sync is run by the user', async () => {
+    stubFetch({ domains: [], connectors: [] })
+    renderPanel()
+    expect(await screen.findByText('What Gmail access gives you')).toBeTruthy()
+    expect(screen.queryByText(/synced automatically/)).toBeNull()
+    expect(screen.getByText(/fetched each time you run a sync/)).toBeTruthy()
+  })
+
   it('shows no OAuth-return banner on an ordinary page load with no gmail query param', async () => {
     stubFetch({ domains: [domain()], connectors: [] })
     renderPanel()
@@ -247,6 +290,43 @@ describe('GmailPanel', () => {
     const call = fetch.mock.calls.find(([input, init]) => String(input).endsWith('/sync') && (init?.method ?? 'GET') === 'POST')!
     const body = JSON.parse(String((call[1] as RequestInit).body))
     expect(body).toEqual({ run_type: 'incremental', resource_type: 'message', since: null })
+  })
+
+  it('refetches connector state after a refused sync too (403 MEMBERSHIP_INACTIVE), and shows readable copy', async () => {
+    const fetch = stubFetch({
+      domains: [domain()], connectors: [connector()], threads: [],
+      syncRuns: [{ id: 'run-1', connector_account_id: 'connector-1', run_type: 'backfill', status: 'succeeded', items_processed: 3, error_summary: null, started_at: '2026-08-01T00:00:00Z', completed_at: '2026-08-01T00:05:00Z' }],
+      onPost: (url) => url.endsWith('/sync')
+        ? response({ error: { code: 'MEMBERSHIP_INACTIVE', message: 'Membership Inactive' } }, 403)
+        : undefined,
+    })
+    renderPanel()
+    fireEvent.click(await screen.findByRole('button', { name: 'Sync now' }))
+
+    expect(await screen.findByText(/Your membership in this workspace is no longer active, so this was stopped\./)).toBeTruthy()
+    // Sync may have committed messages before the stop: never claim nothing was saved.
+    expect(screen.queryByText(/nothing was saved/)).toBeNull()
+    const connectorGets = () => fetch.mock.calls.filter(([input, init]) =>
+      String(input).includes('/engineering/connectors') && (init?.method ?? 'GET').toUpperCase() === 'GET').length
+    const syncRunGets = () => fetch.mock.calls.filter(([input, init]) =>
+      String(input).includes('/engineering/sync-runs') && (init?.method ?? 'GET').toUpperCase() === 'GET').length
+    await waitFor(() => expect(connectorGets()).toBeGreaterThanOrEqual(2))
+    await waitFor(() => expect(syncRunGets()).toBeGreaterThanOrEqual(2))
+  })
+
+  it('shows the generic 403 copy for a sync refused with INSUFFICIENT_ROLE, not the connect-refused banner copy', async () => {
+    stubFetch({
+      domains: [domain()], connectors: [connector()], threads: [],
+      syncRuns: [{ id: 'run-1', connector_account_id: 'connector-1', run_type: 'backfill', status: 'succeeded', items_processed: 3, error_summary: null, started_at: '2026-08-01T00:00:00Z', completed_at: '2026-08-01T00:05:00Z' }],
+      onPost: (url) => url.endsWith('/sync')
+        ? response({ error: { code: 'INSUFFICIENT_ROLE', message: 'Insufficient Role' } }, 403)
+        : undefined,
+    })
+    renderPanel()
+    fireEvent.click(await screen.findByRole('button', { name: 'Sync now' }))
+
+    expect(await screen.findByText('You are not permitted to manage personal data in this workspace.')).toBeTruthy()
+    expect(screen.queryByText(/connecting Gmail/)).toBeNull()
   })
 
   it('runs a first-time backfill (not incremental) when no sync has ever run', async () => {

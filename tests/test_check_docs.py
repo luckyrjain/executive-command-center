@@ -77,6 +77,23 @@ def test_rejects_invalid_lifecycle_status(tmp_path: Path) -> None:
     ]
 
 
+def test_observability_docs_are_governed_like_runbooks(tmp_path: Path) -> None:
+    _write(tmp_path / "docs/observability/ALERTS.md", "# Alerts\n")
+    _write(
+        tmp_path / "docs/observability/RULES.md",
+        _frontmatter(document_id="RULES", status="Approved") + "# Rules\n",
+    )
+
+    errors = validate_repository(tmp_path)
+
+    assert errors == [
+        "docs/observability/ALERTS.md: missing front matter fields: "
+        "id, owner, status, title, version",
+        "docs/observability/RULES.md: status 'Approved' is invalid for runbook; "
+        "allowed: Active, Archived, Closed, Draft, Open",
+    ]
+
+
 def test_rejects_broken_relative_heading_anchor(tmp_path: Path) -> None:
     _write(tmp_path / "docs/a.md", "[target](b.md#missing)\n")
     _write(tmp_path / "docs/b.md", "# Present\n")
