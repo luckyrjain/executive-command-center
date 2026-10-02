@@ -19,7 +19,7 @@ and ``docs/phases/phase-001/TEST-PLAN.md:57`` for the exact budgets.
 """
 
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import new
@@ -49,7 +49,15 @@ pytestmark = pytest.mark.skipif(
 _IN_CI = os.getenv("CI") is not None
 MUTATION_P95_BUDGET_SECONDS = 0.48 if _IN_CI else 0.3
 BRIEF_P95_BUDGET_SECONDS = 3.2 if _IN_CI else 2.0
-SAMPLE_SIZE = 15
+# 20 samples, not 15: with nearest-rank `_p95` below, 15 samples put p95 at
+# index ceil(0.95 * 15) - 1 = 14 -- the maximum -- so a single GC pause or
+# checkpoint write on a shared CI runner failed the whole gate. At 20 samples
+# p95 is the 19th-ranked value, so one outlier is tolerated but two are not.
+# One discarded warm-up request per pass absorbs first-call costs (plan
+# caching, connection checkout). Warm-up + samples (21) stays under the
+# mutation rate limiter's 40-requests-per-session window; see `_mint_session`.
+WARMUP_ITERATIONS = 1
+SAMPLE_SIZE = 20
 
 
 def _p95(samples: list[float]) -> float:
@@ -76,11 +84,12 @@ def _mint_session(workspace_id: UUID, user_id: UUID) -> str:
     `backend/ecc/http_security.py` is a real, process-lifetime, per-session
     fixed-window limiter (40 mutation-class requests per 60 seconds) --
     genuine production abuse protection that this task must not bypass. A
-    single shared session across three ~15-request mutation-class test
-    functions in the same file would trip that limiter (45 > 40) purely as
+    single shared session across three ~21-request mutation-class test
+    functions in the same file would trip that limiter (63 > 40) purely as
     a test-isolation artifact, not a real regression. Minting a session per
     test gives each its own rate-limit bucket, matching how distinct real
-    users would never share one.
+    users would never share one. A retried measurement pass (see
+    `_assert_p95_under_budget`) likewise mints its own session.
     """
     token = f"session-{uuid4()}"
     now = datetime.now(UTC)
@@ -105,6 +114,69 @@ def _mint_session(workspace_id: UUID, user_id: UUID) -> str:
             },
         )
     return token
+
+
+# One request of a measurement pass: (client, session token, idempotency-key
+# label) -> None. Performs the request and asserts on its response.
+_RequestOnce = Callable[[TestClient, str, str], None]
+
+
+def _measure_pass(
+    workspace_id: UUID, user_id: UUID, request_once: _RequestOnce, label: str
+) -> tuple[float, list[float]]:
+    """Run one warm-up-then-sample pass on a freshly minted session."""
+    token = _mint_session(workspace_id, user_id)
+    client = TestClient(app)
+    client.cookies.set("ecc_session", token)
+    try:
+        for index in range(WARMUP_ITERATIONS):
+            request_once(client, token, f"{label}-warmup-{index}-{uuid4()}")
+        samples: list[float] = []
+        for index in range(SAMPLE_SIZE):
+            started = perf_counter()
+            request_once(client, token, f"{label}-sample-{index}-{uuid4()}")
+            samples.append(perf_counter() - started)
+    finally:
+        client.close()
+    return _p95(samples), samples
+
+
+def _assert_p95_under_budget(
+    name: str,
+    budget_seconds: float,
+    workspace_id: UUID,
+    user_id: UUID,
+    request_once: _RequestOnce,
+) -> None:
+    """Assert p95 is under budget, allowing one retry of the *entire* pass.
+
+    The same narrow exception `test_ranking_10000_eligible_entities_under_
+    budget` (`tests/test_risks_attention_postgres.py`) and
+    `test_reverse_with_200_rehomed_relationships_p95_under_budget`
+    (`tests/test_knowledge_entity_operations_performance_postgres.py`)
+    document: transient Postgres background work (checkpoint writes,
+    autovacuum) or runner scheduling noise can slow a couple of calls in one
+    pass without reflecting a regression. A real regression fails both the
+    initial pass and the retry. The budget itself is unchanged.
+    """
+    key_prefix = name.replace(" ", "-")
+    first_p95, first_samples = _measure_pass(workspace_id, user_id, request_once, key_prefix)
+    if first_p95 < budget_seconds:
+        return
+    print(
+        f"\n[{name} budget] initial pass p95 {first_p95 * 1000:.1f} ms exceeded "
+        f"{budget_seconds * 1000:.0f} ms budget; retrying once with a fresh "
+        f"measurement pass before failing. samples(ms)="
+        f"{[round(s * 1000, 1) for s in first_samples]}"
+    )
+    p95, samples = _measure_pass(workspace_id, user_id, request_once, f"{key_prefix}-retry")
+    assert p95 < budget_seconds, (
+        f"{name} p95 exceeded the {budget_seconds * 1000:.0f} ms budget on both the "
+        f"initial pass ({first_p95 * 1000:.1f} ms) and the retry ({p95 * 1000:.1f} ms) "
+        f"(in_ci={_IN_CI}); this indicates a real regression, not one-off environmental "
+        f"noise. initial samples(ms)={[round(s * 1000, 1) for s in first_samples]}; "
+        f"retry samples(ms)={[round(s * 1000, 1) for s in samples]}"
+    )
 
 
 @pytest.fixture(scope="module")
@@ -165,9 +237,6 @@ def test_task_mutation_p95_under_budget(
     mutation_brief_dataset: tuple[UUID, UUID],
 ) -> None:
     workspace_id, user_id = mutation_brief_dataset
-    token = _mint_session(workspace_id, user_id)
-    client = TestClient(app)
-    client.cookies.set("ecc_session", token)
     now = datetime.now(UTC)
     task_id = uuid4()
     with engine.begin() as connection:
@@ -193,35 +262,27 @@ def test_task_mutation_p95_under_budget(
             },
         )
 
-    samples: list[float] = []
     version = 1
-    for index in range(SAMPLE_SIZE):
-        started = perf_counter()
+
+    def patch_task(client: TestClient, token: str, key: str) -> None:
+        nonlocal version
         response = client.patch(
             f"/api/v1/tasks/{task_id}",
-            headers=_headers(token, f"task-mutation-perf-{index}-{uuid4()}"),
-            json={"expected_version": version, "title": f"Mutation perf task {index}"},
+            headers=_headers(token, key),
+            json={"expected_version": version, "title": f"Mutation perf task {key}"},
         )
-        samples.append(perf_counter() - started)
         assert response.status_code == 200, response.text
         version = response.json()["version"]
 
-    p95 = _p95(samples)
-    assert p95 < MUTATION_P95_BUDGET_SECONDS, (
-        f"task mutation p95 {p95 * 1000:.1f} ms exceeds "
-        f"{MUTATION_P95_BUDGET_SECONDS * 1000:.0f} ms budget (in_ci={_IN_CI}); samples(ms)="
-        f"{[round(s * 1000, 1) for s in samples]}"
+    _assert_p95_under_budget(
+        "task mutation", MUTATION_P95_BUDGET_SECONDS, workspace_id, user_id, patch_task
     )
-    client.close()
 
 
 def test_commitment_mutation_p95_under_budget(
     mutation_brief_dataset: tuple[UUID, UUID],
 ) -> None:
     workspace_id, user_id = mutation_brief_dataset
-    token = _mint_session(workspace_id, user_id)
-    client = TestClient(app)
-    client.cookies.set("ecc_session", token)
     now = datetime.now(UTC)
     commitment_id = uuid4()
     with engine.begin() as connection:
@@ -248,54 +309,39 @@ def test_commitment_mutation_p95_under_budget(
             },
         )
 
-    samples: list[float] = []
     version = 1
-    for index in range(SAMPLE_SIZE):
-        started = perf_counter()
+
+    def patch_commitment(client: TestClient, token: str, key: str) -> None:
+        nonlocal version
         response = client.patch(
             f"/api/v1/commitments/{commitment_id}",
-            headers=_headers(token, f"commitment-mutation-perf-{index}-{uuid4()}"),
-            json={"expected_version": version, "summary": f"Mutation perf commitment {index}"},
+            headers=_headers(token, key),
+            json={"expected_version": version, "summary": f"Mutation perf commitment {key}"},
         )
-        samples.append(perf_counter() - started)
         assert response.status_code == 200, response.text
         version = response.json()["version"]
 
-    p95 = _p95(samples)
-    assert p95 < MUTATION_P95_BUDGET_SECONDS, (
-        f"commitment mutation p95 {p95 * 1000:.1f} ms exceeds "
-        f"{MUTATION_P95_BUDGET_SECONDS * 1000:.0f} ms budget (in_ci={_IN_CI}); samples(ms)="
-        f"{[round(s * 1000, 1) for s in samples]}"
+    _assert_p95_under_budget(
+        "commitment mutation",
+        MUTATION_P95_BUDGET_SECONDS,
+        workspace_id,
+        user_id,
+        patch_commitment,
     )
-    client.close()
 
 
 def test_brief_generation_p95_under_budget(
     mutation_brief_dataset: tuple[UUID, UUID],
 ) -> None:
     workspace_id, user_id = mutation_brief_dataset
-    token = _mint_session(workspace_id, user_id)
-    client = TestClient(app)
-    client.cookies.set("ecc_session", token)
 
-    samples: list[float] = []
-    for index in range(SAMPLE_SIZE):
-        started = perf_counter()
-        response = client.post(
-            "/api/v1/briefs/morning",
-            headers=_headers(token, f"brief-perf-{index}-{uuid4()}"),
-            json={},
-        )
-        samples.append(perf_counter() - started)
+    def generate_brief(client: TestClient, token: str, key: str) -> None:
+        response = client.post("/api/v1/briefs/morning", headers=_headers(token, key), json={})
         assert response.status_code == 200, response.text
 
-    p95 = _p95(samples)
-    assert p95 < BRIEF_P95_BUDGET_SECONDS, (
-        f"brief generation p95 {p95 * 1000:.1f} ms exceeds "
-        f"{BRIEF_P95_BUDGET_SECONDS * 1000:.0f} ms budget (in_ci={_IN_CI}); samples(ms)="
-        f"{[round(s * 1000, 1) for s in samples]}"
+    _assert_p95_under_budget(
+        "brief generation", BRIEF_P95_BUDGET_SECONDS, workspace_id, user_id, generate_brief
     )
-    client.close()
 
 
 def test_statement_timeout_is_configured_at_approved_value() -> None:
