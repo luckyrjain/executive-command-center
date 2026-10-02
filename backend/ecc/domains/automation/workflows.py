@@ -30,6 +30,7 @@ supplied `workspace_id` override").
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from hashlib import sha256
 from json import dumps
 from typing import Annotated, Any, Literal
@@ -48,9 +49,10 @@ from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 from ecc.platform.request_models import EmptyBody as _EmptyBody
 
+from .adapter_contract import dispatch_value
 from .adapters import ActionAdapter, AdapterRegistry
 from .adapters import registry as _production_adapter_registry
-from .approvals import evaluate_approval_requirement
+from .approvals import evaluate_approval_requirement, evaluate_policy_scope
 from .policy import AutomationPolicy, get_policy, is_policy_usable, policy_status
 
 # Task 7a: safe to import `.adapters`/`.policy`/`.approvals` here -- confirmed
@@ -1389,9 +1391,20 @@ _SIMULATE_REDACTION_MARKERS = (
 _SIMULATE_REDACTED_VALUE = "[REDACTED]"
 
 DispatchGate = Literal[
-    "clear", "requires_approval", "policy_blocked", "adapter_not_registered", "not_applicable"
+    "clear",
+    "requires_approval",
+    "policy_blocked",
+    "adapter_not_registered",
+    "input_invalid",
+    "not_applicable",
 ]
-PolicyBlockReason = Literal["no_policy", "policy_revoked", "policy_expired"]
+PolicyBlockReason = Literal[
+    "no_policy",
+    "policy_revoked",
+    "policy_expired",
+    "action_type_not_authorized",
+    "data_class_not_authorized",
+]
 
 
 class SimulateWorkspaceScopeMismatch(ValueError):
@@ -1450,6 +1463,12 @@ class SimulateStepResult(BaseModel):
     # declares statically.
     reversible: bool | None = None
     high_impact_categories: list[str] = Field(default_factory=list)
+    # Policy-scope declarations (static, like the two above) and the value
+    # this step's validated static input would move -- what a real dispatch
+    # would record as `workflow_run_steps.dispatch_value`.
+    action_type: str | None = None
+    data_class: str | None = None
+    dispatch_value: Decimal | None = None
     dispatch_gate: DispatchGate
     policy_block_reason: PolicyBlockReason | None = None
     error: str | None = None
@@ -1488,6 +1507,7 @@ def _simulate_steps(
 
     results: list[SimulateStepResult] = []
     action_step_count_so_far = 0
+    run_value_so_far = Decimal("0")
     for index, step in enumerate(steps):
         step_type_raw = step.get("step_type")
         step_type = str(step_type_raw)
@@ -1531,8 +1551,23 @@ def _simulate_steps(
         # even reach the adapter-registration question. Reordered to
         # match Decision 4's own "identical graph-walk ... not a
         # separate, potentially-drifting guess" requirement literally.
+        # Order mirrors worker._evaluate_dispatch_gate exactly (scope-
+        # enforcement design, Decision 5): usability -> adapter -> scope ->
+        # input validation -> value and approval.
+        resolved_input: dict[str, Any] = step.get("input_mapping", {})
+        action_input: BaseModel | None = None
+        step_value: Decimal | None = None
+        validation_error: str | None = None
+        if adapter is not None:
+            try:
+                action_input = adapter.input_schema.model_validate(resolved_input)
+                step_value = dispatch_value(adapter, action_input)
+            except Exception as exc:  # noqa: BLE001 -- mirrors the gate's own broad catch
+                action_input = None
+                validation_error = type(exc).__name__
+
         dispatch_gate: DispatchGate
-        policy_block_reason: PolicyBlockReason | None
+        policy_block_reason: PolicyBlockReason | None = None
         if policy_row is None:
             dispatch_gate = "policy_blocked"
             policy_block_reason = "no_policy"
@@ -1542,13 +1577,21 @@ def _simulate_steps(
             policy_block_reason = "policy_revoked" if lifecycle == "revoked" else "policy_expired"
         elif adapter is None:
             dispatch_gate = "adapter_not_registered"
-            policy_block_reason = None
+        elif (scope_reason := evaluate_policy_scope(adapter, policy_row)) is not None:
+            dispatch_gate = "policy_blocked"
+            policy_block_reason = scope_reason
+        elif validation_error is not None or step_value is None:
+            dispatch_gate = "input_invalid"
         else:
-            policy_block_reason = None
-            requires_approval = evaluate_approval_requirement(
-                adapter, policy_row, action_step_count_so_far=action_step_count_so_far
+            categories = evaluate_approval_requirement(
+                adapter,
+                policy_row,
+                action_step_count_so_far=action_step_count_so_far,
+                run_value_so_far=run_value_so_far,
+                step_value=step_value,
             )
-            dispatch_gate = "requires_approval" if requires_approval else "clear"
+            # `is None`, never truthiness: an empty set still requires approval.
+            dispatch_gate = "clear" if categories is None else "requires_approval"
 
         if adapter is None:
             # A version drafted before this task's own publish-time check
@@ -1575,22 +1618,21 @@ def _simulate_steps(
             action_step_count_so_far += 1
             continue
 
-        resolved_input: dict[str, Any] = step.get("input_mapping", {})
         preview_dict: dict[str, Any] | None = None
-        error: str | None = None
-        try:
-            action_input = adapter.input_schema.model_validate(resolved_input)
-            input_workspace_id = getattr(action_input, "workspace_id", None)
-            if input_workspace_id is not None and input_workspace_id != version.workspace_id:
-                raise SimulateWorkspaceScopeMismatch(
-                    f"step '{step_id}' resolved input names workspace_id="
-                    f"{input_workspace_id}, which does not match workflow version "
-                    f"{version.id}'s own workspace_id={version.workspace_id}"
-                )
-            preview_model = adapter.simulate(action_input)
-            preview_dict = _simulate_redact_payload(preview_model.model_dump(mode="json"))
-        except Exception as exc:  # noqa: BLE001 -- mirrors run_step's own broad adapter-call catch
-            error = type(exc).__name__
+        error: str | None = validation_error
+        if action_input is not None:
+            try:
+                input_workspace_id = getattr(action_input, "workspace_id", None)
+                if input_workspace_id is not None and input_workspace_id != version.workspace_id:
+                    raise SimulateWorkspaceScopeMismatch(
+                        f"step '{step_id}' resolved input names workspace_id="
+                        f"{input_workspace_id}, which does not match workflow version "
+                        f"{version.id}'s own workspace_id={version.workspace_id}"
+                    )
+                preview_model = adapter.simulate(action_input)
+                preview_dict = _simulate_redact_payload(preview_model.model_dump(mode="json"))
+            except Exception as exc:  # noqa: BLE001 -- mirrors run_step's own broad adapter-call catch
+                error = type(exc).__name__
 
         results.append(
             SimulateStepResult(
@@ -1602,12 +1644,17 @@ def _simulate_steps(
                 preview=preview_dict,
                 reversible=adapter.reversible,
                 high_impact_categories=sorted(adapter.high_impact_categories),
+                action_type=adapter.action_type,
+                data_class=adapter.data_class,
+                dispatch_value=step_value,
                 dispatch_gate=dispatch_gate,
                 policy_block_reason=policy_block_reason,
                 error=error,
             )
         )
         action_step_count_so_far += 1
+        if step_value is not None:
+            run_value_so_far += step_value
 
     return results
 
