@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 import time
+import warnings
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -1122,10 +1123,28 @@ def _timed_counts_and_probes(world: GmailSyncWorld, params: dict[str, Any]) -> N
                 # took 3.3 s at load ~150 vs ~0.1-0.4 s normally), so one
                 # re-measurement on the same rows is allowed, as for the
                 # ranking budget in `test_risks_attention_postgres.py`. A
-                # real plan regression is slow on both passes.
-                print(f"{table}: over budget, measuring once more")
+                # real plan regression is slow on both passes. Surfaced as a
+                # warning, not a print: pytest drops a passing test's captured
+                # stdout, so a pass-on-retry would otherwise leave no trace in
+                # CI. The warnings summary is shown even when the test passes.
+                first = (elapsed, probe_elapsed)
+                warnings.warn(
+                    f"[share-probe budget] {table}: initial pass count "
+                    f"{elapsed * 1000:.1f} ms / probes {probe_elapsed * 1000:.1f} ms "
+                    f"over the {_COUNT_BUDGET_SECONDS * 1000:.0f} / "
+                    f"{_PROBE_BUDGET_SECONDS * 1000:.0f} ms budget; retrying once",
+                    stacklevel=2,
+                )
                 _, elapsed, probe_elapsed = _time_count_and_probes(
                     connection, table, row_ids, params
+                )
+                assert elapsed < _COUNT_BUDGET_SECONDS, (
+                    f"{table}: count exceeded the budget on both the initial pass "
+                    f"({first[0] * 1000:.1f} ms) and the retry ({elapsed * 1000:.1f} ms)"
+                )
+                assert probe_elapsed < _PROBE_BUDGET_SECONDS, (
+                    f"{table}: probes exceeded the budget on both the initial pass "
+                    f"({first[1] * 1000:.1f} ms) and the retry ({probe_elapsed * 1000:.1f} ms)"
                 )
             assert elapsed < _COUNT_BUDGET_SECONDS, (table, elapsed)
             assert probe_elapsed < _PROBE_BUDGET_SECONDS, (table, probe_elapsed)
