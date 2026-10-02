@@ -61,6 +61,8 @@ function errorMessage(error: unknown): string {
   return apiErrorMessage(error, {
     WORKFLOW_VERSION_CONFLICT: 'Another version was created for this workflow at the same time. Reload and retry.',
     POLICY_NOT_FOUND: 'That policy ID does not exist in this workspace.',
+    WORKFLOW_NOT_FOUND: 'That workflow ID is taken by a workflow you cannot see. Choose a different ID.',
+    INSUFFICIENT_ROLE: 'You do not have permission to add a version to that workflow.',
     OFFLINE: 'You are offline, so workflows could not be read or created.',
     NETWORK_ERROR: 'Could not reach the server, so workflows could not be read or created.',
     '401': 'Your session is no longer valid. Sign in again to view workflows.',
