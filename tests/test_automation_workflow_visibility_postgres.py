@@ -1,6 +1,6 @@
-"""A private workflow stays invisible through its policies and its runs.
+"""A private workflow stays invisible through its policies, runs and approvals.
 
-Two leaks, both ignoring the visibility of `workflow_versions`:
+Three leaks, all ignoring the visibility of `workflow_versions`:
 
 - `POST /automations/policies` checked only that the `workflow_id` family
   existed. A member got 201 for another member's private workflow (and
@@ -10,10 +10,15 @@ Two leaks, both ignoring the visibility of `workflow_versions`:
   run reads authorized only the run row. Every member could list, open and
   cancel the runs of another member's private workflow, scheduled runs
   included.
+- `approval_requests` rows are inserted with `visibility='workspace'` and
+  the inbox authorized only that row, so every member could list (run_id,
+  digest, categories), approve or reject the approvals of those runs,
+  advancing or failing a run they could not see.
 
 Now policy create needs read (404) then write (403) on a version of the
 workflow before the idempotency cache is read, and a run is visible only
-while its pinned version is readable too.
+while its pinned version is readable too, and an approval only while its
+run is.
 
 World: one workspace with A (`owner`), B (`member`, the workflow's owner)
 and C (`member`, the caller).
@@ -39,6 +44,7 @@ from sqlalchemy import Connection, text
 
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
+from ecc.domains.automation import approvals as automation_approvals
 from ecc.domains.automation import policy as automation_policy
 from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
@@ -561,3 +567,191 @@ def test_run_of_shared_workflow_is_visible_to_grantee(world: World) -> None:
 
     assert str(run_id) in _listed_run_ids(world.c_token)
     assert _get_run(world.c_token, run_id) == 200
+
+
+# ---------------------------------------------------------------------------
+# Approval inbox
+# ---------------------------------------------------------------------------
+
+_DIGEST = "a" * 64
+
+
+def _pending_approval(w: World, workflow_id: str, actor: UUID) -> tuple[UUID, UUID]:
+    """A run paused on step 0 with a pending approval, as the dispatch gate
+    leaves it (`approval_requests` rows are always `visibility='workspace'`)."""
+    run_id = _enqueue(w, workflow_id, actor)
+    with SessionFactory() as session, session.begin():
+        session.execute(
+            text(
+                "UPDATE workflow_runs SET status = 'waiting_approval', current_step_index = 0 "
+                "WHERE workspace_id = :ws AND id = :id"
+            ),
+            {"ws": w.ws, "id": run_id},
+        )
+        approval = automation_approvals.create_approval_request(
+            session, w.ws, run_id, 0, _DIGEST, frozenset({"person-directed"})
+        )
+    return run_id, approval.id
+
+
+def _listed_approval_ids(token: str, status: str | None = None) -> set[str]:
+    params = {"status": status} if status else None
+    response = _client(token).get("/api/v1/automations/approvals", params=params)
+    assert response.status_code == 200, response.text
+    return {approval["id"] for approval in response.json()["approvals"]}
+
+
+def _decide(
+    token: str, approval_id: UUID, decision: str, key: str | None = None
+) -> tuple[int, Any]:
+    response = _client(token).post(
+        f"/api/v1/automations/approvals/{approval_id}/{decision}",
+        json={"action_digest": _DIGEST} if decision == "approve" else None,
+        headers=_headers(token, key),
+    )
+    return response.status_code, response.json()
+
+
+def _approval_status(ws: UUID, approval_id: UUID) -> str:
+    with engine.connect() as connection:
+        return str(
+            connection.execute(
+                text("SELECT status FROM approval_requests WHERE workspace_id = :ws AND id = :id"),
+                {"ws": ws, "id": approval_id},
+            ).scalar_one()
+        )
+
+
+def test_approvals_for_private_workflow_runs_are_hidden(world: World) -> None:
+    workflow_id = f"vis.appr.{uuid4().hex[:8]}"
+    _publish_workflow(world, workflow_id)
+    _set_family_visibility(world.ws, workflow_id, "private")
+    run_id, approval_id = _pending_approval(world, workflow_id, world.b)
+
+    assert str(approval_id) not in _listed_approval_ids(world.c_token)
+    assert str(approval_id) not in _listed_approval_ids(world.c_token, status="pending")
+    assert str(approval_id) not in _listed_approval_ids(world.a_token)
+
+    assert str(approval_id) in _listed_approval_ids(world.b_token)
+    assert str(approval_id) in _listed_approval_ids(world.b_token, status="pending")
+
+
+@pytest.mark.parametrize("decision", ["approve", "reject"])
+def test_deciding_a_private_workflow_runs_approval_is_not_found(
+    world: World, decision: str
+) -> None:
+    workflow_id = f"vis.decide.{uuid4().hex[:8]}"
+    _publish_workflow(world, workflow_id)
+    _set_family_visibility(world.ws, workflow_id, "private")
+    run_id, approval_id = _pending_approval(world, workflow_id, world.b)
+
+    for token in (world.c_token, world.a_token):
+        status, body = _decide(token, approval_id, decision)
+        assert status == 404, (decision, body)
+        assert body["error"]["code"] == "APPROVAL_NOT_FOUND"
+    assert _approval_status(world.ws, approval_id) == "pending"
+    assert _run_status(world.ws, run_id) == "waiting_approval"
+
+
+@pytest.mark.parametrize("decision", ["approve", "reject"])
+def test_deciding_a_workspace_workflow_runs_approval_succeeds(world: World, decision: str) -> None:
+    workflow_id = f"vis.wsdecide.{uuid4().hex[:8]}"
+    _publish_workflow(world, workflow_id)
+    run_id, approval_id = _pending_approval(world, workflow_id, world.b)
+
+    assert str(approval_id) in _listed_approval_ids(world.c_token)
+    status, body = _decide(world.c_token, approval_id, decision)
+    assert status == 200, body
+    assert _run_status(world.ws, run_id) == "queued"
+
+
+def test_approval_of_shared_workflow_run_is_visible_to_grantee(world: World) -> None:
+    workflow_id = f"vis.apprshared.{uuid4().hex[:8]}"
+    _publish_workflow(world, workflow_id)
+    _set_family_visibility(world.ws, workflow_id, "shared_explicitly")
+    _grant_family(world, workflow_id, ["read"])
+    _run_id, approval_id = _pending_approval(world, workflow_id, world.b)
+
+    assert str(approval_id) in _listed_approval_ids(world.c_token)
+    status, body = _decide(world.c_token, approval_id, "reject")
+    assert status == 200, body
+
+
+def test_approval_follows_its_runs_pinned_version_going_private(world: World) -> None:
+    workflow_id = f"vis.apprlater.{uuid4().hex[:8]}"
+    _publish_workflow(world, workflow_id)
+    run_id, approval_id = _pending_approval(world, workflow_id, world.c)
+    assert str(approval_id) in _listed_approval_ids(world.c_token)
+
+    _set_family_visibility(world.ws, workflow_id, "private")
+
+    assert str(approval_id) not in _listed_approval_ids(world.c_token)
+    status, _ = _decide(world.c_token, approval_id, "reject")
+    assert status == 404
+    assert _run_status(world.ws, run_id) == "waiting_approval"
+
+
+@pytest.mark.parametrize("decision", ["approve", "reject"])
+def test_decision_replay_is_reauthorized_against_the_run(world: World, decision: str) -> None:
+    """ADR-0014: the cache is read only after the run check, so a same-key
+    replay after the workflow went private answers 404, not the cached 200."""
+    workflow_id = f"vis.apprreplay.{uuid4().hex[:8]}"
+    _publish_workflow(world, workflow_id)
+    _run_id, approval_id = _pending_approval(world, workflow_id, world.b)
+    key = str(uuid4())
+
+    first_status, first_body = _decide(world.c_token, approval_id, decision, key)
+    assert first_status == 200, first_body
+
+    _set_family_visibility(world.ws, workflow_id, "private")
+    replay_status, replay_body = _decide(world.c_token, approval_id, decision, key)
+
+    assert replay_status == 404, replay_body
+    assert replay_body["error"]["code"] == "APPROVAL_NOT_FOUND"
+
+
+def test_decision_waits_for_an_in_flight_visibility_change(world: World) -> None:
+    """The pinned version is locked `FOR SHARE` before it is checked, so a
+    decision racing a visibility change queues behind it and then sees it,
+    rather than authorizing against the pre-change row."""
+    workflow_id = f"vis.apprrace.{uuid4().hex[:8]}"
+    _publish_workflow(world, workflow_id)
+    run_id, approval_id = _pending_approval(world, workflow_id, world.b)
+    result: dict[str, Any] = {}
+
+    def fire() -> None:
+        try:
+            result["status"], result["body"] = _decide(world.c_token, approval_id, "approve")
+        except BaseException as exc:  # surfaced on the main thread below
+            result["error"] = exc
+
+    holder = engine.connect()
+    holder_tx = holder.begin()
+    thread = threading.Thread(target=fire)
+    try:
+        holder_pid = int(holder.execute(text("SELECT pg_backend_pid()")).scalar_one())
+        holder.execute(
+            text(
+                "UPDATE workflow_versions SET visibility = 'private' "
+                "WHERE workspace_id = :ws AND workflow_id = :wf"
+            ),
+            {"ws": world.ws, "wf": workflow_id},
+        )
+        thread.start()
+        deadline = time.monotonic() + 15
+        while not _blocked_by(holder_pid):
+            assert time.monotonic() < deadline, "decision never queued on the version"
+            time.sleep(0.05)
+        holder_tx.commit()
+    finally:
+        if holder_tx.is_active:
+            holder_tx.rollback()
+        holder.close()
+        thread.join(timeout=15)
+
+    assert not thread.is_alive()
+    if "error" in result:
+        raise result["error"]
+    assert result["status"] == 404, result["body"]
+    assert _approval_status(world.ws, approval_id) == "pending"
+    assert _run_status(world.ws, run_id) == "waiting_approval"
