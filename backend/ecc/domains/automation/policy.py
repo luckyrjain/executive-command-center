@@ -237,41 +237,112 @@ def get_policy(session: Session, workspace_id: UUID, policy_id: UUID) -> Automat
     return _row_to_policy(dict(row)) if row is not None else None
 
 
+# The workflow version a policy is authorized against: the family's active
+# version, else its latest. Policy create authorizes against it (read, then
+# write), and a policy is visible only while it is readable, so a member who
+# cannot see a workflow cannot see or revoke the policies bound to it either.
+# Checked live rather than copied onto the policy at create: a later
+# visibility change, ownership transfer or revoked grant on the workflow
+# then applies to its existing policies, with no backfill.
+_GOVERNING_VERSION_SQL = (
+    "SELECT governing.id FROM workflow_versions AS governing "
+    "WHERE governing.workspace_id = {workspace_id} AND governing.workflow_id = {workflow_id} "
+    "ORDER BY governing.status = 'active' DESC, governing.version DESC LIMIT 1"
+)
+
+
 def list_policies(
     session: Session, auth: AuthContext, *, workflow_id: str | None = None
 ) -> list[AutomationPolicy]:
-    extra_clauses = []
-    extra_params: dict[str, Any] = {}
-    if workflow_id is not None:
-        extra_clauses.append("workflow_id = :workflow_id")
-        extra_params["workflow_id"] = workflow_id
-    rows = authz.list_visible_resources(
+    """Each policy is filtered by its own visibility and by its workflow's
+    governing version's (`_GOVERNING_VERSION_SQL`); a family with no
+    version hides its policies."""
+    policy_sql, policy_params = authz.visible_resource_filter_sql(
         session,
         auth,
         resource_type="automation_policies",
-        columns=_POLICY_FIELDS,
-        order_by="created_at ASC",
-        extra_clauses=extra_clauses,
-        extra_params=extra_params,
+        action="read",
+        table_alias="automation_policies",
+        param_prefix="policy_",
+    )
+    version_sql, version_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="workflow_versions",
+        action="read",
+        table_alias="workflow_versions",
+        param_prefix="version_",
+    )
+    clauses = [
+        "automation_policies.workspace_id = :workspace_id",
+        policy_sql,
+        "EXISTS (SELECT 1 FROM workflow_versions WHERE workflow_versions.id = ("
+        + _GOVERNING_VERSION_SQL.format(
+            workspace_id="automation_policies.workspace_id",
+            workflow_id="automation_policies.workflow_id",
+        )
+        + f") AND {version_sql})",
+        "(CAST(:workflow_id AS text) IS NULL OR automation_policies.workflow_id = :workflow_id)",
+    ]
+    params: dict[str, Any] = {
+        **policy_params,
+        **version_params,
+        "workspace_id": auth.workspace_id,
+        "workflow_id": workflow_id,
+    }
+    rows = (
+        session.execute(
+            text(
+                f"SELECT {_POLICY_FIELDS} FROM automation_policies "  # noqa: S608 -- constants and authz fragments only
+                f"WHERE {' AND '.join(clauses)} ORDER BY created_at ASC"
+            ),
+            params,
+        )
+        .mappings()
+        .all()
     )
     session.rollback()
     return [_row_to_policy(dict(row)) for row in rows]
 
 
-def _authorize_workflow_for_policy(session: Session, auth: AuthContext, workflow_id: str) -> None:
-    """Binding a policy to a workflow needs read (else `404`, the same answer
-    as for a `workflow_id` that never existed) then write (`403`) on the
-    workflow's active version, or its latest version when none is active.
-    Checking only that the family existed told a member whether another
-    member's private workflow existed, and let them bind to it.
+def policy_visible(session: Session, auth: AuthContext, policy_id: UUID) -> bool:
+    """`authorize(read)` on the policy and on its workflow's governing
+    version, the rule `list_policies` filters on. Takes no lock: a caller
+    that needs the answer to hold locks the policy row itself first."""
+    version_id = session.execute(
+        text(
+            "SELECT ("
+            + _GOVERNING_VERSION_SQL.format(
+                workspace_id="automation_policies.workspace_id",
+                workflow_id="automation_policies.workflow_id",
+            )
+            + ") FROM automation_policies WHERE workspace_id = :workspace_id AND id = :id"
+        ),
+        {"workspace_id": auth.workspace_id, "id": policy_id},
+    ).scalar_one_or_none()
+    return (
+        version_id is not None
+        and authz.authorize(
+            session, auth, resource_type="automation_policies", resource_id=policy_id, action="read"
+        )
+        and authz.authorize(
+            session, auth, resource_type="workflow_versions", resource_id=version_id, action="read"
+        )
+    )
 
-    That one row is locked `FOR SHARE` before the checks, so an ownership
-    transfer or visibility change committing meanwhile is seen. The family
-    row goes first, `FOR KEY SHARE` (what the policy insert's foreign key
-    takes anyway): draft create locks the family and then the latest
-    version, so taking the version first would deadlock with it. One version
-    row only: locking every version could deadlock with publish, which locks
-    the target and the active version `FOR UPDATE` in its own order.
+
+def _lock_governing_version(session: Session, auth: AuthContext, workflow_id: str) -> UUID | None:
+    """Locks and returns the workflow's governing version
+    (`_GOVERNING_VERSION_SQL`), or `None` when the family has no version.
+
+    That one row is locked `FOR SHARE` so an ownership transfer or
+    visibility change committing meanwhile is seen by the caller's checks.
+    The family row goes first, `FOR KEY SHARE` (what a policy insert's
+    foreign key takes anyway): draft create locks the family and then the
+    latest version, so taking the version first would deadlock with it. One
+    version row only: locking every version could deadlock with publish,
+    which locks the target and the active version `FOR UPDATE` in its own
+    order.
     """
     session.execute(
         text(
@@ -281,12 +352,10 @@ def _authorize_workflow_for_policy(session: Session, auth: AuthContext, workflow
         {"workspace_id": auth.workspace_id, "workflow_id": workflow_id},
     )
     pick_sql = text(
-        "SELECT id FROM workflow_versions "
-        "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id "
-        "ORDER BY status = 'active' DESC, version DESC LIMIT 1"
+        _GOVERNING_VERSION_SQL.format(workspace_id=":workspace_id", workflow_id=":workflow_id")
     )
     params = {"workspace_id": auth.workspace_id, "workflow_id": workflow_id}
-    version_id = session.execute(pick_sql, params).scalar_one_or_none()
+    version_id: UUID | None = session.execute(pick_sql, params).scalar_one_or_none()
     if version_id is not None:
         lock_sql = text("SELECT id FROM workflow_versions WHERE id = :id FOR SHARE")
         session.execute(lock_sql, {"id": version_id})
@@ -297,6 +366,17 @@ def _authorize_workflow_for_policy(session: Session, auth: AuthContext, workflow
         if current is not None and current != version_id:
             version_id = current
             session.execute(lock_sql, {"id": version_id})
+    return version_id
+
+
+def _authorize_workflow_for_policy(session: Session, auth: AuthContext, workflow_id: str) -> None:
+    """Binding a policy to a workflow needs read (else `404`, the same answer
+    as for a `workflow_id` that never existed) then write (`403`) on the
+    workflow's governing version, locked first (`_lock_governing_version`).
+    Checking only that the family existed told a member whether another
+    member's private workflow existed, and let them bind to it.
+    """
+    version_id = _lock_governing_version(session, auth, workflow_id)
     if version_id is None or not authz.authorize(
         session, auth, resource_type="workflow_versions", resource_id=version_id, action="read"
     ):
@@ -610,17 +690,37 @@ def revoke_policy_endpoint(
         # no longer able to see the row) never has a cached success replayed.
         # (`revoke_policy` re-selects this row FOR UPDATE below:
         # a no-op re-lock within this transaction.)
-        locked = session.execute(
+        workflow_id = session.execute(
             text(
-                "SELECT id FROM automation_policies "
+                "SELECT workflow_id FROM automation_policies "
                 "WHERE workspace_id = :workspace_id AND id = :id FOR UPDATE"
             ),
             {"workspace_id": auth.workspace_id, "id": policy_id},
-        ).one_or_none()
-        if locked is None:
+        ).scalar_one_or_none()
+        if workflow_id is None:
             raise HTTPException(status_code=404, detail="POLICY_NOT_FOUND")
-        if not authz.authorize(
-            session, auth, resource_type="automation_policies", resource_id=policy_id, action="read"
+        # A policy is visible only while its workflow's governing version is
+        # readable too (`list_policies`), and unbinding it needs write there,
+        # as binding it did. Policy row first, then the version. Every read
+        # check runs before any write check, so a 403 never confirms a
+        # policy the caller cannot see.
+        version_id = _lock_governing_version(session, auth, workflow_id)
+        if (
+            version_id is None
+            or not authz.authorize(
+                session,
+                auth,
+                resource_type="automation_policies",
+                resource_id=policy_id,
+                action="read",
+            )
+            or not authz.authorize(
+                session,
+                auth,
+                resource_type="workflow_versions",
+                resource_id=version_id,
+                action="read",
+            )
         ):
             raise HTTPException(status_code=404, detail="POLICY_NOT_FOUND")
         if not authz.authorize(
@@ -628,6 +728,12 @@ def revoke_policy_endpoint(
             auth,
             resource_type="automation_policies",
             resource_id=policy_id,
+            action="write",
+        ) or not authz.authorize(
+            session,
+            auth,
+            resource_type="workflow_versions",
+            resource_id=version_id,
             action="write",
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
