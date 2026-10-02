@@ -756,3 +756,314 @@ def test_decision_waits_for_an_in_flight_visibility_change(world: World) -> None
     assert result["status"] == 404, result["body"]
     assert _approval_status(world.ws, approval_id) == "pending"
     assert _run_status(world.ws, run_id) == "waiting_approval"
+
+
+# ---------------------------------------------------------------------------
+# GET /automations/policies, POST /automations/policies/{id}/revoke
+# ---------------------------------------------------------------------------
+
+
+def _b_policy(w: World, workflow_id: str) -> UUID:
+    """A policy B binds to B's workflow (inserted workspace-visible, like
+    every policy)."""
+    with SessionFactory() as session, session.begin():
+        created = automation_policy.create_policy(
+            session,
+            w.ws,
+            w.b,
+            workflow_id=workflow_id,
+            action_types=sorted(ACTION_TYPES),
+            data_classes=["sensitive"],
+            value_limit=Decimal("100"),
+            count_limit=5,
+            rate_limit=None,
+            schedule=None,
+            approval_mode="bounded_recurring",
+        )
+    assert isinstance(created, automation_policy.AutomationPolicy)
+    return created.id
+
+
+def _listed_policy_ids(token: str, workflow_id: str | None = None) -> set[str]:
+    params = {"workflow_id": workflow_id} if workflow_id else None
+    response = _client(token).get("/api/v1/automations/policies", params=params)
+    assert response.status_code == 200, response.text
+    return {policy["id"] for policy in response.json()["policies"]}
+
+
+def _revoke_policy(token: str, policy_id: UUID, key: str | None = None) -> tuple[int, Any]:
+    response = _client(token).post(
+        f"/api/v1/automations/policies/{policy_id}/revoke", headers=_headers(token, key)
+    )
+    return response.status_code, response.json()
+
+
+def _policy_revoked(ws: UUID, policy_id: UUID) -> bool:
+    with engine.connect() as connection:
+        return (
+            connection.execute(
+                text(
+                    "SELECT revoked_at FROM automation_policies "
+                    "WHERE workspace_id = :ws AND id = :id"
+                ),
+                {"ws": ws, "id": policy_id},
+            ).scalar_one()
+            is not None
+        )
+
+
+def test_policies_of_private_workflow_are_hidden_from_other_members(world: World) -> None:
+    workflow_id = f"vis.pol.{uuid4().hex[:8]}"
+    _draft_workflow(world, workflow_id)
+    policy_id = _b_policy(world, workflow_id)
+    _set_family_visibility(world.ws, workflow_id, "private")
+
+    assert str(policy_id) not in _listed_policy_ids(world.c_token, workflow_id)
+    assert str(policy_id) not in _listed_policy_ids(world.c_token)
+    # A workspace owner role does not see into a member's private workflow.
+    assert str(policy_id) not in _listed_policy_ids(world.a_token, workflow_id)
+
+    assert str(policy_id) in _listed_policy_ids(world.b_token, workflow_id)
+    assert str(policy_id) in _listed_policy_ids(world.b_token)
+
+
+def test_policies_of_workspace_workflow_stay_visible(world: World) -> None:
+    workflow_id = f"vis.wspol.{uuid4().hex[:8]}"
+    _draft_workflow(world, workflow_id)
+    policy_id = _b_policy(world, workflow_id)
+
+    assert str(policy_id) in _listed_policy_ids(world.c_token, workflow_id)
+    assert str(policy_id) in _listed_policy_ids(world.c_token)
+
+
+def test_policy_list_follows_the_active_version_not_any_version(world: World) -> None:
+    """The same version policy create authorizes against: a stray
+    workspace-visible draft does not reopen a private active version."""
+    workflow_id = f"vis.polmixed.{uuid4().hex[:8]}"
+    active = _publish_workflow(world, workflow_id)
+    _draft_workflow(world, workflow_id)
+    policy_id = _b_policy(world, workflow_id)
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE workflow_versions SET visibility = 'private' WHERE id = :id"),
+            {"id": active.id},
+        )
+
+    assert str(policy_id) not in _listed_policy_ids(world.c_token, workflow_id)
+    status, _ = _revoke_policy(world.c_token, policy_id)
+    assert status == 404
+    assert not _policy_revoked(world.ws, policy_id)
+
+
+def test_policy_of_shared_workflow_is_visible_to_grantee(world: World) -> None:
+    workflow_id = f"vis.sharedpol.{uuid4().hex[:8]}"
+    _draft_workflow(world, workflow_id)
+    policy_id = _b_policy(world, workflow_id)
+    _set_family_visibility(world.ws, workflow_id, "shared_explicitly")
+    _grant_family(world, workflow_id, ["read"])
+
+    assert str(policy_id) in _listed_policy_ids(world.c_token, workflow_id)
+
+
+def test_policy_revoke_for_private_workflow_is_indistinguishable_from_missing(
+    world: World,
+) -> None:
+    workflow_id = f"vis.polrev.{uuid4().hex[:8]}"
+    _draft_workflow(world, workflow_id)
+    policy_id = _b_policy(world, workflow_id)
+    _set_family_visibility(world.ws, workflow_id, "private")
+
+    hidden_status, hidden_body = _revoke_policy(world.c_token, policy_id)
+    missing_status, missing_body = _revoke_policy(world.c_token, uuid4())
+
+    assert hidden_status == missing_status == 404, hidden_body
+    assert hidden_body["error"]["code"] == missing_body["error"]["code"] == "POLICY_NOT_FOUND"
+    assert not _policy_revoked(world.ws, policy_id)
+
+    status, body = _revoke_policy(world.b_token, policy_id)
+    assert status == 200, body
+
+
+def test_policy_revoke_with_read_only_grant_is_forbidden(world: World) -> None:
+    """Unbinding a policy is authority over the workflow, as binding one is."""
+    workflow_id = f"vis.polread.{uuid4().hex[:8]}"
+    _draft_workflow(world, workflow_id)
+    policy_id = _b_policy(world, workflow_id)
+    _set_family_visibility(world.ws, workflow_id, "shared_explicitly")
+    _grant_family(world, workflow_id, ["read"])
+
+    status, body = _revoke_policy(world.c_token, policy_id)
+
+    assert status == 403, body
+    assert body["error"]["code"] == "INSUFFICIENT_ROLE"
+    assert not _policy_revoked(world.ws, policy_id)
+
+
+def test_policy_revoke_with_write_grant_succeeds(world: World) -> None:
+    workflow_id = f"vis.polwrite.{uuid4().hex[:8]}"
+    _draft_workflow(world, workflow_id)
+    policy_id = _b_policy(world, workflow_id)
+    _set_family_visibility(world.ws, workflow_id, "shared_explicitly")
+    _grant_family(world, workflow_id, ["read", "write"])
+
+    status, body = _revoke_policy(world.c_token, policy_id)
+
+    assert status == 200, body
+    assert _policy_revoked(world.ws, policy_id)
+
+
+def test_policy_revoke_replay_is_reauthorized(world: World) -> None:
+    """ADR-0014: a same-key replay after the workflow went private answers
+    404, not the cached 200."""
+    workflow_id = f"vis.polreplay.{uuid4().hex[:8]}"
+    _draft_workflow(world, workflow_id)
+    policy_id = _b_policy(world, workflow_id)
+    key = str(uuid4())
+
+    first_status, first_body = _revoke_policy(world.c_token, policy_id, key)
+    assert first_status == 200, first_body
+
+    _set_family_visibility(world.ws, workflow_id, "private")
+    replay_status, replay_body = _revoke_policy(world.c_token, policy_id, key)
+
+    assert replay_status == 404, replay_body
+    assert replay_body["error"]["code"] == "POLICY_NOT_FOUND"
+
+
+def test_policy_revoke_sees_a_visibility_change_committed_while_it_waits(world: World) -> None:
+    """Revoke locks the policy row, then the workflow's version `FOR SHARE`,
+    before authorizing. A transaction that has the version locked and makes
+    it private holds the revoke back; once it commits, the revoke sees the
+    private version and answers 404."""
+    workflow_id = f"vis.polrace.{uuid4().hex[:8]}"
+    draft = _draft_workflow(world, workflow_id)
+    policy_id = _b_policy(world, workflow_id)
+    result: dict[str, Any] = {}
+
+    def fire() -> None:
+        try:
+            result["status"], result["body"] = _revoke_policy(world.c_token, policy_id)
+        except BaseException as exc:  # surfaced on the main thread below
+            result["error"] = exc
+
+    holder = engine.connect()
+    holder_tx = holder.begin()
+    thread = threading.Thread(target=fire)
+    try:
+        holder_pid = int(holder.execute(text("SELECT pg_backend_pid()")).scalar_one())
+        holder.execute(
+            text("UPDATE workflow_versions SET visibility = 'private' WHERE id = :id"),
+            {"id": draft.id},
+        )
+        thread.start()
+        deadline = time.monotonic() + 15
+        while not _blocked_by(holder_pid):
+            assert time.monotonic() < deadline, "revoke never queued on the version row"
+            time.sleep(0.05)
+        holder_tx.commit()
+    finally:
+        if holder_tx.is_active:
+            holder_tx.rollback()
+        holder.close()
+        thread.join(timeout=15)
+
+    assert not thread.is_alive()
+    if "error" in result:
+        raise result["error"]
+    assert result["status"] == 404, result["body"]
+    assert not _policy_revoked(world.ws, policy_id)
+
+
+def test_policy_stays_visible_when_only_a_stray_draft_is_private(world: World) -> None:
+    """The governing version is the active one: a private draft newer than
+    a readable active version hides nothing."""
+    workflow_id = f"vis.polstray.{uuid4().hex[:8]}"
+    _publish_workflow(world, workflow_id)
+    stray = _draft_workflow(world, workflow_id)
+    policy_id = _b_policy(world, workflow_id)
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE workflow_versions SET visibility = 'private' WHERE id = :id"),
+            {"id": stray.id},
+        )
+
+    assert str(policy_id) in _listed_policy_ids(world.c_token, workflow_id)
+    status, body = _revoke_policy(world.c_token, policy_id)
+    assert status == 200, body
+
+
+def _post_draft(token: str, workflow_id: str, policy_ref: UUID) -> tuple[int, Any]:
+    response = _client(token).post(
+        "/api/v1/automations/workflows",
+        json={"workflow_id": workflow_id, "graph": _GRAPH, "policy_ref": str(policy_ref)},
+        headers=_headers(token),
+    )
+    return response.status_code, response.json()
+
+
+def test_draft_policy_ref_to_a_hidden_policy_is_indistinguishable_from_missing(
+    world: World,
+) -> None:
+    """A draft may only reference a policy the caller could list."""
+    hidden_workflow = f"vis.polref.{uuid4().hex[:8]}"
+    _draft_workflow(world, hidden_workflow)
+    policy_id = _b_policy(world, hidden_workflow)
+    _set_family_visibility(world.ws, hidden_workflow, "private")
+
+    hidden_status, hidden_body = _post_draft(
+        world.c_token, f"vis.mine.{uuid4().hex[:8]}", policy_id
+    )
+    missing_status, missing_body = _post_draft(
+        world.c_token, f"vis.mine.{uuid4().hex[:8]}", uuid4()
+    )
+
+    assert hidden_status == missing_status == 404, hidden_body
+    assert hidden_body["error"]["code"] == missing_body["error"]["code"] == "POLICY_NOT_FOUND"
+
+
+def test_draft_create_does_not_deadlock_with_policy_revoke(world: World) -> None:
+    """Revoke locks the policy, then its workflow's governing version. Draft
+    create with that policy as `policy_ref` used to lock the family's
+    versions first and the policy last, so the two deadlocked. Here a
+    holder takes revoke's locks in its order around a draft create: the
+    draft create must queue on the policy, holding no version lock."""
+    workflow_id = f"vis.revdead.{uuid4().hex[:8]}"
+    draft = _draft_workflow(world, workflow_id)
+    policy_id = _b_policy(world, workflow_id)
+    result: dict[str, Any] = {}
+
+    def fire() -> None:
+        try:
+            result["status"], result["body"] = _post_draft(world.b_token, workflow_id, policy_id)
+        except BaseException as exc:  # surfaced on the main thread below
+            result["error"] = exc
+
+    holder = engine.connect()
+    holder_tx = holder.begin()
+    thread = threading.Thread(target=fire)
+    try:
+        holder_pid = int(holder.execute(text("SELECT pg_backend_pid()")).scalar_one())
+        holder.execute(
+            text("SELECT id FROM automation_policies WHERE id = :id FOR UPDATE"),
+            {"id": policy_id},
+        )
+        thread.start()
+        deadline = time.monotonic() + 15
+        while not _blocked_by(holder_pid):
+            assert time.monotonic() < deadline, "draft create never queued on the policy"
+            time.sleep(0.05)
+        holder.execute(text("SET LOCAL lock_timeout = '5s'"))
+        holder.execute(
+            text("SELECT id FROM workflow_versions WHERE id = :id FOR SHARE"), {"id": draft.id}
+        )
+        holder_tx.commit()
+    finally:
+        if holder_tx.is_active:
+            holder_tx.rollback()
+        holder.close()
+        thread.join(timeout=15)
+
+    assert not thread.is_alive()
+    if "error" in result:
+        raise result["error"]
+    assert result["status"] == 201, result["body"]
