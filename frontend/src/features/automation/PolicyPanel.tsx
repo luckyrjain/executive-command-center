@@ -34,7 +34,7 @@ function createErrorMessage(error: unknown): string {
 
 function revokeErrorMessage(error: unknown): string {
   if (error instanceof ApiError && error.code === 'INSUFFICIENT_ROLE') {
-    return 'You cannot change this workflow, so you cannot revoke its policies.'
+    return 'You do not have permission to revoke this policy.'
   }
   return errorMessage(error)
 }

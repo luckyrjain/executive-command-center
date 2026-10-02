@@ -116,7 +116,7 @@ describe('PolicyPanel', () => {
     expect(await screen.findByText(/already expired/)).toBeTruthy()
   })
 
-  it('explains a 403 on revoke as a workflow the caller can see but not change', async () => {
+  it('explains a 403 on revoke without blaming the workflow', async () => {
     const fetch = vi.fn()
       .mockImplementationOnce(() => response({ policies: [activePolicy] }))
       .mockImplementationOnce(() => response({ error: { code: 'INSUFFICIENT_ROLE', message: 'Insufficient Role' } }, 403))
@@ -127,7 +127,7 @@ describe('PolicyPanel', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Revoke policy for weekly-digest' }))
 
     const alert = await screen.findByRole('alert')
-    expect(alert.textContent).toContain('cannot revoke its policies')
+    expect(alert.textContent).toContain('do not have permission to revoke this policy')
     expect(alert.textContent).not.toContain('Insufficient Role')
   })
 
