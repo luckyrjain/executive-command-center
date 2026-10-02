@@ -28,6 +28,17 @@ Modes are `preview_only|per_run|bounded_recurring`.
 
 Each action adapter statically declares its `high_impact_categories` at registration time, checked before any execution attempt. **A rollback (`step_type='compensation'`) step is the one place this per-run-approval requirement cannot be satisfied at dispatch time**, because compensation runs as an automatic continuation of a failing run and has no approval-inbox surface to wait in; the requirement is upheld there by forbidding the situation entirely -- a compensation step whose `action_ref` names an adapter with any declared `high_impact_categories` is rejected at publish time (`EXECUTION-CONTRACT.md`, `422 COMPENSATION_ACTION_REF_HIGH_IMPACT`), so no high-impact action can ever execute as a rollback. **An adapter that cannot classify itself into any category still defaults to requiring per-run approval** -- `bounded` (eligible for `bounded_recurring` mode, no per-run prompt) is a category an adapter must explicitly and correctly claim; there is no "none of the above, therefore bounded" default (fail closed, matching Phase 4's conservative data-class default precedent).
 
+## Separation of duties (opt-in per workspace)
+
+Approval requests are workspace-visible, so by default the member who started a run (`workflow_runs.created_by`) can approve its own high-impact step: approval guarantees a human decided, not a *second* human. That default is deliberate -- a single-member workspace has nobody else who could ever approve.
+
+A workspace owner can require a distinct approver with `PATCH /api/v1/identity/workspaces/{id}` `{"require_distinct_approver": true}` (migration `0085_distinct_approver`, default `false`). While it is on:
+
+- `POST /automations/approvals/{id}/approve` by the run's starter returns `403 SELF_APPROVAL_FORBIDDEN`; the request stays `pending` and the run stays paused until another member approves it, it is rejected, or it expires. The owner is not exempt.
+- Rejecting is still allowed for the starter -- declining an action is always safe.
+- Only an `owner` can change the setting (`INSUFFICIENT_ROLE` for anyone else): an admin able to switch it off could remove the control meant to constrain them.
+- `decide_approval` reads the setting `FOR SHARE` on the `workspaces` row, so an owner enabling it while a decision is in flight either applies to that decision or waits for it to commit -- never half-way.
+
 ## Expiry and rate limits (resolved)
 
 | Control | Value | Behavior on limit |

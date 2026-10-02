@@ -12,7 +12,7 @@ function response(body: unknown, status = 200) {
 }
 
 function workspace(overrides: Partial<Workspace> = {}): Workspace {
-  return { id: 'workspace-1', name: 'Acme', timezone: 'UTC', role: 'owner', created_at: '2026-01-01T00:00:00Z', current: true, ...overrides }
+  return { id: 'workspace-1', name: 'Acme', timezone: 'UTC', require_distinct_approver: false, role: 'owner', created_at: '2026-01-01T00:00:00Z', current: true, ...overrides }
 }
 
 function member(overrides: Partial<Member> = {}): Member {

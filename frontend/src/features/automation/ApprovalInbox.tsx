@@ -18,6 +18,9 @@ function errorMessage(error: unknown): string | { code: string; text: string } {
   if (error.code === 'APPROVAL_EXPIRED') {
     return { code: 'APPROVAL_EXPIRED', text: `This approval expired${details?.expires_at ? ` at ${new Date(details.expires_at).toLocaleString()}` : ''} and can no longer be decided.` }
   }
+  if (error.code === 'SELF_APPROVAL_FORBIDDEN') {
+    return { code: 'SELF_APPROVAL_FORBIDDEN', text: 'This workspace requires a different member to approve: you started this run, so someone else must approve it. You can still reject it.' }
+  }
   if (error.code === 'APPROVAL_ALREADY_DECIDED') {
     return { code: 'APPROVAL_ALREADY_DECIDED', text: `This approval was already ${details?.decision ?? 'decided'}${details?.decided_at ? ` at ${new Date(details.decided_at).toLocaleString()}` : ''}.` }
   }

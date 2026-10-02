@@ -149,6 +149,21 @@ describe('ApprovalInbox', () => {
     expect(await screen.findByText(/does not match this approval's current action digest/)).toBeTruthy()
   })
 
+  it('explains self_approval_forbidden instead of showing a generic error', async () => {
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ approvals: [pendingApproval] }))
+      .mockImplementationOnce(() => response(runDetail))
+      .mockImplementationOnce(() => response({ error: { code: 'SELF_APPROVAL_FORBIDDEN', message: 'Self Approval Forbidden' } }, 403))
+    vi.stubGlobal('fetch', fetch)
+    renderInbox()
+
+    await waitFor(() => expect(screen.getByText(/Run run-1 · step 0/)).toBeTruthy())
+    fireEvent.change(screen.getByLabelText('Echo the action digest above to approve, run run-1 step 0'), { target: { value: 'digest-abc123' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+
+    expect(await screen.findByText(/requires a different member to approve/)).toBeTruthy()
+  })
+
   it('surfaces approval_expired as a distinct state and disables both decision actions', async () => {
     const expiredApproval: Approval = { ...pendingApproval, expires_at: '2020-01-01T00:00:00Z' }
     vi.stubGlobal('fetch', mockFetchByPath({

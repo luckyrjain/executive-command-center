@@ -351,12 +351,18 @@ class WorkspacePatchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str | None = Field(default=None, min_length=1, max_length=200)
     timezone: str | None = Field(default=None, min_length=1, max_length=64)
+    # Owner-only (`patch_workspace_endpoint`): when true, a member may not
+    # approve an automation approval request for a run they started
+    # (`automation.approvals.decide_approval`). An admin who could flip it
+    # could also switch off the control meant to constrain them.
+    require_distinct_approver: bool | None = None
 
 
 class WorkspaceResponse(BaseModel):
     id: UUID
     name: str
     timezone: str
+    require_distinct_approver: bool
     role: str
     created_at: datetime
     # Phase 8 Task 9's own addition -- `GET /workspaces` is the only call a
@@ -684,7 +690,8 @@ def list_workspaces_endpoint(auth: AuthDep, session: SessionDep) -> WorkspaceLis
         session.execute(
             text(
                 """
-                SELECT w.id, w.name, w.timezone, wm.role, w.created_at
+                SELECT w.id, w.name, w.timezone, w.require_distinct_approver,
+                    wm.role, w.created_at
                 FROM workspace_memberships AS wm
                 JOIN workspaces AS w ON w.id = wm.workspace_id
                 WHERE wm.account_id = :account_id AND wm.status = 'active'
@@ -714,7 +721,8 @@ def get_workspace_endpoint(
         session.execute(
             text(
                 """
-                SELECT w.id, w.name, w.timezone, wm.role, w.created_at
+                SELECT w.id, w.name, w.timezone, w.require_distinct_approver,
+                    wm.role, w.created_at
                 FROM workspace_memberships AS wm
                 JOIN workspaces AS w ON w.id = wm.workspace_id
                 WHERE w.id = :workspace_id AND wm.users_id = :users_id AND wm.status = 'active'
@@ -816,6 +824,7 @@ def create_workspace_endpoint(
         id=new_workspace_id,
         name=payload.name,
         timezone=payload.timezone,
+        require_distinct_approver=False,
         role="owner",
         created_at=now,
         # The caller's session stays scoped to their existing
@@ -858,12 +867,16 @@ def patch_workspace_endpoint(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="WORKSPACE_NOT_FOUND")
         if membership["role"] not in {"owner", "admin"}:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="INSUFFICIENT_ROLE")
+        if payload.require_distinct_approver is not None and membership["role"] != "owner":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="INSUFFICIENT_ROLE")
 
         updates: dict[str, Any] = {}
         if payload.name is not None:
             updates["name"] = payload.name
         if payload.timezone is not None:
             updates["timezone"] = payload.timezone
+        if payload.require_distinct_approver is not None:
+            updates["require_distinct_approver"] = payload.require_distinct_approver
         if updates:
             set_clause = ", ".join(f"{column} = :{column}" for column in updates)
             session.execute(
@@ -888,7 +901,8 @@ def patch_workspace_endpoint(
             session.execute(
                 text(
                     """
-                    SELECT w.id, w.name, w.timezone, wm.role, w.created_at
+                    SELECT w.id, w.name, w.timezone, w.require_distinct_approver,
+                        wm.role, w.created_at
                     FROM workspace_memberships AS wm
                     JOIN workspaces AS w ON w.id = wm.workspace_id
                     WHERE w.id = :workspace_id AND wm.users_id = :users_id

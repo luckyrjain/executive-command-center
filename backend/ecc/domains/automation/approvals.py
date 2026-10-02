@@ -216,6 +216,16 @@ class ApprovalExpired:
     expires_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class ApprovalSelfApprovalForbidden:
+    """The workspace has `require_distinct_approver` on and the approving
+    member started the run this request gates (`workflow_runs.created_by`).
+    Only `"approved"` is refused -- rejecting your own run's step is always
+    safe."""
+
+    run_created_by: UUID
+
+
 def approval_lifecycle_status(
     approval: ApprovalRequest, *, now: datetime | None = None
 ) -> LifecycleStatus:
@@ -438,6 +448,7 @@ def decide_approval(
     | ApprovalDigestMismatch
     | ApprovalAlreadyDecided
     | ApprovalExpired
+    | ApprovalSelfApprovalForbidden
 ):
     """Records a human decision. `current_action_digest` is required for
     `decision == "approved"` (echoed by the caller -- `API-SCHEMAS.md`:
@@ -485,6 +496,28 @@ def decide_approval(
         return ApprovalDigestMismatch(
             expected_digest=approval.action_digest, provided_digest=current_action_digest
         )
+
+    if decision == "approved":
+        # Separation of duties, opt-in per workspace (migration
+        # `0085_distinct_approver`). `FOR SHARE` on the workspace row: an
+        # owner flipping the setting either commits before this read (and
+        # applies) or waits until this decision commits -- never applies
+        # half-way through it. Reading the run's `created_by` needs no lock:
+        # it is written once, by `worker.enqueue_run`, and never updated.
+        requires_distinct_approver = session.execute(
+            text("SELECT require_distinct_approver FROM workspaces WHERE id = :id FOR SHARE"),
+            {"id": workspace_id},
+        ).scalar_one()
+        if requires_distinct_approver:
+            run_created_by = session.execute(
+                text(
+                    "SELECT created_by FROM workflow_runs "
+                    "WHERE workspace_id = :workspace_id AND id = :run_id"
+                ),
+                {"workspace_id": workspace_id, "run_id": approval.run_id},
+            ).scalar_one()
+            if run_created_by == actor_id:
+                return ApprovalSelfApprovalForbidden(run_created_by=run_created_by)
 
     session.execute(
         text(
@@ -801,6 +834,8 @@ def approve_endpoint(
                 status_code=409,
                 detail={"code": "APPROVAL_EXPIRED", "expires_at": result.expires_at.isoformat()},
             )
+        if isinstance(result, ApprovalSelfApprovalForbidden):
+            raise HTTPException(status_code=403, detail={"code": "SELF_APPROVAL_FORBIDDEN"})
 
         response = _to_response(result)
         audit_outbox.write_audit_and_outbox(
@@ -905,6 +940,11 @@ def reject_endpoint(
                 status_code=409,
                 detail={"code": "APPROVAL_EXPIRED", "expires_at": result.expires_at.isoformat()},
             )
+        if isinstance(result, ApprovalSelfApprovalForbidden):
+            # Unreachable for decision="rejected" (only approving your own
+            # run's step is refused) -- handled for exhaustiveness, like
+            # ApprovalDigestMismatch above.
+            raise HTTPException(status_code=403, detail={"code": "SELF_APPROVAL_FORBIDDEN"})
 
         response = _to_response(result)
         audit_outbox.write_audit_and_outbox(

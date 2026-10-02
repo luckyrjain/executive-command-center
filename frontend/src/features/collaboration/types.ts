@@ -32,6 +32,8 @@ export type Workspace = {
   id: string
   name: string
   timezone: string
+  /** Owner-only setting: when true, a member may not approve an automation approval for a run they started. */
+  require_distinct_approver: boolean
   role: string
   created_at: string
   current: boolean
