@@ -1033,7 +1033,7 @@ def _to_response(version: WorkflowVersion) -> WorkflowVersionResponse:
     )
 
 
-def _lock_active_version(
+def lock_active_version(
     session: Session, select_sql: str, lock_clause: str, params: dict[str, Any]
 ) -> UUID | None:
     """Locks and returns the family's active version id, or `None` when it
@@ -1044,7 +1044,11 @@ def _lock_active_version(
     version". A fresh, unlocked statement settles it; if it finds one, lock
     that instead. That publish has committed, so locking its row cannot
     deadlock with it. A row the locking select does return is active and
-    stays so while the lock is held.
+    stays so while the lock is held. Each extra pass needs yet another
+    publish to have committed in between, so the loop ends.
+
+    `select_sql` must select one id filtered on `status = 'active'`;
+    `lock_clause` is the row lock to take (`FOR UPDATE`, `FOR SHARE`, ...).
     """
     while True:
         locked = session.execute(text(f"{select_sql} {lock_clause}"), params).scalar_one_or_none()
@@ -1102,7 +1106,7 @@ def _lock_and_authorize_family(session: Session, auth: AuthContext, workflow_id:
         ),
         params,
     ).scalar_one_or_none()
-    active_id = _lock_active_version(
+    active_id = lock_active_version(
         session,
         "SELECT id FROM workflow_versions "
         "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id "
@@ -1158,7 +1162,7 @@ def _authorize_retiring_active_version(
     visible draft as missing. A 403 here discloses only that the active
     version is not theirs to change.
     """
-    active_id = _lock_active_version(
+    active_id = lock_active_version(
         session,
         "SELECT a.id FROM workflow_versions AS a "
         "JOIN workflow_versions AS t "
