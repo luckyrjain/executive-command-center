@@ -700,10 +700,10 @@ from ecc.observability import (
     record_step_retry,
     record_unknown_outcome,
 )
-from ecc.platform import audit_outbox, authz
+from ecc.platform import audit_outbox
 from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
 
-from . import kill_switches
+from . import kill_switches, run_visibility
 from . import policy as policy_module
 from .adapter_contract import dispatch_value
 from .adapters import (
@@ -1344,26 +1344,31 @@ def list_runs(
     *,
     status_filter: RunStatus | None = None,
 ) -> list[WorkflowRun]:
-    """Workspace-scoped run listing (Task 4's `GET /automations/runs`) --
-    added alongside `pause_run`/`resume_run` rather than in `runs.py`
-    itself, matching this package's established convention that reads
-    against a table live in that table's own owning module
+    """Workspace-scoped run listing (Task 4's `GET /automations/runs`).
+    Each run is filtered by its own visibility and by its pinned version's
+    (`run_visibility`).
+
+    Lives here rather than in `runs.py`, matching this package's convention
+    that reads against a table live in that table's own owning module
     (`approvals.list_approvals`, `policy.list_policies`), with the router
     module itself staying a thin HTTP-shape layer.
     """
-    extra_clauses = []
-    extra_params: dict[str, Any] = {}
+    visible_sql, visible_params = run_visibility.visible_runs_filter_sql(session, auth)
+    clauses = ["workflow_runs.workspace_id = :workspace_id", visible_sql]
+    params: dict[str, Any] = {**visible_params, "workspace_id": auth.workspace_id}
     if status_filter is not None:
-        extra_clauses.append("status = :status_filter")
-        extra_params["status_filter"] = status_filter
-    rows = authz.list_visible_resources(
-        session,
-        auth,
-        resource_type="workflow_runs",
-        columns=_RUN_FIELDS,
-        order_by="queued_at DESC",
-        extra_clauses=extra_clauses,
-        extra_params=extra_params,
+        clauses.append("workflow_runs.status = :status_filter")
+        params["status_filter"] = status_filter
+    rows = (
+        session.execute(
+            text(
+                f"SELECT {_RUN_FIELDS} FROM workflow_runs "  # noqa: S608 -- constants and authz fragments only
+                f"WHERE {' AND '.join(clauses)} ORDER BY queued_at DESC"
+            ),
+            params,
+        )
+        .mappings()
+        .all()
     )
     return [_row_to_run(dict(row)) for row in rows]
 

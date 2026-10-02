@@ -99,6 +99,7 @@ from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 from ecc.platform.request_models import EmptyBody as _EmptyBody
 
+from . import run_visibility
 from . import worker as worker_module
 from . import workflows as workflows_module
 from .worker import (
@@ -360,9 +361,7 @@ def list_runs_endpoint(
 
 @router.get("/runs/{run_id}", response_model=RunDetailResponse)
 def get_run_endpoint(run_id: UUID, auth: AuthDep, session: SessionDep) -> RunDetailResponse:
-    visible = authz.authorize(
-        session, auth, resource_type="workflow_runs", resource_id=run_id, action="read"
-    )
+    visible = run_visibility.run_visible(session, auth, run_id)
     session.rollback()
     if not visible:
         raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
@@ -591,9 +590,8 @@ def _mutate_run(
         ).one_or_none()
         if locked is None:
             raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
-        if not authz.authorize(
-            session, auth, resource_type="workflow_runs", resource_id=run_id, action="read"
-        ):
+        # The pinned version must be readable too (`run_visibility`).
+        if not run_visibility.run_visible(session, auth, run_id, lock_version=True):
             raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="workflow_runs", resource_id=run_id, action="write"
