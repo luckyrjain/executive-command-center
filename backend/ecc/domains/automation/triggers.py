@@ -67,6 +67,8 @@ from ecc.auth import AuthContext, AuthDep
 from ecc.database import get_session
 from ecc.platform import authz
 
+from .policy import GOVERNING_VERSION_SQL
+
 TriggerType = Literal["manual", "event", "schedule"]
 
 _TRIGGER_FIELDS = """
@@ -126,28 +128,17 @@ def get_trigger(session: Session, workspace_id: UUID, trigger_id: UUID) -> Trigg
     return _row_to_trigger(dict(row)) if row is not None else None
 
 
-# The workflow version a trigger is judged by: the family's active version,
-# else its latest. `create_trigger` stamps every row `visibility =
-# 'workspace'`, so the trigger row alone would show every member the schedule
-# and event filter of another member's private workflow. Checked live rather
-# than copied onto the trigger: a later visibility change, ownership transfer
-# or revoked grant on the workflow then applies to its existing triggers,
-# with no backfill. The same version `POST /automations/policies` authorizes
-# a policy against (`policy._authorize_workflow_for_policy`).
-_GOVERNING_VERSION_SQL = (
-    "SELECT governing.id FROM workflow_versions AS governing "
-    "WHERE governing.workspace_id = triggers.workspace_id "
-    "AND governing.workflow_id = triggers.workflow_id "
-    "ORDER BY governing.status = 'active' DESC, governing.version DESC LIMIT 1"
-)
-
-
 def list_triggers(
     session: Session, auth: AuthContext, *, workflow_id: str | None = None
 ) -> list[Trigger]:
     """Each trigger is filtered by its own visibility and by its workflow's
-    governing version's (`_GOVERNING_VERSION_SQL`); a family with no
-    version hides its triggers."""
+    governing version's (`policy.GOVERNING_VERSION_SQL`, the version policy
+    create authorizes against); a family with no version hides its
+    triggers. `create_trigger` stamps every row `visibility = 'workspace'`,
+    so the trigger row alone would show every member the schedule and event
+    filter of another member's private workflow. Checked live, so a later
+    visibility change, ownership transfer or revoked grant on the workflow
+    applies to its existing triggers with no backfill."""
     trigger_sql, trigger_params = authz.visible_resource_filter_sql(
         session,
         auth,
@@ -168,7 +159,10 @@ def list_triggers(
         "triggers.workspace_id = :workspace_id",
         trigger_sql,
         "EXISTS (SELECT 1 FROM workflow_versions WHERE workflow_versions.id = ("
-        f"{_GOVERNING_VERSION_SQL}) AND {version_sql})",
+        + GOVERNING_VERSION_SQL.format(
+            workspace_id="triggers.workspace_id", workflow_id="triggers.workflow_id"
+        )
+        + f") AND {version_sql})",
         "(CAST(:workflow_id AS text) IS NULL OR triggers.workflow_id = :workflow_id)",
     ]
     params: dict[str, Any] = {
