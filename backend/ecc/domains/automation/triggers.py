@@ -67,6 +67,8 @@ from ecc.auth import AuthContext, AuthDep
 from ecc.database import get_session
 from ecc.platform import authz
 
+from .policy import GOVERNING_VERSION_SQL
+
 TriggerType = Literal["manual", "event", "schedule"]
 
 _TRIGGER_FIELDS = """
@@ -129,19 +131,56 @@ def get_trigger(session: Session, workspace_id: UUID, trigger_id: UUID) -> Trigg
 def list_triggers(
     session: Session, auth: AuthContext, *, workflow_id: str | None = None
 ) -> list[Trigger]:
-    extra_clauses = []
-    extra_params: dict[str, Any] = {}
-    if workflow_id is not None:
-        extra_clauses.append("workflow_id = :workflow_id")
-        extra_params["workflow_id"] = workflow_id
-    rows = authz.list_visible_resources(
+    """Each trigger is filtered by its own visibility and by its workflow's
+    governing version's (`policy.GOVERNING_VERSION_SQL`, the version policy
+    create authorizes against); a family with no version hides its
+    triggers. `create_trigger` stamps every row `visibility = 'workspace'`,
+    so the trigger row alone would show every member the schedule and event
+    filter of another member's private workflow. Checked live, so a later
+    visibility change, ownership transfer or revoked grant on the workflow
+    applies to its existing triggers with no backfill."""
+    trigger_sql, trigger_params = authz.visible_resource_filter_sql(
         session,
         auth,
         resource_type="triggers",
-        columns=_TRIGGER_FIELDS,
-        order_by="created_at ASC",
-        extra_clauses=extra_clauses,
-        extra_params=extra_params,
+        action="read",
+        table_alias="triggers",
+        param_prefix="trigger_",
+    )
+    version_sql, version_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="workflow_versions",
+        action="read",
+        table_alias="workflow_versions",
+        param_prefix="version_",
+    )
+    clauses = [
+        "triggers.workspace_id = :workspace_id",
+        trigger_sql,
+        "EXISTS (SELECT 1 FROM workflow_versions WHERE workflow_versions.id = ("
+        + GOVERNING_VERSION_SQL.format(
+            workspace_id="triggers.workspace_id", workflow_id="triggers.workflow_id"
+        )
+        + f") AND {version_sql})",
+        "(CAST(:workflow_id AS text) IS NULL OR triggers.workflow_id = :workflow_id)",
+    ]
+    params: dict[str, Any] = {
+        **trigger_params,
+        **version_params,
+        "workspace_id": auth.workspace_id,
+        "workflow_id": workflow_id,
+    }
+    rows = (
+        session.execute(
+            text(
+                f"SELECT {_TRIGGER_FIELDS} FROM triggers "  # noqa: S608 -- constants and authz fragments only
+                f"WHERE {' AND '.join(clauses)} ORDER BY created_at ASC"
+            ),
+            params,
+        )
+        .mappings()
+        .all()
     )
     session.rollback()
     return [_row_to_trigger(dict(row)) for row in rows]
@@ -345,8 +384,10 @@ def list_triggers_endpoint(
     session: SessionDep,
     workflow_id: Annotated[str | None, Query(max_length=200)] = None,
 ) -> TriggerListResponse:
-    """Every trigger (`manual`/`event`/`schedule`) configured for the
-    caller's workspace, optionally narrowed to one `workflow_id` -- the read
+    """Every trigger (`manual`/`event`/`schedule`) in the caller's workspace
+    that they can see (`list_triggers`: the trigger and its workflow's
+    governing version must both be readable), optionally narrowed to one
+    `workflow_id` -- the read
     a "schedule controls" view needs to show a workflow's own configured
     trigger(s) and next-fire-relevant fields (`schedule_expression`/
     `timezone`/`skip_missed`/`last_fired_at`) before a user attempts a new

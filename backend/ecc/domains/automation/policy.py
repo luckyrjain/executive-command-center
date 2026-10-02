@@ -243,8 +243,9 @@ def get_policy(session: Session, workspace_id: UUID, policy_id: UUID) -> Automat
 # cannot see a workflow cannot see or revoke the policies bound to it either.
 # Checked live rather than copied onto the policy at create: a later
 # visibility change, ownership transfer or revoked grant on the workflow
-# then applies to its existing policies, with no backfill.
-_GOVERNING_VERSION_SQL = (
+# then applies to its existing policies, with no backfill. `triggers.list_triggers`
+# applies the same rule to triggers.
+GOVERNING_VERSION_SQL = (
     "SELECT governing.id FROM workflow_versions AS governing "
     "WHERE governing.workspace_id = {workspace_id} AND governing.workflow_id = {workflow_id} "
     "ORDER BY governing.status = 'active' DESC, governing.version DESC LIMIT 1"
@@ -255,7 +256,7 @@ def list_policies(
     session: Session, auth: AuthContext, *, workflow_id: str | None = None
 ) -> list[AutomationPolicy]:
     """Each policy is filtered by its own visibility and by its workflow's
-    governing version's (`_GOVERNING_VERSION_SQL`); a family with no
+    governing version's (`GOVERNING_VERSION_SQL`); a family with no
     version hides its policies."""
     policy_sql, policy_params = authz.visible_resource_filter_sql(
         session,
@@ -277,7 +278,7 @@ def list_policies(
         "automation_policies.workspace_id = :workspace_id",
         policy_sql,
         "EXISTS (SELECT 1 FROM workflow_versions WHERE workflow_versions.id = ("
-        + _GOVERNING_VERSION_SQL.format(
+        + GOVERNING_VERSION_SQL.format(
             workspace_id="automation_policies.workspace_id",
             workflow_id="automation_policies.workflow_id",
         )
@@ -312,7 +313,7 @@ def policy_visible(session: Session, auth: AuthContext, policy_id: UUID) -> bool
     version_id = session.execute(
         text(
             "SELECT ("
-            + _GOVERNING_VERSION_SQL.format(
+            + GOVERNING_VERSION_SQL.format(
                 workspace_id="automation_policies.workspace_id",
                 workflow_id="automation_policies.workflow_id",
             )
@@ -333,7 +334,7 @@ def policy_visible(session: Session, auth: AuthContext, policy_id: UUID) -> bool
 
 def _lock_governing_version(session: Session, auth: AuthContext, workflow_id: str) -> UUID | None:
     """Locks and returns the workflow's governing version
-    (`_GOVERNING_VERSION_SQL`), or `None` when the family has no version.
+    (`GOVERNING_VERSION_SQL`), or `None` when the family has no version.
 
     That one row is locked `FOR SHARE` so an ownership transfer or
     visibility change committing meanwhile is seen by the caller's checks.
@@ -352,7 +353,7 @@ def _lock_governing_version(session: Session, auth: AuthContext, workflow_id: st
         {"workspace_id": auth.workspace_id, "workflow_id": workflow_id},
     )
     pick_sql = text(
-        _GOVERNING_VERSION_SQL.format(workspace_id=":workspace_id", workflow_id=":workflow_id")
+        GOVERNING_VERSION_SQL.format(workspace_id=":workspace_id", workflow_id=":workflow_id")
     )
     params = {"workspace_id": auth.workspace_id, "workflow_id": workflow_id}
     version_id: UUID | None = session.execute(pick_sql, params).scalar_one_or_none()
