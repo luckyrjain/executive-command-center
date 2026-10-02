@@ -174,7 +174,7 @@ runs next (also unchanged -- it is what tells this call whether a prior
 attempt already dispatched, succeeded, failed, or left an ambiguous
 `unknown`-shaped gap for *this exact step*). Only once that check confirms
 there is **no row at all yet** does `_evaluate_dispatch_gate` run: it
-resolves the run's policy (`policy.get_policy` via `run.policy_id`;
+resolves the run's policy (`policy.get_policy_for_workflow` via `run.policy_id`;
 `policy.is_policy_usable`), and, if the policy is usable, evaluates
 `approvals.evaluate_approval_requirement` against the resolved adapter. A
 step this gate does not clear returns `StepBlockedByPolicy` or
@@ -533,8 +533,8 @@ its own fix, in a different place:
    called, so a policy revoked (or expired, or deleted) at any point after
    the last ordinary step's own `_evaluate_dispatch_gate` still authorized a
    real, un-reauthorized side effect. `_dispatch_compensation_step` now calls
-   `_compensation_policy_usable` (the identical `get_policy`/`is_policy_
-   usable` question the gate asks, deliberately re-read from the database
+   `_compensation_policy_usable` (the identical `get_policy_for_workflow`/
+   `is_policy_usable` question the gate asks, deliberately re-read from the database
    rather than cached) before resolving either adapter, and on failure marks
    the step *and* its ledger row `'failed'` with
    `error_class='PolicyUnusableDuringCompensation'` without invoking
@@ -2806,7 +2806,7 @@ def _compensation_policy_usable(session: Session, run: WorkflowRun) -> bool:
     effect immediately for any not-yet-started step" is only true if the
     revocation is observed by whatever is about to start a step, and a
     compensation step is by definition not-yet-started at this point. Reads
-    with `policy.get_policy` (no `FOR UPDATE`) -- this is a point-in-time
+    with `policy.get_policy_for_workflow` (no `FOR UPDATE`) -- this is a point-in-time
     authorization read, not a mutation that needs to serialize against a
     concurrent `revoke_policy`; under READ COMMITTED it sees every
     revocation committed before this statement, which is exactly the

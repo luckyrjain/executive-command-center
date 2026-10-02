@@ -242,10 +242,10 @@ def get_policy_for_workflow(
 ) -> AutomationPolicy | None:
     """The policy `policy_id` names, only if it governs `workflow_id`.
 
-    A policy is created for one workflow family, by someone with access to
-    that family. Every server-side lookup of a version's or run's authority
-    goes through here, so a `policy_ref` naming another workflow's policy
-    (written before drafts were checked, or by a direct caller) resolves to
+    A policy is bound to one workflow family (`workflow_id`). Every
+    server-side lookup of a version's or run's authority goes through here,
+    so a `policy_ref` naming another workflow's policy (written before
+    drafts were checked, or by a direct caller) resolves to
     no policy at all and fails closed -- a run of workflow Y never borrows
     the authority of a policy written for workflow X (`API-SCHEMAS.md`'s
     confused-deputy rule).

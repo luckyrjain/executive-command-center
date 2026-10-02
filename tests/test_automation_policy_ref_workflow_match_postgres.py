@@ -1,7 +1,7 @@
 """A workflow version's `policy_ref` must name a policy of the same workflow.
 
-`automation_policies.workflow_id` binds a policy to one workflow family, and
-creating a policy requires access to that family. Before this fix,
+`automation_policies.workflow_id` binds a policy to one workflow family.
+Before this fix,
 `POST /automations/workflows` only checked that the caller could read the
 policy named by `policy_ref`, and dispatch resolved authority from the active
 version's `policy_ref` with no family match either. A member could attach a
@@ -41,6 +41,7 @@ from sqlalchemy import text
 
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
+from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
 
 pytestmark = pytest.mark.skipif(
@@ -206,6 +207,27 @@ def test_dispatch_fails_closed_under_another_workflows_policy(world: World) -> N
     assert run.status == "needs_review"
     assert adapter.execute_calls == 0
     assert step_rows(world, run.id) == []
+
+
+def test_enqueue_ignores_the_rate_limit_of_another_workflows_policy(world: World) -> None:
+    """Enqueue resolves the policy through the same workflow match: a
+    foreign policy's ceiling is not this workflow's, and the run it lets
+    through is blocked at dispatch above."""
+    foreign = _foreign_policy(world)
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE automation_policies SET rate_limit = CAST(:rate AS jsonb) WHERE id = :id"),
+            {"id": foreign, "rate": '{"runs_per_workflow_per_hour": 0}'},
+        )
+    workflow_id = f"test.mismatch.{uuid4().hex}"
+    _activate_pre_fix(world, workflow_id, foreign)
+
+    with SessionFactory() as session, session.begin():
+        queued = automation_worker.enqueue_run(
+            session, world.workspace_id, world.user_id, workflow_id=workflow_id
+        )
+
+    assert isinstance(queued, automation_worker.WorkflowRun), queued
 
 
 def test_simulate_reports_no_policy_for_another_workflows_policy(world: World) -> None:

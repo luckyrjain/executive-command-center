@@ -854,13 +854,16 @@ def activate_workflow_version(
     # Not registry-dependent: the policy must govern this workflow whoever
     # publishes. A `policy_ref` that resolves to nothing is left to the
     # dispatch gate, as before.
-    if target_row["policy_ref"] is not None:
-        named_policy = get_policy(session, workspace_id, target_row["policy_ref"])
-        if named_policy is not None and named_policy.workflow_id != target_row["workflow_id"]:
-            return WorkflowVersionPolicyWorkflowMismatch(
-                workflow_id=target_row["workflow_id"],
-                version=target_row["version"],
-            )
+    named_policy = (
+        get_policy(session, workspace_id, target_row["policy_ref"])
+        if target_row["policy_ref"] is not None
+        else None
+    )
+    if named_policy is not None and named_policy.workflow_id != target_row["workflow_id"]:
+        return WorkflowVersionPolicyWorkflowMismatch(
+            workflow_id=target_row["workflow_id"],
+            version=target_row["version"],
+        )
 
     if adapter_registry is not None:
         violations = unregistered_action_refs(target_row["graph"], adapter_registry)
@@ -888,14 +891,9 @@ def activate_workflow_version(
         # stays authoritative -- when there is no policy_ref, or the policy
         # is legacy, revoked or expired: those already block at dispatch
         # with their own reasons, and failing publish for them would be new
-        # behaviour outside the scope-enforcement design.
-        scope_policy = (
-            get_policy_for_workflow(
-                session, workspace_id, target_row["policy_ref"], target_row["workflow_id"]
-            )
-            if target_row["policy_ref"] is not None
-            else None
-        )
+        # behaviour outside the scope-enforcement design. `named_policy`
+        # already matches this workflow (checked above).
+        scope_policy = named_policy
         if (
             scope_policy is not None
             and scope_policy.scope_enforced
@@ -1164,8 +1162,7 @@ def _require_policy_of_family(
     `_lock_and_authorize_policy_ref`, so only a policy the caller can
     already read reaches it and the 422 discloses nothing new. Without it,
     a member could point their own workflow at a policy someone created
-    for another one -- which needs access to that family -- and run under
-    its authority (`API-SCHEMAS.md`'s confused-deputy rule)."""
+    for another one and run under its authority (`API-SCHEMAS.md`'s confused-deputy rule)."""
     policy = get_policy(session, auth.workspace_id, policy_ref)
     if policy is not None and policy.workflow_id != workflow_id:
         raise HTTPException(
