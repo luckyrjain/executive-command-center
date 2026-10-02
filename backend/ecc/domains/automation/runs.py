@@ -590,11 +590,16 @@ def _mutate_run(
         ).one_or_none()
         if locked is None:
             raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
-        # The pinned version must be readable too (`run_visibility`).
-        if not run_visibility.run_visible(session, auth, run_id, lock_version=True):
+        # The pinned version must be readable too (`run_visibility`), and
+        # writable to change the run: a read-only grantee on a workflow sees
+        # its runs but cannot cancel, pause or resume them.
+        version_id = run_visibility.visible_run_version_id(session, auth, run_id, lock_version=True)
+        if version_id is None:
             raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="workflow_runs", resource_id=run_id, action="write"
+        ) or not authz.authorize(
+            session, auth, resource_type="workflow_versions", resource_id=version_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
