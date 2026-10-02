@@ -2953,7 +2953,11 @@ def _lock_and_authorize_suggestion_candidates(
             f"SELECT id FROM {table} WHERE workspace_id = :workspace_id "  # noqa: S608 -- see docstring
             f"AND ({visibility_sql}) "
             "AND suggested_team_name = :suggested_team_name "
-            "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL FOR UPDATE"
+            # `ORDER BY id`: the same per-table lock order the replay check
+            # (`_reauthorized_team_suggestion_replay`) uses, so two requests
+            # locking overlapping rows cannot deadlock.
+            "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL "
+            "ORDER BY id FOR UPDATE"
         ),
         {
             "workspace_id": auth.workspace_id,
