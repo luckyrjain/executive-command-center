@@ -189,15 +189,13 @@ def update_risk(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session, auth, idempotency_key, req_hash, domain="risks", response_model=RiskResponse
-        )
-        if cached is not None:
-            return cached
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. The idempotency
+        # cache is read only after those checks pass: a caller who has since
+        # lost access (suspended, demoted, or no longer able to see the risk)
+        # must not have a cached success replayed to them.
         current = _get_row(session, auth, risk_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="RISK_NOT_FOUND")
@@ -209,6 +207,14 @@ def update_risk(
             session, auth, resource_type="risks", resource_id=risk_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        # After authz, before the archived/version/state checks: a same-key
+        # replay of a successful write finds the risk already changed and
+        # must get the cached 200, not a 409.
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="risks", response_model=RiskResponse
+        )
+        if cached is not None:
+            return cached
         if current["archived_at"] is not None:
             raise HTTPException(status_code=409, detail="RISK_ARCHIVED")
         if current["version"] != payload.expected_version:
@@ -282,15 +288,8 @@ def _archive_action(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session, auth, idempotency_key, req_hash, domain="risks", response_model=RiskResponse
-        )
-        if cached is not None:
-            return cached
-        # Lock before authorizing: an ownership transfer that commits while
-        # this request waits on the row lock must be seen by the checks below
-        # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # Lock before authorizing, and authorize before the idempotency
+        # cache -- see update_risk's identical comment.
         current = _get_row(session, auth, risk_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="RISK_NOT_FOUND")
@@ -302,6 +301,12 @@ def _archive_action(
             session, auth, resource_type="risks", resource_id=risk_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        # After authz, before the version/state checks -- see update_risk.
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="risks", response_model=RiskResponse
+        )
+        if cached is not None:
+            return cached
         if current["version"] != payload.expected_version:
             raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
         if action == "archive" and current["archived_at"] is not None:
