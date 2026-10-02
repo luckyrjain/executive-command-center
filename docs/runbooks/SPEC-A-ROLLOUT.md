@@ -2,7 +2,7 @@
 id: SPEC-A-ROLLOUT
 title: Security Remediation Spec A Rollout Runbook
 status: Active
-version: 1.3.0
+version: 1.4.0
 owner: Lucky Jain
 created: 2026-10-01
 updated: 2026-10-01
@@ -291,7 +291,7 @@ What the restore does **not** undo:
 
 1. Deploy T17 (frontend codes) and this documentation (T19). T08 is already on `main`.
 2. Set `ECC_GMAIL_REQUIRE_IDENTITY_MATCH=true` and restart every process.
-3. Verify: a connect whose Google email differs from the member's ECC email returns 403 `GMAIL_ACCOUNT_IDENTITY_MISMATCH`, and no row is written. On the process that served the request, `/metrics` now shows `ecc_connector_enrollment_refused_total{provider="gmail",reason="identity_mismatch"} 1`; `EccGmailIdentityMismatchRefused` fires through its new-series term within a scrape and evaluation interval and resolves about 5 minutes later. (`increase()` alone would not see this first event; see the alert file.) A matching connect succeeds.
+3. Verify: a connect whose Google email differs from the member's ECC email returns 403 `GMAIL_ACCOUNT_IDENTITY_MISMATCH`, and no row is written. On the process that served the request, `/metrics` showed `ecc_connector_enrollment_refused_total{provider="gmail",reason="identity_mismatch"} 0.0` before the test and now shows `1.0`; `EccGmailIdentityMismatchRefused` fires within a scrape and evaluation interval and stays firing for a day (its `increase()` window). A matching connect succeeds.
 4. Rollback: flag off and restart. Nothing else changed.
 
 ## R7: two clean weeks, then T20
@@ -304,13 +304,13 @@ The clean window starts when R6's restart completes and needs **14 consecutive d
 - no personal-data exposure incident, and no new backfill-reported row left unreviewed after a re-run;
 - no open Critical/High finding against the Spec A code.
 
-Any breach resets the window to day 0. **Treat every `EccConnectorRevokeFailed` as real by default**: do the Google-side check and reset the window. Several real `error` paths have no disconnect, removal or purge audit event (`callback_failure` has only `connector_account.enrollment_refused` or nothing; `adapter_callback`, `callback_duplicate` and `reconnect_replaced` have none), so do not require one. Declare a false positive only when **none** of the log lines in the alert file's "Revoke-error evidence" table (`connector_revoke_failed`, `gmail_revoke_failed`, `gmail_revoke_post_failed`, `connector_revoke_safety_check_failed`, `removal_revoke_credential_unavailable`, `remediation_revoke_credential_unavailable`) exists for that provider and site on any API process from 60 minutes before the alert to its end. That pattern fits a series that reappears after more than 55 minutes without samples, a relabelling, or a fresh TSDB / replaced Prometheus server, which can fire once for about 5 minutes with no real event behind it. Record such an alert, with the empty log search, as a false positive and do not reset the window. When it closes, record the dates and the alert history in the change record, then start T20 (remove the three flags). Spec B may start after T20.
+Any breach resets the window to day 0. **Treat every `EccConnectorRevokeFailed` as real by default**: do the Google-side check and reset the window. Several real `error` paths have no disconnect, removal or purge audit event (`callback_failure` has only `connector_account.enrollment_refused` or nothing; `adapter_callback`, `callback_duplicate` and `reconnect_replaced` have none), so do not require one. Declare a false positive only when **none** of the log lines in the alert file's "Revoke-error evidence" table (`connector_revoke_failed`, `gmail_revoke_failed`, `gmail_revoke_post_failed`, `connector_revoke_safety_check_failed`, `removal_revoke_credential_unavailable`, `remediation_revoke_credential_unavailable`) exists for that provider and site on any API process from 60 minutes before the alert to its end. The counters are pre-initialised at 0, so `increase()` does not fire without a counted event; an alert with no log line points at a monitoring cause, such as a relabelling that renamed series. Record such an alert, with the empty log search, as a false positive and do not reset the window. When it closes, record the dates and the alert history in the change record, then start T20 (remove the three flags). Spec B may start after T20.
 
 ## Monitoring
 
 Alert rules, how to read each counter, and first actions are in [`../observability/SPEC-A-ALERTS.md`](../observability/SPEC-A-ALERTS.md). Points specific to the rollout:
 
-- The counters are process-local and reset on every restart, and every R-step restarts. Each label set appears only at its first event, at 1, so `increase()` alone misses the first event after a restart; the rare-event rules add a new-series term for this (see the alert file). Until the counters are pre-initialised to 0 at startup (a tracked code follow-up), a repeat of the same count in the same label set within an hour of a restart can still go unseen: after each R-step restart, also check the audit log for `connector_account.enrollment_refused` and `connector_account.disabled` events and the Gmail `connector_revoke_failed` log lines. Never read the counters as raw values.
+- The counters are process-local and reset on every restart, and every R-step restarts. Every bounded label set is pre-initialised at 0 at startup (#355), so `increase()` sees the first event after a restart. It can still miss an event that happens before a restarted process's first scrape and brings the counter back to the old process's value (see "Remaining gaps" in the alert file): after each R-step restart, also check the audit log for `connector_account.enrollment_refused` and `connector_account.disabled` events and the Gmail `connector_revoke_failed` log lines. Never read the counters as raw values.
 - Ops-script counts (remediation, backfill) are not scraped; they live in the change record.
 - A revoke-safety check that fails at `site="adapter_callback"` (a DB error) counts as `skipped_unsafe`, not `error`. Watch that series too.
 - Every Gmail callback refusal also revokes at `site="callback_failure"`. Net `ecc_connector_enrollment_refused_total` out of that trend (the recording rule does this).
@@ -352,6 +352,7 @@ Also open and not a sign-off: the owner-sharing question. FX3 also refuses owner
 
 | Version | Date | Summary | Author |
 |---|---|---|---|
+| 1.4.0 | 2026-10-01 | Counters are pre-initialised at 0 (#355) and the alert rules are plain `increase()` (alert file 1.4.0): R6 verification expects 0 then 1 and an alert that stays firing for a day; the R7 false-positive text and Monitoring note drop the new-series term and keep the first-scrape gap | Lucky Jain |
 | 1.3.0 | 2026-10-01 | PR review: R7 treats revoke errors as real by default and needs an empty search across every revoke-error log line before calling one a false positive; the canary criterion confirms a user-side removal before recording it benign; R5 SQL uses UTC (`SET LOCAL TimeZone`, explicit offset in `<fx1_deploy_time>`) | Lucky Jain |
 | 1.2.0 | 2026-10-01 | Review fixes: the R5 clean-up locks the targeted AI runs and steps before snapshotting their grants and re-checks for live grants before `COMMIT`; R6 alert now resolves after about 5 minutes; R7 requires confirming a new-series alert against log lines and audit events before resetting the clean window (false-positive causes include a fresh TSDB or replaced Prometheus server) | Lucky Jain |
 | 1.1.0 | 2026-10-01 | Review fixes: database backup and snapshot tables required before R5; the FX1 AI-run clean-up is narrowing only (purge dropped), reversible through the snapshot, with one shared `revoked_at`; rollback lists what restore does not undo (rows written private while the flag was on, removal side effects); R6 verification and monitoring reflect counters that appear at 1 | Lucky Jain |

@@ -2,7 +2,7 @@
 id: SPEC-A-ALERTS
 title: Security Remediation Spec A Alert Rules
 status: Active
-version: 1.3.0
+version: 1.4.0
 owner: Lucky Jain
 created: 2026-10-01
 updated: 2026-10-01
@@ -19,13 +19,9 @@ This repository has no alerting stack and no other alert rules. These are the Pr
 
 - `GET /metrics` on every backend process (`backend/ecc/main.py`) serves the Prometheus text format. When `ECC_METRICS_TOKEN` is set, the scraper must send `Authorization: Bearer <token>`.
 - The counters are hand-rolled and **process-local** (`backend/ecc/observability.py`). Each API worker or replica must be scraped as its own target, and every counter goes back to zero when its process restarts. Each flag change in the rollout restarts every process.
-- **A label set does not exist until its first event, and then appears at 1.** `_Counter.inc` creates each label combination lazily, and the text format carries no created timestamp. `increase()` only measures the change *between* samples of a series, so it never sees the event that created the series: a series born at 1 that stays at 1 has an increase of 0. These counters are rare-event counters, and every R-step restart wipes them, so in practice most "first event after a restart" cases would be invisible to `increase()` alone. `increase()` does handle a restart when the label set already existed in the previous process and its last sample is still inside the window (the value drops, which counts as a reset).
-- So every rare-event rule below is `increase(...) > 0` **or a new-series term**, `X unless last_over_time(X[55m] offset 5m)`: the current value of every series (per scrape target, since `instance` is part of the match) that has a sample now but **no sample at all between 60 and 5 minutes ago**. Such a series exists only because something was counted, so its value is the number of events since it appeared.
-  - **Fire / resolve.** A new series matches from its first scrape until its first sample is more than 5 minutes old, so the new-series branch fires for **about 5 minutes** (one evaluation is enough; the rules have no `for:`) and then resolves. Alertmanager still delivers that one firing notification. After that, only `increase()` can fire for that series.
-  - **Why this form.** A range selector (`[55m]`) skips staleness markers and tolerates gaps, so a scrape gap, a target briefly down, or a stale marker on an existing series does **not** make it look new again: as long as any sample of it exists in the 55-minute window, it is suppressed. The plain `X unless X offset 55m` used in 1.1.0 looked at a single instant and re-fired every existing non-zero series about 55 minutes after any such blip.
-  - **Coverage.** The window (60 to 5 minutes ago) lies inside the 1-hour `increase()` window, so an old sample that suppresses the new-series branch is also seen by `increase()`, which catches a restart whose count dropped (a reset).
-  - **Remaining false positives.** A series with **no** sample for more than 55 minutes that comes back unchanged (a target down for over an hour, then back without a restart), a relabelling that renames existing series, or a fresh TSDB / replaced Prometheus server (no history, so every existing non-zero series looks new on its first scrape) fires once for about 5 minutes. Before treating such an alert as real (for example before resetting the R7 clean window), confirm it against the audit events and the log lines named in "What an alert means and what to do".
-- **Remaining blind spot, until the counters are pre-initialised.** If the previous process counted the same label set within the last hour and the new process reaches the *same* value, there is neither a drop nor a new series, so nothing fires. Pre-initialising every bounded label set to 0 at startup (tracked as a separate code follow-up) removes the blind spot and the need for the new-series terms; once it ships, plain `increase()` is correct. Until then, also check the change record's ops-script counts and the audit log after each restart. Never alert on a raw counter value.
+- **Every bounded label set exists at 0 from process start** (#355). `ecc.main` calls `observability.preinitialise_connector_security_counters` at import. It creates every combination of the literal labels in the table below, for `provider` ∈ `PERSONAL_PROVIDERS` (today `gmail`) and `resource_type` ∈ `connector_security.SHARE_REFUSED_RESOURCE_TYPES`, all at 0. A first event after a restart is therefore a 0 → 1 step that `increase()` sees, and the restart itself is a drop that `increase()` treats as a counter reset. Every rule below is plain `increase()`.
+  - **Note: why 1.1.0 to 1.3.0 had new-series terms.** Before #355, `_Counter.inc` created each label set lazily at 1, and the text format carries no created timestamp, so `increase()` never saw the event that created a series. Those versions added `X unless last_over_time(X[55m] offset 5m)` to the rare-event rules to catch a series that had just appeared. That term had false positives (a target down for over 55 minutes, a relabelling, a fresh TSDB) and still missed a restarted process that reached the old process's value. Pre-initialisation replaced it; do not bring it back unless pre-initialisation is removed.
+  - **Remaining gaps.** (1) An event between a process start and that process's **first scrape** is missed if the counter then shows the same value the previous process last reported (no drop, no step). The window is one scrape interval per restart. (2) Label sets outside the pre-initialised sets, mainly a non-personal (engineering) `provider` on `ecc_connector_revoke_total` or `ecc_connector_enrollment_refused_total`, are still created lazily at 1, so their first event after a restart is missed. Engineering connectors' `disconnect()` is a documented no-op, so a revoke `error` there is not expected. After each restart, still check the audit log and the change record's ops-script counts. Never alert on a raw counter value.
 - Ops scripts are one-off processes that nobody scrapes: `scripts/remediate_connector_ownership.py` (`site="remediation"`) and `scripts/backfill_personal_visibility.py`. Their counts appear only in their own stderr summary and CSV, so copy them into the change record.
 - No label carries an email, account id, workspace id or credential, so an alert names a provider, a site or a reason, never a person. To find the affected row, use the matching audit events (`GET /api/v1/audit`, owner/admin only) at the alert's time.
 
@@ -66,13 +62,7 @@ groups:
     rules:
       # Any revoke whose Google grant may still be live. Truthful for Gmail since FX6.
       - alert: EccConnectorRevokeFailed
-        expr: |
-          (sum by (provider, site) (increase(ecc_connector_revoke_total{result="error"}[1h])) > 0)
-          or
-          (sum by (provider, site) (
-             ecc_connector_revoke_total{result="error"}
-               unless last_over_time(ecc_connector_revoke_total{result="error"}[55m] offset 5m)
-           ) > 0)
+        expr: sum by (provider, site) (increase(ecc_connector_revoke_total{result="error"}[1h])) > 0
         labels:
           severity: warning
         annotations:
@@ -81,9 +71,6 @@ groups:
 
       # The spec's ratio rule: more than 20% of attempted revokes failed in a day.
       # Denominator = attempted revokes (ok + error); skipped_unsafe were never attempted.
-      # increase() misses each series' first event (see "Where the numbers come
-      # from"), so this ratio undercounts after restarts; EccConnectorRevokeFailed
-      # is the rule that catches single failures.
       - alert: EccConnectorRevokeErrorRatioHigh
         expr: |
           (
@@ -98,24 +85,13 @@ groups:
 
       # D2 / refresh canary (plan note N18): invalid_grant in ANY since_reconnect
       # bucket above its baseline (twice the daily average of the previous week;
-      # with a zero baseline, any invalid_grant fires). Second branch: any
-      # invalid_grant series that appeared in the last ~5 minutes (its first
-      # event, invisible to increase()) fires regardless of the baseline -- after
-      # a restart every first invalid_grant is such a series, which is acceptable
-      # for a canary.
+      # with a zero baseline, any invalid_grant fires).
       - alert: EccGmailRefreshInvalidGrantAboveBaseline
         expr: |
-          (
-            sum(increase(ecc_gmail_refresh_rejected_total{error="invalid_grant"}[1d])) > 0
-            and
-            sum(increase(ecc_gmail_refresh_rejected_total{error="invalid_grant"}[1d]))
-              > 2 * ((sum(increase(ecc_gmail_refresh_rejected_total{error="invalid_grant"}[7d] offset 1d)) / 7) or vector(0))
-          )
-          or
-          (sum(
-             ecc_gmail_refresh_rejected_total{error="invalid_grant"}
-               unless last_over_time(ecc_gmail_refresh_rejected_total{error="invalid_grant"}[55m] offset 5m)
-           ) > 0)
+          sum(increase(ecc_gmail_refresh_rejected_total{error="invalid_grant"}[1d])) > 0
+          and
+          sum(increase(ecc_gmail_refresh_rejected_total{error="invalid_grant"}[1d]))
+            > 2 * ((sum(increase(ecc_gmail_refresh_rejected_total{error="invalid_grant"}[7d] offset 1d)) / 7) or vector(0))
         labels:
           severity: warning
         annotations:
@@ -140,13 +116,7 @@ groups:
       # Spec § Observability: any identity mismatch (only emitted once
       # ECC_GMAIL_REQUIRE_IDENTITY_MATCH is on, rollout R6).
       - alert: EccGmailIdentityMismatchRefused
-        expr: |
-          (sum(increase(ecc_connector_enrollment_refused_total{provider="gmail",reason="identity_mismatch"}[1d])) > 0)
-          or
-          (sum(
-             ecc_connector_enrollment_refused_total{provider="gmail",reason="identity_mismatch"}
-               unless last_over_time(ecc_connector_enrollment_refused_total{provider="gmail",reason="identity_mismatch"}[55m] offset 5m)
-           ) > 0)
+        expr: sum(increase(ecc_connector_enrollment_refused_total{provider="gmail",reason="identity_mismatch"}[1d])) > 0
         labels:
           severity: info
         annotations:
@@ -155,13 +125,7 @@ groups:
 
       # Someone tried to connect a mailbox another member already owns.
       - alert: EccGmailOwnerConflictRefused
-        expr: |
-          (sum(increase(ecc_connector_enrollment_refused_total{provider="gmail",reason="owned_by_another_member"}[1d])) > 0)
-          or
-          (sum(
-             ecc_connector_enrollment_refused_total{provider="gmail",reason="owned_by_another_member"}
-               unless last_over_time(ecc_connector_enrollment_refused_total{provider="gmail",reason="owned_by_another_member"}[55m] offset 5m)
-           ) > 0)
+        expr: sum(increase(ecc_connector_enrollment_refused_total{provider="gmail",reason="owned_by_another_member"}[1d])) > 0
         labels:
           severity: info
         annotations:
@@ -170,12 +134,7 @@ groups:
 
       # A non-owner tried to sync or disable another member's Gmail connector (flag on).
       - alert: EccPersonalConnectorAccessDenied
-        expr: |
-          (sum by (provider, route) (increase(ecc_connector_access_denied_total[1d])) > 0)
-          or
-          (sum by (provider, route) (
-             ecc_connector_access_denied_total unless last_over_time(ecc_connector_access_denied_total[55m] offset 5m)
-           ) > 0)
+        expr: sum by (provider, route) (increase(ecc_connector_access_denied_total[1d])) > 0
         labels:
           severity: info
         annotations:
@@ -183,37 +142,37 @@ groups:
           runbook: "docs/runbooks/SPEC-A-ROLLOUT.md#monitoring"
 ```
 
-The share-refused spike rule has no new-series term on purpose: it needs more than 5 events in an hour, so it only misses the first event of each series.
+Every rule is plain `increase()`, so an alert stays firing while its event is inside the rule's window: 1 hour for `EccConnectorRevokeFailed`, 1 day for the identity-mismatch, owner-conflict, access-denied and canary rules.
 
 Thresholds (5 an hour, 3x, 2x, 20%) are starting points for a small internal deployment. Tune them after the first clean week, and record the change here.
 
 ## Rule unit test (promtool)
 
-Save the rules block above as `spec-a-alerts.rules.yml` and this as `spec-a-alerts.test.yml`, then run `promtool test rules spec-a-alerts.test.yml` wherever promtool is installed (it is not part of this repository's toolchain). The first case is the one that matters: a series that appears at 1 and never changes, which `increase()` alone never alerts on; it fires for about 5 minutes. The second is a restart with a lower count, which `increase()` catches as a reset. The third is an existing series with a staleness marker and a 10-minute gap, which must not fire.
+Save the rules block above as `spec-a-alerts.rules.yml` and this as `spec-a-alerts.test.yml`, then run `promtool test rules spec-a-alerts.test.yml` wherever promtool is installed (it is not part of this repository's toolchain). The first case is the one that matters: a fresh process exposes the pre-initialised series at 0, then counts one revoke error, which `increase()` sees as 0 → 1. The second is a restart with a lower count, which `increase()` catches as a reset. The third is an existing series with a staleness marker and a 10-minute gap, then the same value, which must not fire.
 
 ```yaml
 rule_files:
   - spec-a-alerts.rules.yml
 evaluation_interval: 1m
 tests:
-  # A revoke error in a fresh process: the series is absent for 90 minutes,
-  # then appears at 1 (first sample at 90m) and stays there.
+  # A revoke error in a fresh process: the pre-initialised series is 0 from
+  # the first scrape, then the event takes it to 1 (first 1 at 91m).
   - interval: 1m
     input_series:
       - series: 'ecc_connector_revoke_total{provider="gmail",site="removal",result="error",instance="api-1"}'
-        values: '_x90 1x120'
+        values: '0x90 1x120'
     alert_rule_test:
       - eval_time: 80m          # before the event: nothing
         alertname: EccConnectorRevokeFailed
         exp_alerts: []
-      - eval_time: 92m          # first event: fires through the new-series term
+      - eval_time: 92m          # first event: 0 -> 1 is an increase
         alertname: EccConnectorRevokeFailed
         exp_alerts:
           - exp_labels: {severity: warning, provider: gmail, site: removal}
             exp_annotations:
               summary: "gmail revoke failed at site removal; the provider grant may still be live"
               runbook: "docs/runbooks/PHASE-10-GMAIL-RECOVERY.md#google-revoke-failed-ecc_connector_revoke_totalprovidergmailresulterror"
-      - eval_time: 100m         # the 90m sample is now inside the 60-5 min window: resolved
+      - eval_time: 155m         # the step has left the 1h window: resolved
         alertname: EccConnectorRevokeFailed
         exp_alerts: []
   # A restart: the old process had counted 3, the new one counts 1.
@@ -230,14 +189,13 @@ tests:
               summary: "gmail revoke failed at site cascade; the provider grant may still be live"
               runbook: "docs/runbooks/PHASE-10-GMAIL-RECOVERY.md#google-revoke-failed-ecc_connector_revoke_totalprovidergmailresulterror"
   # An old series with a staleness marker and a 10-minute scrape gap, then the
-  # same value again: no new event, so no alert (the 1.1.0 instant-offset term
-  # fired here).
+  # same value again: no new event, so no alert.
   - interval: 1m
     input_series:
       - series: 'ecc_connector_revoke_total{provider="gmail",site="disable",result="error",instance="api-1"}'
         values: '1x30 stale _x9 1x60'
     alert_rule_test:
-      - eval_time: 45m          # back after the gap: earlier samples are in the window
+      - eval_time: 45m          # back after the gap at the same value
         alertname: EccConnectorRevokeFailed
         exp_alerts: []
       - eval_time: 90m
@@ -245,7 +203,7 @@ tests:
         exp_alerts: []
 ```
 
-This test has not been run here: promtool is not available in this environment. Run it before loading the rules.
+Run with promtool 3.15.0 on 2026-10-02: `promtool check rules` (9 rules) and `promtool test rules` both pass. The same first case with a lazily created series (`_x90 1x120`, the pre-#355 behaviour) fails, so the test depends on the counters being pre-initialised. Re-run it whenever the rules change.
 
 ## Revoke-error evidence
 
@@ -265,7 +223,7 @@ No log line carries an email or account id. When the audit event is missing, ide
 
 | Alert | First action |
 |---|---|
-| `EccConnectorRevokeFailed` / `EccConnectorRevokeErrorRatioHigh` | **Treat it as real by default.** Follow "Google revoke failed" in [`PHASE-10-GMAIL-RECOVERY.md`](../runbooks/PHASE-10-GMAIL-RECOVERY.md): find the event with the [revoke-error evidence table](#revoke-error-evidence) below, identify the connector or mailbox, and ask the mailbox owner to remove the app's access at Google. During R2 to R7 a real occurrence resets the two-week clean window. Only if **no** log line from that table exists for the alert's provider and site on any API process in the window (60 minutes before the alert to its end) is it a false positive (see "Remaining false positives"); record the empty log search as evidence. |
+| `EccConnectorRevokeFailed` / `EccConnectorRevokeErrorRatioHigh` | **Treat it as real by default.** Follow "Google revoke failed" in [`PHASE-10-GMAIL-RECOVERY.md`](../runbooks/PHASE-10-GMAIL-RECOVERY.md): find the event with the [revoke-error evidence table](#revoke-error-evidence) below, identify the connector or mailbox, and ask the mailbox owner to remove the app's access at Google. During R2 to R7 a real occurrence resets the two-week clean window. Only if **no** log line from that table exists for the alert's provider and site on any API process in the window (60 minutes before the alert to its end) treat it as a false positive. With the counters pre-initialised, `increase()` does not fire without a counted event, so look for a monitoring cause (for example a relabelling that renamed series) and record the empty log search as evidence. |
 | `EccGmailRefreshInvalidGrantAboveBaseline` | Find the sync runs that failed with `invalid_grant` at that time and ask their mailbox owners whether they removed the app's access at Google (the most common cause of a single `invalid_grant`), and check whether an ECC revoke (`site` `callback_duplicate`, `reconnect_replaced`, `disable`) touched the same Google account shortly before. If an owner confirms they removed access themselves and no ECC revoke matches, record it as benign. If an ECC revoke matches under `ECC_GMAIL_REVOKE_SCOPE=none`, the revoke of one token killed a grant another live row uses: set the scope back to `global`, restart every process, and record it in the D2 record. |
 | `EccPersonalDataShareRefusedSpike` | Expected in small numbers after R5, while people discover that email-derived rows cannot be shared. A spike from one path (for example `transfer`) usually means a workflow, such as removal preparation, is pushing admins to transfer. Check the `personal_data.share_refused` audit events. |
 | `EccGmailIdentityMismatchRefused` | DS1 (no aliases) is working as designed. Tell the member to connect the Google account whose email matches their ECC account. A burst may mean a member is probing other people's mailboxes. |
@@ -277,6 +235,7 @@ No log line carries an email or account id. When the audit event is missing, ide
 
 | Version | Date | Summary | Author |
 |---|---|---|---|
+| 1.4.0 | 2026-10-01 | The Spec A counters are pre-initialised at 0 at process start (#355), so the new-series terms are removed and every rule is plain `increase()`. Kept a note on why they existed and the remaining gaps (an event before a restarted process's first scrape that brings it back to the old value; lazily created engineering-provider series). The promtool test now starts the series at 0 and passes under promtool. Identity-mismatch, owner-conflict and access-denied alerts now stay firing for a day, not about 5 minutes | Lucky Jain |
 | 1.3.0 | 2026-10-01 | PR review: revoke errors are real by default; new "Revoke-error evidence" table lists every log line (and audit event, if any) per site, and a false positive needs an empty log search; a failed safety check counts `error` except at `adapter_callback` and `removal`; owner-conflict refusals are `skipped_unsafe` only while the other row is live; canary first action confirms user-side removal before recording it benign | Lucky Jain |
 | 1.2.0 | 2026-10-01 | Review fix (also: a fresh TSDB or replaced Prometheus server listed as a one-off false-positive cause): the new-series term is now `X unless last_over_time(X[55m] offset 5m)` (range selectors skip staleness markers and gaps), so a scrape gap or stale marker no longer re-fires existing series; a new series fires for about 5 minutes; remaining false positives (gap over 55 minutes, relabelling) documented; promtool test gains a stale/gap case | Lucky Jain |
 | 1.1.0 | 2026-10-01 | Review fix: counters create each label set lazily at 1, so `increase()` alone misses the first event after every restart. Revoke-failed, canary, identity-mismatch, owner-conflict and access-denied rules gain a new-series term (`X unless X offset 55m`). Documented the remaining blind spot until counters are pre-initialised, and added a promtool unit-test snippet | Lucky Jain |
