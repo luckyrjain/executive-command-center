@@ -2988,10 +2988,18 @@ def _lock_and_authorize_suggestion_candidates(
     docstring: a row invisible to the caller must never even be selected
     or locked, let alone surfaced in `skipped_unauthorized`, or an
     unauthorized caller could learn a private row's id exists by noticing
-    it show up there. The subsequent per-row `action="write"` check is
-    then only ever run against rows already known to be visible, matching
-    `_validate_team_entity`/`assign_repository_team_endpoint`'s read-then-
-    write precedent.
+    it show up there.
+
+    That filter only narrows which rows get locked; it is not the read
+    check. A grant revoke (`authz_grants.revoke_grant_endpoint`) locks the
+    row but only updates `resource_grants`, never the row, so Postgres
+    does not re-evaluate this statement's `WHERE` once that lock frees:
+    the grant subquery keeps its pre-revoke snapshot and the row is still
+    returned. Each row's `read` is therefore re-authorized after the lock
+    (a fresh READ COMMITTED statement sees the committed revoke) and a row
+    the caller can no longer read is dropped -- neither written nor
+    reported -- before the `write` check, matching `_validate_team_
+    entity`/`assign_repository_team_endpoint`'s read-then-write precedent.
     """
     visibility_sql, visibility_params = authz.visible_resource_filter_sql(
         session, auth, resource_type=table, action="read", table_alias=table
@@ -3016,6 +3024,10 @@ def _lock_and_authorize_suggestion_candidates(
     authorized: list[UUID] = []
     skipped: list[UUID] = []
     for (row_id,) in rows:
+        if not authz.authorize(
+            session, auth, resource_type=table, resource_id=row_id, action="read"
+        ):
+            continue
         if authz.authorize(session, auth, resource_type=table, resource_id=row_id, action="write"):
             authorized.append(row_id)
         else:
