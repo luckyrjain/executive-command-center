@@ -15,6 +15,8 @@ and C (`member`, the caller).
 
 from __future__ import annotations
 
+import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -219,6 +221,18 @@ def _set_visibility(version_id: UUID, visibility: str) -> None:
         )
 
 
+def _set_family_visibility(ws: UUID, workflow_id: str, visibility: str) -> None:
+    """Every version of the workflow, so no stray draft stays readable."""
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE workflow_versions SET visibility = :v "
+                "WHERE workspace_id = :ws AND workflow_id = :wf"
+            ),
+            {"v": visibility, "ws": ws, "wf": workflow_id},
+        )
+
+
 def _grant(w: World, version_id: UUID, actions: list[str]) -> None:
     with engine.begin() as connection:
         connection.execute(
@@ -262,8 +276,8 @@ def _post_run(token: str, workflow_id: str, key: str | None = None) -> tuple[int
 
 def test_member_cannot_run_another_members_private_workflow(world: World) -> None:
     workflow_id = f"authz.private.{uuid4().hex[:8]}"
-    active = _publish_workflow(world, workflow_id)
-    _set_visibility(active.id, "private")
+    _publish_workflow(world, workflow_id)
+    _set_family_visibility(world.ws, workflow_id, "private")
 
     status, body = _post_run(world.c_token, workflow_id)
 
@@ -275,6 +289,7 @@ def test_member_cannot_run_another_members_private_workflow(world: World) -> Non
 def test_read_only_grantee_cannot_run_shared_workflow(world: World) -> None:
     workflow_id = f"authz.readonly.{uuid4().hex[:8]}"
     active = _publish_workflow(world, workflow_id)
+    _set_family_visibility(world.ws, workflow_id, "private")
     _set_visibility(active.id, "shared_explicitly")
     _grant(world, active.id, ["read"])
 
@@ -288,6 +303,7 @@ def test_read_only_grantee_cannot_run_shared_workflow(world: World) -> None:
 def test_write_grantee_can_run_shared_workflow(world: World) -> None:
     workflow_id = f"authz.writegrant.{uuid4().hex[:8]}"
     active = _publish_workflow(world, workflow_id)
+    _set_family_visibility(world.ws, workflow_id, "private")
     _set_visibility(active.id, "shared_explicitly")
     _grant(world, active.id, ["read", "write"])
 
@@ -350,13 +366,13 @@ def test_visible_inactive_workflow_is_still_409(world: World) -> None:
 
 def test_same_key_replay_is_reauthorized(world: World) -> None:
     workflow_id = f"authz.replay.{uuid4().hex[:8]}"
-    active = _publish_workflow(world, workflow_id)
+    _publish_workflow(world, workflow_id)
     key = str(uuid4())
 
     status, first = _post_run(world.c_token, workflow_id, key)
     assert status == 201, first
 
-    _set_visibility(active.id, "private")
+    _set_family_visibility(world.ws, workflow_id, "private")
     status, replay = _post_run(world.c_token, workflow_id, key)
 
     assert status == 404, replay
@@ -376,3 +392,126 @@ def test_authorized_same_key_replay_returns_cached_run(world: World) -> None:
     assert status == 201, replay
     assert replay["id"] == first["id"]
     assert _run_count(world.ws, workflow_id) == 1
+
+
+def test_authorized_replay_after_disable_returns_cached_run(world: World) -> None:
+    """No active version any more, but the caller can still read the
+    (now disabled) version: the replay gets its cached 201, a new key the
+    409. The throwaway v1 draft is made unreadable so only the disabled
+    version keeps the workflow visible."""
+    workflow_id = f"authz.disabled.{uuid4().hex[:8]}"
+    active = _publish_workflow(world, workflow_id)
+    _set_family_visibility(world.ws, workflow_id, "private")
+    _set_visibility(active.id, "workspace")
+    key = str(uuid4())
+
+    status, first = _post_run(world.c_token, workflow_id, key)
+    assert status == 201, first
+    with SessionFactory() as session, session.begin():
+        disabled = automation_workflows.disable_workflow_version(session, world.ws, active.id)
+    assert isinstance(disabled, automation_workflows.WorkflowVersion)
+
+    status, replay = _post_run(world.c_token, workflow_id, key)
+    assert status == 201, replay
+    assert replay["id"] == first["id"]
+
+    status, fresh = _post_run(world.c_token, workflow_id)
+    assert status == 409, fresh
+    assert fresh["error"]["code"] == "WORKFLOW_NOT_ACTIVE"
+    assert _run_count(world.ws, workflow_id) == 1
+
+
+# ---------------------------------------------------------------------------
+# The active row lock: real concurrency (request thread + a separate
+# connection holding the lock), waiting observed in pg_stat_activity.
+# ---------------------------------------------------------------------------
+
+_WAIT_SECONDS = 15
+
+
+def _blocked_on(holder_pid: int) -> int:
+    with engine.connect() as probe:
+        return int(
+            probe.execute(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname = current_database() AND wait_event_type = 'Lock' "
+                    "AND pg_blocking_pids(pid) @> ARRAY[CAST(:holder AS integer)] "
+                    "AND query ~* 'FROM workflow_versions\\s.*FOR SHARE'"
+                ),
+                {"holder": holder_pid},
+            ).scalar_one()
+        )
+
+
+def _fire(token: str, workflow_id: str, result: dict[str, Any]) -> threading.Thread:
+    def run() -> None:
+        try:
+            result["response"] = _post_run(token, workflow_id)
+        except BaseException as exc:  # surfaced on the main thread
+            result["error"] = exc
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread
+
+
+def test_run_waiting_on_active_row_lock_sees_committed_visibility(world: World) -> None:
+    """A visibility change (as an ownership transfer would: FOR UPDATE on
+    the row) commits while the request waits on the active row: the
+    request must authorize against the committed row and answer 404."""
+    workflow_id = f"authz.race.{uuid4().hex[:8]}"
+    active = _publish_workflow(world, workflow_id)
+    result: dict[str, Any] = {}
+    holder = engine.connect()
+    holder_tx = holder.begin()
+    thread: threading.Thread | None = None
+    try:
+        holder_pid = int(holder.execute(text("SELECT pg_backend_pid()")).scalar_one())
+        holder.execute(
+            text("SELECT id FROM workflow_versions WHERE id = :id FOR UPDATE"), {"id": active.id}
+        )
+        holder.execute(
+            text(
+                "UPDATE workflow_versions SET visibility = 'private' "
+                "WHERE workspace_id = :ws AND workflow_id = :wf"
+            ),
+            {"ws": world.ws, "wf": workflow_id},
+        )
+        thread = _fire(world.c_token, workflow_id, result)
+        deadline = time.monotonic() + _WAIT_SECONDS
+        while _blocked_on(holder_pid) < 1:
+            assert time.monotonic() < deadline, "run request never blocked on the row lock"
+            time.sleep(0.05)
+        holder_tx.commit()
+    finally:
+        if holder_tx.is_active:
+            holder_tx.rollback()
+        holder.close()
+        if thread is not None:
+            thread.join(timeout=_WAIT_SECONDS)
+    assert thread is not None and not thread.is_alive(), "run request never finished"
+    if "error" in result:
+        raise result["error"]
+    status, body = result["response"]
+    assert status == 404, body
+    assert body["error"]["code"] == "WORKFLOW_NOT_FOUND"
+    assert _run_count(world.ws, workflow_id) == 0
+
+
+def test_concurrent_runs_do_not_block_each_other(world: World) -> None:
+    """The lock is FOR SHARE: another run holding it does not block this one."""
+    workflow_id = f"authz.shared.{uuid4().hex[:8]}"
+    active = _publish_workflow(world, workflow_id)
+    result: dict[str, Any] = {}
+    with engine.connect() as holder, holder.begin():
+        holder.execute(
+            text("SELECT id FROM workflow_versions WHERE id = :id FOR SHARE"), {"id": active.id}
+        )
+        thread = _fire(world.c_token, workflow_id, result)
+        thread.join(timeout=_WAIT_SECONDS)
+        assert not thread.is_alive(), "run request blocked behind another FOR SHARE holder"
+    if "error" in result:
+        raise result["error"]
+    status, body = result["response"]
+    assert status == 201, body

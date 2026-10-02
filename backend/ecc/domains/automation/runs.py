@@ -386,14 +386,18 @@ def create_run_endpoint(
         # the same 404 as for an id that never existed (otherwise 404 vs
         # enqueue_run's 409 would reveal a private workflow exists); one
         # who can read a version keeps enqueue_run's WORKFLOW_NOT_ACTIVE.
-        active_version_id = session.execute(
-            text(
-                "SELECT id FROM workflow_versions "
-                "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id "
-                "AND status = 'active' FOR SHARE"
-            ),
-            {"workspace_id": auth.workspace_id, "workflow_id": payload.workflow_id},
-        ).scalar_one_or_none()
+        active_sql = text(
+            "SELECT id FROM workflow_versions "
+            "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id "
+            "AND status = 'active' FOR SHARE"
+        )
+        active_params = {"workspace_id": auth.workspace_id, "workflow_id": payload.workflow_id}
+        active_version_id = session.execute(active_sql, active_params).scalar_one_or_none()
+        if active_version_id is None:
+            # A publish that commits while this SELECT waits on the row it
+            # retires hides both rows from this statement (the new one was
+            # still a draft in its snapshot); a fresh statement sees it.
+            active_version_id = session.execute(active_sql, active_params).scalar_one_or_none()
         if active_version_id is None:
             if not authz.list_visible_resources(
                 session,
