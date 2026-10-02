@@ -58,15 +58,15 @@ def visible_runs_filter_sql(session: Session, auth: AuthContext) -> tuple[str, d
     )
 
 
-def run_visible(
+def visible_run_version_id(
     session: Session, auth: AuthContext, run_id: UUID, *, lock_version: bool = False
-) -> bool:
-    """`authorize(read)` on the run and on its pinned version. With
-    `lock_version`, the version row is locked `FOR SHARE` before either
-    check, so a concurrent ownership transfer or visibility change is seen.
-    The caller must already hold the run row's lock: the order is run, then
-    version."""
-    version_id = session.execute(
+) -> UUID | None:
+    """The run's pinned version id when the caller may read both the run and
+    that version, else `None`. With `lock_version`, the version row is
+    locked `FOR SHARE` before either check, so a concurrent ownership
+    transfer or visibility change is seen. The caller must already hold the
+    run row's lock: the order is run, then version."""
+    version_id: UUID | None = session.execute(
         text(
             "SELECT workflow_versions.id FROM workflow_runs "
             f"JOIN workflow_versions ON {PINNED_VERSION_JOIN} "
@@ -75,12 +75,21 @@ def run_visible(
         ),
         {"workspace_id": auth.workspace_id, "id": run_id},
     ).scalar_one_or_none()
-    return (
-        version_id is not None
-        and authz.authorize(
+    if (
+        version_id is None
+        or not authz.authorize(
             session, auth, resource_type="workflow_runs", resource_id=run_id, action="read"
         )
-        and authz.authorize(
+        or not authz.authorize(
             session, auth, resource_type="workflow_versions", resource_id=version_id, action="read"
         )
-    )
+    ):
+        return None
+    return version_id
+
+
+def run_visible(
+    session: Session, auth: AuthContext, run_id: UUID, *, lock_version: bool = False
+) -> bool:
+    """Whether `visible_run_version_id` finds the run visible."""
+    return visible_run_version_id(session, auth, run_id, lock_version=lock_version) is not None
