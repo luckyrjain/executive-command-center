@@ -213,8 +213,9 @@ corrected" section below.
 `_evaluate_dispatch_gate`'s two blocking outcomes:
 
 1. **No usable policy (`StepBlockedByPolicy`).** `run.policy_id is None`,
-   or it names a row `policy.get_policy` cannot find, or `policy.
-   is_policy_usable` reports `False` (revoked or expired) -- all three
+   or it names a row `policy.get_policy_for_workflow` cannot find (missing,
+   or a policy of another workflow), or `policy.is_policy_usable` reports
+   `False` (revoked or expired) -- all three
    block the step, fail-closed ("no policy means no authority," this
    task's own instruction: an unset `policy_id` is not an implicit
    all-bounded default). `process_claimed_run` maps this to `run.status =
@@ -1561,7 +1562,9 @@ def enqueue_run(
     # means no authority" gate (`_evaluate_dispatch_gate`), so no side effect
     # can follow from letting the row be created.
     if active.policy_ref is not None:
-        policy_row = policy_module.get_policy(session, workspace_id, active.policy_ref)
+        policy_row = policy_module.get_policy_for_workflow(
+            session, workspace_id, active.policy_ref, workflow_id
+        )
         if policy_row is not None:
             limit = _configured_runs_per_hour(policy_row)
             if limit is not None:
@@ -2025,9 +2028,10 @@ def _resolve_usable_policy(
 
     Fail-closed in all three unusable shapes, exactly as the module
     docstring's "No usable policy" section describes: `run.policy_id is
-    None` (no authority was ever attached), `policy.get_policy` finds no
-    such row, or `policy.is_policy_usable` reports `False` (revoked or
-    expired -- `policy.policy_status` distinguishes which, and that
+    None` (no authority was ever attached), `policy.get_policy_for_
+    workflow` finds no such row for this run's workflow, or `policy.
+    is_policy_usable` reports `False` (revoked or expired --
+    `policy.policy_status` distinguishes which, and that
     distinction is carried through to `StepBlockedByPolicy.reason`).
     Returns the resolved, currently-usable `AutomationPolicy` otherwise,
     so a caller that needs it for approval evaluation does not have to
@@ -2047,7 +2051,9 @@ def _resolve_usable_policy(
     """
     if run.policy_id is None:
         return StepBlockedByPolicy(step_index, "no_policy")
-    policy_row = policy_module.get_policy(session, run.workspace_id, run.policy_id)
+    policy_row = policy_module.get_policy_for_workflow(
+        session, run.workspace_id, run.policy_id, run.workflow_id
+    )
     if policy_row is None:
         return StepBlockedByPolicy(step_index, "no_policy")
     if not policy_module.is_policy_usable(policy_row):
@@ -2811,7 +2817,9 @@ def _compensation_policy_usable(session: Session, run: WorkflowRun) -> bool:
     """
     if run.policy_id is None:
         return False
-    policy_row = policy_module.get_policy(session, run.workspace_id, run.policy_id)
+    policy_row = policy_module.get_policy_for_workflow(
+        session, run.workspace_id, run.policy_id, run.workflow_id
+    )
     if policy_row is None:
         return False
     return policy_module.is_policy_usable(policy_row)
@@ -3102,7 +3110,9 @@ def _dispatch_compensation_step(
         and compensation_adapter is not None
     ):
         scope_policy = (
-            policy_module.get_policy(session, run.workspace_id, run.policy_id)
+            policy_module.get_policy_for_workflow(
+                session, run.workspace_id, run.policy_id, run.workflow_id
+            )
             if run.policy_id is not None
             else None
         )

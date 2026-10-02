@@ -237,6 +237,25 @@ def get_policy(session: Session, workspace_id: UUID, policy_id: UUID) -> Automat
     return _row_to_policy(dict(row)) if row is not None else None
 
 
+def get_policy_for_workflow(
+    session: Session, workspace_id: UUID, policy_id: UUID, workflow_id: str
+) -> AutomationPolicy | None:
+    """The policy `policy_id` names, only if it governs `workflow_id`.
+
+    A policy is created for one workflow family, by someone with access to
+    that family. Every server-side lookup of a version's or run's authority
+    goes through here, so a `policy_ref` naming another workflow's policy
+    (written before drafts were checked, or by a direct caller) resolves to
+    no policy at all and fails closed -- a run of workflow Y never borrows
+    the authority of a policy written for workflow X (`API-SCHEMAS.md`'s
+    confused-deputy rule).
+    """
+    policy = get_policy(session, workspace_id, policy_id)
+    if policy is None or policy.workflow_id != workflow_id:
+        return None
+    return policy
+
+
 def list_policies(
     session: Session, auth: AuthContext, *, workflow_id: str | None = None
 ) -> list[AutomationPolicy]:
