@@ -235,17 +235,34 @@ def list_policies(
     return [_row_to_policy(dict(row)) for row in rows]
 
 
-def workflow_family_exists(session: Session, workspace_id: UUID, workflow_id: str) -> bool:
-    return (
-        session.execute(
-            text(
-                "SELECT 1 FROM workflow_definitions WHERE workspace_id = :workspace_id "
-                "AND workflow_id = :workflow_id LIMIT 1"
-            ),
-            {"workspace_id": workspace_id, "workflow_id": workflow_id},
-        ).first()
-        is not None
-    )
+def _authorize_workflow_for_policy(session: Session, auth: AuthContext, workflow_id: str) -> None:
+    """Binding a policy to a workflow needs read (else `404`, the same answer
+    as for a `workflow_id` that never existed) then write (`403`) on the
+    workflow's active version, or its latest version when none is active.
+    Checking only that the family existed told a member whether another
+    member's private workflow existed, and let them bind to it.
+
+    That one row is locked `FOR SHARE` before the checks, so an ownership
+    transfer or visibility change committing meanwhile is seen. One row
+    only: locking every version could deadlock with publish, which locks the
+    target and the active version `FOR UPDATE` in its own order.
+    """
+    version_id = session.execute(
+        text(
+            "SELECT id FROM workflow_versions "
+            "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id "
+            "ORDER BY status = 'active' DESC, version DESC LIMIT 1 FOR SHARE"
+        ),
+        {"workspace_id": auth.workspace_id, "workflow_id": workflow_id},
+    ).scalar_one_or_none()
+    if version_id is None or not authz.authorize(
+        session, auth, resource_type="workflow_versions", resource_id=version_id, action="read"
+    ):
+        raise HTTPException(status_code=404, detail="WORKFLOW_NOT_FOUND")
+    if not authz.authorize(
+        session, auth, resource_type="workflow_versions", resource_id=version_id, action="write"
+    ):
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
 
 def create_policy(
@@ -449,6 +466,8 @@ def create_policy_endpoint(
     with session.begin():
         authz.lock_membership_for_write(session, auth, role_action="write")
         lock_idempotency(session, auth, idempotency_key)
+        # Ahead of the cache, so a same-key replay is re-authorized.
+        _authorize_workflow_for_policy(session, auth, payload.workflow_id)
         cached = load_cached(
             session,
             auth,
@@ -459,9 +478,6 @@ def create_policy_endpoint(
         )
         if cached is not None:
             return cached
-
-        if not workflow_family_exists(session, auth.workspace_id, payload.workflow_id):
-            raise HTTPException(status_code=404, detail="WORKFLOW_NOT_FOUND")
 
         created = create_policy(
             session,

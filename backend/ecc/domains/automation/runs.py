@@ -345,9 +345,7 @@ def list_runs_endpoint(
 
 @router.get("/runs/{run_id}", response_model=RunDetailResponse)
 def get_run_endpoint(run_id: UUID, auth: AuthDep, session: SessionDep) -> RunDetailResponse:
-    visible = authz.authorize(
-        session, auth, resource_type="workflow_runs", resource_id=run_id, action="read"
-    )
+    visible = worker_module.run_visible(session, auth, run_id)
     session.rollback()
     if not visible:
         raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
@@ -511,9 +509,8 @@ def _mutate_run(
         ).one_or_none()
         if locked is None:
             raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
-        if not authz.authorize(
-            session, auth, resource_type="workflow_runs", resource_id=run_id, action="read"
-        ):
+        # The pinned version must be readable too (`worker.run_visible`).
+        if not worker_module.run_visible(session, auth, run_id, lock_version=True):
             raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="workflow_runs", resource_id=run_id, action="write"

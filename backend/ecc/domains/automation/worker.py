@@ -1296,34 +1296,98 @@ def get_run(session: Session, workspace_id: UUID, run_id: UUID) -> WorkflowRun |
     return _row_to_run(dict(row)) if row is not None else None
 
 
+# A run's detail (workflow_id, step results) is its workflow's, so a run is
+# visible only while the `workflow_versions` row it is pinned to is readable
+# too. Checked live rather than copied onto the run at enqueue: a later
+# visibility change, ownership transfer or revoked grant on the version then
+# applies to its existing runs, scheduled ones included, with no backfill.
+_PINNED_VERSION_JOIN = (
+    "workflow_versions.workspace_id = workflow_runs.workspace_id "
+    "AND workflow_versions.workflow_id = workflow_runs.workflow_id "
+    "AND workflow_versions.version = workflow_runs.workflow_version"
+)
+
+
 def list_runs(
     session: Session,
     auth: AuthContext,
     *,
     status_filter: RunStatus | None = None,
 ) -> list[WorkflowRun]:
-    """Workspace-scoped run listing (Task 4's `GET /automations/runs`) --
-    added alongside `pause_run`/`resume_run` rather than in `runs.py`
-    itself, matching this package's established convention that reads
-    against a table live in that table's own owning module
+    """Workspace-scoped run listing (Task 4's `GET /automations/runs`).
+    Each run is filtered by its own visibility and by its pinned version's
+    (see `_PINNED_VERSION_JOIN`).
+
+    Lives here rather than in `runs.py`, matching this package's convention
+    that reads against a table live in that table's own owning module
     (`approvals.list_approvals`, `policy.list_policies`), with the router
     module itself staying a thin HTTP-shape layer.
     """
-    extra_clauses = []
-    extra_params: dict[str, Any] = {}
-    if status_filter is not None:
-        extra_clauses.append("status = :status_filter")
-        extra_params["status_filter"] = status_filter
-    rows = authz.list_visible_resources(
+    run_sql, run_params = authz.visible_resource_filter_sql(
         session,
         auth,
         resource_type="workflow_runs",
-        columns=_RUN_FIELDS,
-        order_by="queued_at DESC",
-        extra_clauses=extra_clauses,
-        extra_params=extra_params,
+        action="read",
+        table_alias="workflow_runs",
+        param_prefix="run_",
+    )
+    version_sql, version_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="workflow_versions",
+        action="read",
+        table_alias="workflow_versions",
+        param_prefix="version_",
+    )
+    clauses = [
+        "workflow_runs.workspace_id = :workspace_id",
+        run_sql,
+        f"EXISTS (SELECT 1 FROM workflow_versions WHERE {_PINNED_VERSION_JOIN} AND {version_sql})",
+    ]
+    params: dict[str, Any] = {**run_params, **version_params, "workspace_id": auth.workspace_id}
+    if status_filter is not None:
+        clauses.append("workflow_runs.status = :status_filter")
+        params["status_filter"] = status_filter
+    rows = (
+        session.execute(
+            text(
+                f"SELECT {_RUN_FIELDS} FROM workflow_runs "  # noqa: S608 -- constants and authz fragments only
+                f"WHERE {' AND '.join(clauses)} ORDER BY queued_at DESC"
+            ),
+            params,
+        )
+        .mappings()
+        .all()
     )
     return [_row_to_run(dict(row)) for row in rows]
+
+
+def run_visible(
+    session: Session, auth: AuthContext, run_id: UUID, *, lock_version: bool = False
+) -> bool:
+    """`authorize(read)` on the run and on its pinned version. With
+    `lock_version`, the version row is locked `FOR SHARE` before either
+    check, so a concurrent ownership transfer or visibility change is seen.
+    The caller must already hold the run row's lock: the order is run, then
+    version."""
+    version_id = session.execute(
+        text(
+            "SELECT workflow_versions.id FROM workflow_runs "
+            f"JOIN workflow_versions ON {_PINNED_VERSION_JOIN} "
+            "WHERE workflow_runs.workspace_id = :workspace_id AND workflow_runs.id = :id"
+            + (" FOR SHARE OF workflow_versions" if lock_version else "")
+        ),
+        {"workspace_id": auth.workspace_id, "id": run_id},
+    ).scalar_one_or_none()
+    return (
+        version_id is not None
+        and authz.authorize(
+            session, auth, resource_type="workflow_runs", resource_id=run_id, action="read"
+        )
+        and authz.authorize(
+            session, auth, resource_type="workflow_versions", resource_id=version_id, action="read"
+        )
+    )
 
 
 def list_run_steps(session: Session, workspace_id: UUID, run_id: UUID) -> list[WorkflowRunStep]:

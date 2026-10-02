@@ -118,7 +118,7 @@ describe('PolicyPanel', () => {
     renderPanel()
 
     const alert = await screen.findByRole('alert', {}, { timeout: 3000 })
-    expect(alert.textContent).toContain('does not exist in this workspace yet')
+    expect(alert.textContent).toContain('No workflow with this ID exists in this workspace that you can see')
     expect(alert.textContent).not.toContain('Workflow Not Found')
     // A failed list is never the "no policies" empty state.
     expect(screen.queryByText('No policies recorded yet.')).toBeNull()
@@ -157,6 +157,24 @@ describe('PolicyPanel', () => {
     const body = JSON.parse(String(fetch.mock.calls[1][1]?.body))
     expect(body.count_limit).toBe(25)
     expect(body.workflow_id).toBe('weekly-digest')
+  })
+
+  it('explains a 403 on create as a workflow the caller can see but not change', async () => {
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ policies: [] }))
+      .mockImplementationOnce(() => response({ error: { code: 'INSUFFICIENT_ROLE', message: 'Insufficient Role' } }, 403))
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await waitFor(() => expect(screen.getByText('No policies recorded yet.')).toBeTruthy())
+    fireEvent.change(screen.getByLabelText('Workflow ID'), { target: { value: 'weekly-digest' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Create policy' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('cannot attach a policy to it')
+    expect(alert.textContent).not.toContain('Insufficient Role')
   })
 
   it('on failed final submit, navigates back to Scope (where the missing Workflow ID lives) and focuses it', async () => {

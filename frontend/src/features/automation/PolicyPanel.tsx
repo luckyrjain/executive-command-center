@@ -23,6 +23,13 @@ const CREATE_STEPS = ['scope', 'limits', 'review'] as const
 const CREATE_STEP_LABELS: Record<(typeof CREATE_STEPS)[number], string> = { scope: 'Scope', limits: 'Limits', review: 'Review' }
 const CREATE_ERROR_ID = 'create-policy-error'
 
+function createErrorMessage(error: unknown): string {
+  if (error instanceof ApiError && error.code === 'INSUFFICIENT_ROLE') {
+    return 'You can see this workflow but not change it, so you cannot attach a policy to it.'
+  }
+  return errorMessage(error)
+}
+
 function errorMessage(error: unknown): string {
   if (error instanceof ApiError && error.code === 'POLICY_REVOKED') {
     const details = error.current as { revoked_at?: string } | undefined
@@ -33,7 +40,7 @@ function errorMessage(error: unknown): string {
     return `This policy already expired${details?.expires_at ? ` at ${new Date(details.expires_at).toLocaleString()}` : ''} and cannot be revoked further.`
   }
   return apiErrorMessage(error, {
-    WORKFLOW_NOT_FOUND: 'That workflow ID does not exist in this workspace yet -- draft the workflow first.',
+    WORKFLOW_NOT_FOUND: 'No workflow with this ID exists in this workspace that you can see -- draft the workflow first.',
     POLICY_NOT_FOUND: 'That policy no longer exists in this workspace.',
     OFFLINE: 'You are offline, so policies could not be read or changed.',
     NETWORK_ERROR: 'Could not reach the server, so policies could not be read or changed.',
@@ -173,7 +180,7 @@ export default function PolicyPanel() {
       <form ref={createFormRef} noValidate onSubmit={attemptCreate} aria-labelledby="create-policy-title">
         <h3 id="create-policy-title">Create a policy</h3>
         {formError ? <div id={CREATE_ERROR_ID} role="alert" className="inline-status error-panel">{formError}</div> : null}
-        {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div> : null}
+        {createMutation.isError ? <div role="alert" className="inline-status error-panel">{createErrorMessage(createMutation.error)}</div> : null}
 
         <ol className="wizard-stepper" aria-label="Create policy progress">
           {CREATE_STEPS.map((step, i) => (
