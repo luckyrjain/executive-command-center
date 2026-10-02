@@ -1139,3 +1139,36 @@ def test_simulate_reports_dispatch_value_and_accumulates_it(
     simulated = _simulate(scope_world, workflow_id, registry)
     assert [r.dispatch_value for r in simulated] == [Decimal("70"), Decimal("70")]
     assert [r.dispatch_gate for r in simulated] == ["requires_approval", "requires_approval"]
+
+
+def test_simulate_treats_a_policy_bound_to_another_workflow_as_no_policy(
+    simulate_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Simulate walks the graph the way the worker would, so a version
+    naming another workflow's policy reports `no_policy`, as dispatch
+    would."""
+    client, workspace_id, user_id, token = simulate_test_context
+    graph = _linear_graph(_action_step("s1", "test.echo"))
+    owner = _publish_workflow_direct(workspace_id, user_id, f"test.sim-owner.{uuid4().hex}", graph)
+    assert owner.policy_ref is not None
+    borrower_id = f"test.sim-borrower.{uuid4().hex}"
+    with SessionFactory() as session, session.begin():
+        draft = automation_workflows.create_workflow_draft(
+            session,
+            workspace_id,
+            user_id,
+            workflow_id=borrower_id,
+            graph=graph,
+            trigger_refs=[],
+            policy_ref=owner.policy_ref,
+        )
+        activated = automation_workflows.activate_workflow_version(session, workspace_id, draft.id)
+    assert isinstance(activated, automation_workflows.WorkflowVersion)
+
+    response = client.post(
+        f"/api/v1/automations/workflows/{activated.id}/simulate", headers=_headers(token)
+    )
+    assert response.status_code == 200
+    [step] = response.json()["steps"]
+    assert step["dispatch_gate"] == "policy_blocked"
+    assert step["policy_block_reason"] == "no_policy"

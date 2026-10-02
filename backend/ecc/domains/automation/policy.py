@@ -237,6 +237,22 @@ def get_policy(session: Session, workspace_id: UUID, policy_id: UUID) -> Automat
     return _row_to_policy(dict(row)) if row is not None else None
 
 
+def get_policy_for_workflow(
+    session: Session, workspace_id: UUID, policy_id: UUID, workflow_id: str
+) -> AutomationPolicy | None:
+    """The policy `policy_id` as authority for `workflow_id`: `None` when it
+    does not exist *or* is bound to a different workflow. A policy is
+    standing authority for its own workflow only, so a version or run of X
+    naming Y's policy has no policy at all -- never "run workflow X under
+    policy Y" (`API-SCHEMAS.md`'s confused-deputy rule). Every lookup that
+    resolves a policy as authority for a workflow goes through here.
+    """
+    policy = get_policy(session, workspace_id, policy_id)
+    if policy is None or policy.workflow_id != workflow_id:
+        return None
+    return policy
+
+
 def list_policies(
     session: Session, auth: AuthContext, *, workflow_id: str | None = None
 ) -> list[AutomationPolicy]:

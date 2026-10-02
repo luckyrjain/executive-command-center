@@ -2901,3 +2901,83 @@ def test_pausing_a_waiting_approval_run_takes_effect_on_the_approval_resume(
         )
     assert completed.status == "succeeded"
     assert adapter.execute_calls == 1
+
+
+def _activate_with_borrowed_policy(
+    workspace_id: UUID, user_id: UUID, workflow_id: str, graph: dict[str, Any], policy_id: UUID
+) -> automation_workflows.WorkflowVersion:
+    """Workflow `workflow_id` published with a `policy_ref` naming a policy
+    bound to a different workflow -- written straight through the domain
+    function, as a draft created before the endpoint refused this would be."""
+    with SessionFactory() as session, session.begin():
+        draft = automation_workflows.create_workflow_draft(
+            session,
+            workspace_id,
+            user_id,
+            workflow_id=workflow_id,
+            graph=graph,
+            trigger_refs=[],
+            policy_ref=policy_id,
+        )
+        activated = automation_workflows.activate_workflow_version(session, workspace_id, draft.id)
+    assert isinstance(activated, automation_workflows.WorkflowVersion)
+    return activated
+
+
+def test_policy_bound_to_another_workflow_blocks_dispatch(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """A policy authorizes only the workflow it is bound to: a run of X
+    whose version names Y's policy has no authority at all ("run workflow
+    X under policy Y" is the confused-deputy path `API-SCHEMAS.md` rules
+    out)."""
+    workspace_id, user_id = worker_test_context
+    graph = _chained_graph(_action_step("s1", "test.echo"))
+    owner = _publish_workflow(workspace_id, user_id, f"test.owner.{uuid4().hex}", graph)
+    assert owner.policy_ref is not None
+    borrower_id = f"test.borrower.{uuid4().hex}"
+    _activate_with_borrowed_policy(workspace_id, user_id, borrower_id, graph, owner.policy_ref)
+
+    with SessionFactory() as session, session.begin():
+        queued = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=borrower_id
+        )
+    assert isinstance(queued, automation_worker.WorkflowRun)
+
+    adapter = EchoAdapter()
+    registry = _make_registry(adapter)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+    assert claimed is not None
+    assert claimed.id == queued.id
+    with SessionFactory() as session:
+        finished = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+    assert finished.status == "needs_review"
+    assert adapter.execute_calls == 0
+
+
+def test_rate_limit_of_a_policy_bound_to_another_workflow_is_not_applied(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """The borrowed policy is not X's policy for any purpose, its ceiling
+    included: X is treated as having no policy, which enqueue does not
+    rate-limit (dispatch blocks it; see the test above)."""
+    workspace_id, user_id = worker_test_context
+    graph = _chained_graph(_action_step("s1", "test.echo"))
+    owner = _publish_workflow(
+        workspace_id,
+        user_id,
+        f"test.owner-rl.{uuid4().hex}",
+        graph,
+        rate_limit={"runs_per_workflow_per_hour": 1},
+    )
+    assert owner.policy_ref is not None
+    borrower_id = f"test.borrower-rl.{uuid4().hex}"
+    _activate_with_borrowed_policy(workspace_id, user_id, borrower_id, graph, owner.policy_ref)
+
+    for _ in range(2):
+        with SessionFactory() as session, session.begin():
+            queued = automation_worker.enqueue_run(
+                session, workspace_id, user_id, workflow_id=borrower_id
+            )
+        assert isinstance(queued, automation_worker.WorkflowRun)

@@ -889,3 +889,31 @@ def test_decision_waits_for_an_in_flight_visibility_change(world: World) -> None
     assert result["status"] == 404, result["body"]
     assert _approval_status(world.ws, approval_id) == "pending"
     assert _run_status(world.ws, run_id) == "waiting_approval"
+
+
+def _post_draft_with_policy_ref(token: str, workflow_id: str, policy_ref: UUID) -> tuple[int, Any]:
+    response = _client(token).post(
+        "/api/v1/automations/workflows",
+        json={"workflow_id": workflow_id, "graph": _GRAPH, "policy_ref": str(policy_ref)},
+        headers=_headers(token),
+    )
+    return response.status_code, response.json()
+
+
+def test_draft_cannot_borrow_another_workflows_policy(world: World) -> None:
+    """C can read B's workspace-visible workflow and its policy, but a
+    policy is standing authority for its own workflow only: C's draft of
+    another workflow cannot point at it."""
+    owner_id = f"vis.lender.{uuid4().hex[:8]}"
+    owner = _publish_workflow(world, owner_id)
+    assert owner.policy_ref is not None
+
+    status, body = _post_draft_with_policy_ref(
+        world.c_token, f"vis.borrower.{uuid4().hex[:8]}", owner.policy_ref
+    )
+
+    assert status == 422, body
+    assert body["error"]["code"] == "POLICY_WORKFLOW_MISMATCH"
+
+    own_status, own_body = _post_draft_with_policy_ref(world.b_token, owner_id, owner.policy_ref)
+    assert own_status == 201, own_body

@@ -53,7 +53,12 @@ from .adapter_contract import ACTION_TYPES, DATA_CLASSES, dispatch_value, has_di
 from .adapters import ActionAdapter, AdapterRegistry
 from .adapters import registry as _production_adapter_registry
 from .approvals import evaluate_approval_requirement, evaluate_policy_scope
-from .policy import AutomationPolicy, get_policy, is_policy_usable, policy_status
+from .policy import (
+    AutomationPolicy,
+    get_policy_for_workflow,
+    is_policy_usable,
+    policy_status,
+)
 
 # Task 7a: safe to import `.adapters`/`.policy`/`.approvals` here -- confirmed
 # directly, none of those three modules imports `workflows.py` or `worker.py`
@@ -853,12 +858,15 @@ def activate_workflow_version(
                 violations=tuple(high_impact_violations),
             )
         # Scope (third, only with a registry). Skipped -- the dispatch gate
-        # stays authoritative -- when there is no policy_ref, or the policy
-        # is legacy, revoked or expired: those already block at dispatch
+        # stays authoritative -- when there is no policy_ref, the policy is
+        # bound to another workflow, or it is legacy, revoked or expired:
+        # those already block at dispatch
         # with their own reasons, and failing publish for them would be new
         # behaviour outside the scope-enforcement design.
         scope_policy = (
-            get_policy(session, workspace_id, target_row["policy_ref"])
+            get_policy_for_workflow(
+                session, workspace_id, target_row["policy_ref"], target_row["workflow_id"]
+            )
             if target_row["policy_ref"] is not None
             else None
         )
@@ -1127,24 +1135,37 @@ def _lock_and_authorize_family(session: Session, auth: AuthContext, workflow_id:
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
 
-def _lock_and_authorize_policy_ref(session: Session, auth: AuthContext, policy_ref: UUID) -> None:
+def _lock_and_authorize_policy_ref(
+    session: Session, auth: AuthContext, policy_ref: UUID, workflow_id: str
+) -> None:
     """A `policy_ref` must name a policy the caller can read: one that does
     not exist and one they cannot see both answer `404 POLICY_NOT_FOUND`,
-    so the reference cannot be used to probe for policy ids. Read, not
-    write: the draft only points at the policy. `FOR SHARE` holds off a
-    visibility or ownership change until this transaction ends.
+    so the reference cannot be used to probe for policy ids. `FOR SHARE`
+    holds off a visibility or ownership change until this transaction ends.
+
+    It must also be bound to this draft's own workflow, else `422
+    POLICY_WORKFLOW_MISMATCH` (after the read check, so only a policy the
+    caller can see gets the distinct answer). A policy is standing
+    authority for its own workflow only (`policy.get_policy_for_workflow`):
+    without this, a member who could merely read another workflow's policy
+    could point their own workflow at it and run under its scope and
+    approval mode. Read on the policy is then enough, since the family
+    checks already required write on the draft's workflow -- the one the
+    policy authorizes.
     """
-    locked = session.execute(
+    bound_to = session.execute(
         text(
-            "SELECT id FROM automation_policies "
+            "SELECT workflow_id FROM automation_policies "
             "WHERE workspace_id = :workspace_id AND id = :id FOR SHARE"
         ),
         {"workspace_id": auth.workspace_id, "id": policy_ref},
-    ).one_or_none()
-    if locked is None or not authz.authorize(
+    ).scalar_one_or_none()
+    if bound_to is None or not authz.authorize(
         session, auth, resource_type="automation_policies", resource_id=policy_ref, action="read"
     ):
         raise HTTPException(status_code=404, detail="POLICY_NOT_FOUND")
+    if bound_to != workflow_id:
+        raise HTTPException(status_code=422, detail="POLICY_WORKFLOW_MISMATCH")
 
 
 def _authorize_retiring_active_version(
@@ -1301,7 +1322,7 @@ def create_workflow_endpoint(
         lock_idempotency(session, auth, idempotency_key)
         _lock_and_authorize_family(session, auth, payload.workflow_id)
         if payload.policy_ref is not None:
-            _lock_and_authorize_policy_ref(session, auth, payload.policy_ref)
+            _lock_and_authorize_policy_ref(session, auth, payload.policy_ref, payload.workflow_id)
         cached = load_cached(
             session,
             auth,
@@ -1778,7 +1799,9 @@ def _simulate_steps(
     steps: list[dict[str, Any]] = version.graph.get("steps", [])
     policy_row: AutomationPolicy | None = None
     if version.policy_ref is not None:
-        policy_row = get_policy(session, version.workspace_id, version.policy_ref)
+        policy_row = get_policy_for_workflow(
+            session, version.workspace_id, version.policy_ref, version.workflow_id
+        )
 
     results: list[SimulateStepResult] = []
     action_step_count_so_far = 0

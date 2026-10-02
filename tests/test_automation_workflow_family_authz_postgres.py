@@ -162,8 +162,14 @@ def _seed_family(
     return workflow_id, version_id
 
 
-def _seed_policy(w: RaceWorld, *, owner: UUID, visibility: str) -> UUID:
-    workflow_id, _ = _seed_family(w, owner=owner, visibility="workspace", status="draft")
+def _seed_policy(
+    w: RaceWorld, *, owner: UUID, visibility: str, family_owner: UUID | None = None
+) -> UUID:
+    """A policy owned by `owner`, bound to a fresh workspace-visible family
+    owned by `family_owner` (default: `owner`)."""
+    workflow_id, _ = _seed_family(
+        w, owner=family_owner or owner, visibility="workspace", status="draft"
+    )
     policy_id = uuid4()
     with engine.begin() as conn:
         conn.execute(
@@ -184,6 +190,16 @@ def _seed_policy(w: RaceWorld, *, owner: UUID, visibility: str) -> UUID:
             },
         )
     return policy_id
+
+
+def _policy_workflow_id(policy_id: UUID) -> str:
+    with engine.connect() as conn:
+        return str(
+            conn.execute(
+                text("SELECT workflow_id FROM automation_policies WHERE id = :id"),
+                {"id": policy_id},
+            ).scalar_one()
+        )
 
 
 def _grant_read(w: RaceWorld, *, grantee: UUID, resource_type: str, resource_id: UUID) -> None:
@@ -370,10 +386,11 @@ def test_invisible_policy_ref_is_indistinguishable_from_unknown(world: RaceWorld
 
 
 def test_visible_policy_ref_is_accepted(world: RaceWorld) -> None:
-    policy = _seed_policy(world, owner=world.b, visibility="workspace")
+    """B's workspace-visible policy, bound to C's own workflow."""
+    policy = _seed_policy(world, owner=world.b, visibility="workspace", family_owner=world.c)
     c_token = _session_token(world, world.c)
     with _client(c_token) as client:
-        response = _create(client, c_token, f"new-{uuid4().hex[:12]}", policy_ref=policy)
+        response = _create(client, c_token, _policy_workflow_id(policy), policy_ref=policy)
 
     assert response.status_code == 201, response.text
     assert response.json()["policy_ref"] == str(policy)
@@ -461,10 +478,10 @@ def test_create_replay_is_reauthorized_against_the_family(world: RaceWorld) -> N
 
 
 def test_create_replay_is_reauthorized_against_the_policy(world: RaceWorld) -> None:
-    policy = _seed_policy(world, owner=world.b, visibility="workspace")
+    policy = _seed_policy(world, owner=world.b, visibility="workspace", family_owner=world.c)
     c_token = _session_token(world, world.c)
     request_headers = headers(c_token)
-    workflow_id = f"new-{uuid4().hex[:12]}"
+    workflow_id = _policy_workflow_id(policy)
     with _client(c_token) as client:
         first = _create(
             client, c_token, workflow_id, policy_ref=policy, request_headers=request_headers

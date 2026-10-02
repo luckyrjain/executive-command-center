@@ -223,6 +223,15 @@ describe('WorkflowList', () => {
     }
   })
 
+  it('explains a policy bound to a different workflow, never the raw backend message', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ error: { code: 'POLICY_WORKFLOW_MISMATCH', message: 'Policy Workflow Mismatch' } }, 422)))
+    renderList()
+
+    const alert = await screen.findByRole('alert', {}, { timeout: 3000 })
+    expect(alert.textContent).toContain('That policy belongs to a different workflow.')
+    expect(alert.textContent).not.toContain('Policy Workflow Mismatch')
+  })
+
   it('maps a failed workflow-list fetch through errorMessage(), never the raw backend message', async () => {
     // retry: 1 on the list query overrides the client default, so the mock
     // keeps failing and the wait outlasts React Query's ~1s backoff.
