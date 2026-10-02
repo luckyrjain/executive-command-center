@@ -22,15 +22,10 @@ gate on them (Decision 6: an expired or revoked policy blocks *future*
 runs; this task builds no run dispatch, so nothing beyond `revoke_policy`
 below currently calls them for an HTTP effect).
 
-## Which policy scope fields are actually enforced (accepted limitation)
+## Which policy scope fields are enforced
 
 This module stores and returns all eight scope/limit fields
-`APPROVAL-POLICY.md` names. Only some of them are compared against anything
-at dispatch or enqueue time, and the difference is disclosed here (rather
-than left for a reader to discover by grepping for call sites) in the same
-"state the real boundary explicitly" style
-`docs/phases/phase-005/IMPLEMENTATION-STATUS.md` already uses for Phase 5's
-other accepted limitations:
+`APPROVAL-POLICY.md` names. How each one is enforced:
 
 - **`approval_mode` -- enforced.** `approvals.evaluate_approval_requirement`
   (per-step approval requirement) plus `worker._evaluate_dispatch_gate`'s
@@ -39,6 +34,21 @@ other accepted limitations:
   `worker._evaluate_dispatch_gate` before every not-yet-started step.
 - **`count_limit` -- enforced.** `evaluate_approval_requirement`'s
   `policy-limit-exceeding` check, per run.
+- **`value_limit` -- enforced.** Same check, per run: the run's summed
+  `workflow_run_steps.dispatch_value` plus this step's
+  (`adapter_contract.dispatch_value`) must not exceed it. Every adapter
+  registered today moves value 0. A per-day window is deferred.
+- **`action_types`/`data_classes` -- enforced on `scope_enforced` rows.**
+  `approvals.evaluate_policy_scope`: the adapter's `action_type` must be
+  listed and its `data_class` must rank at or below the highest listed
+  class (`adapter_contract.DATA_CLASSES`, an ordinal ceiling). Checked at
+  publish (`ACTION_REF_OUTSIDE_POLICY_SCOPE`), dispatch (blocks to
+  `needs_review`, not an approval), retry-resume, compensation and
+  `/simulate`. `create_policy` refuses an empty or unknown scope
+  (`validate_policy_scope` -> `POLICY_SCOPE_EMPTY`/
+  `POLICY_SCOPE_UNKNOWN_VALUE`) and always writes `scope_enforced = true`.
+  A legacy row (`scope_enforced = false`, created before migration 0086)
+  is not checked and ages out within 90 days.
 - **`rate_limit` (`runs_per_workflow_per_hour`) -- enforced.**
   `worker.enqueue_run` rejects the next run past the ceiling
   (`worker.RunRateLimited` -> `rate_limited`).
@@ -47,38 +57,10 @@ other accepted limitations:
   `timezone`), which is what `scheduler.py` actually evaluates; this column
   is descriptive metadata about the authorized cadence, never a second
   scheduler input.
-- **`action_types` -- NOT enforced.** Stored, returned by
-  `GET /automations/policies`, never compared against a dispatching adapter.
-- **`data_classes` -- NOT enforced.** Same: stored and returned, never
-  compared.
-- **`value_limit` -- NOT enforced.** Same: stored and returned (and
-  required/non-nullable, so an author must still choose a number), never
-  summed against anything.
 
-**The three unenforced fields, stated plainly: a policy scoped to specific
-`action_types` or `data_classes` currently authorizes any registered adapter
-regardless of that adapter's actual type or data classification, and a
-`value_limit` of any size constrains nothing.** They are stored, returned by
-the API, and intended for future enforcement -- they are not a live control
-today. The reason is a missing model, not an oversight: enforcing them
-requires per-adapter metadata mapping an adapter identity to its action type
-and the data classes it touches (and, for `value_limit`, a monetary amount
-per dispatch), and `adapters.ActionAdapter` declares no such fields --
-Decision 8's contract carries `adapter_id`, `input_schema`/`output_schema`,
-`reversible` and `high_impact_categories`, and nothing else. Adding that
-metadata means extending the adapter protocol, backfilling it for every
-registered adapter, deciding how an adapter that declines to classify itself
-is treated (fail-closed, matching `high_impact_categories`' own precedent),
-and threading it through both `_evaluate_dispatch_gate` and
-`workflows._simulate_steps` -- a design change of its own, deliberately not
-attempted as part of a docs-vs-code reconciliation. What *is* enforced
-meanwhile is the part that does not need adapter metadata at all:
-`high_impact_categories` (which every adapter already declares) always
-forces per-run approval, `approval_mode` gates or blocks every step, and
-`expires_at`/`revoked_at`/`count_limit`/`rate_limit` all bound authority by
-time and volume. The gap is real but narrow: it is "this policy does not
-narrow *which kinds* of registered adapter it authorizes," not "this policy
-authorizes unattended execution."
+Full rules: `APPROVAL-POLICY.md`'s "Scope enforcement" section and
+`docs/superpowers/specs/2026-10-01-automation-policy-scope-enforcement-
+design.md`.
 """
 
 from dataclasses import dataclass
@@ -210,11 +192,9 @@ def policy_status(
 
 def is_policy_usable(policy: AutomationPolicy, *, now: datetime | None = None) -> bool:
     """Whether this policy currently authorizes anything -- `True` only for
-    `policy_status(...) == "active"`. No caller in this task's scope
-    dispatches a run, so nothing yet calls this for an HTTP-visible effect;
-    it exists for the Task 2 worker's own future policy-resolution step to
-    reuse rather than reimplement (design doc Decision 6's "expired policy
-    blocks future runs").
+    `policy_status(...) == "active"` (design doc Decision 6's "expired policy
+    blocks future runs"). The worker's dispatch gate, publish-time scope
+    check and `/simulate` all use it.
     """
     return policy_status(policy, now=now) == "active"
 

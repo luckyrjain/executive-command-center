@@ -1,6 +1,6 @@
 # Automation Policy Scope Enforcement Design
 
-**Status of this document:** **accepted by the repository owner on 2026-10-02** (PR #359): Decisions 1-6 as recommended, with the answers recorded in "Owner decisions" at the end. It changes no code itself; `docs/phases/phase-005/APPROVAL-POLICY.md`'s "Accepted limitation" section changes in the implementation PR, not here. Implementation may now begin, in Decision 6's order. This document is the "design change of its own" that `APPROVAL-POLICY.md:45` and `backend/ecc/domains/automation/policy.py:62-73` say enforcement needs.
+**Status of this document:** **implemented** (commits `c7bc1d0c`..`9de2500f`, branch `feat/automation-policy-scope-enforcement`; the documentation updates listed under Decision 6 are applied). **Accepted by the repository owner on 2026-10-02** (PR #359): Decisions 1-6 as recommended, with the answers recorded in "Owner decisions" at the end. It changes no code itself; `docs/phases/phase-005/APPROVAL-POLICY.md`'s "Accepted limitation" section changes in the implementation PR, not here. Implementation may now begin, in Decision 6's order. This document is the "design change of its own" that `APPROVAL-POLICY.md:45` and `backend/ecc/domains/automation/policy.py:62-73` say enforcement needs.
 
 ## Outcome
 
