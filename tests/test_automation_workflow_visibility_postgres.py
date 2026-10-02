@@ -620,6 +620,29 @@ def test_run_change_replay_is_reauthorized_against_the_version(world: World) -> 
     assert replay.status_code == 403, replay.text
 
 
+def test_demoted_run_starter_cannot_cancel_their_run(world: World) -> None:
+    """ADR-0014's narrowing: C owns the run but not the version, so once
+    demoted to viewer C gets 403; the workspace owner A can still cancel."""
+    workflow_id = f"vis.demoted.{uuid4().hex[:8]}"
+    _publish_workflow(world, workflow_id)
+    run_id = _enqueue(world, workflow_id, world.c)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE workspace_memberships SET role = 'viewer' "
+                "WHERE workspace_id = :ws AND users_id = :c"
+            ),
+            {"ws": world.ws, "c": world.c},
+        )
+
+    status, body = _mutate_run(world.c_token, run_id, "cancel")
+    assert status == 403, body
+    assert _run_status(world.ws, run_id) == "queued"
+
+    status, body = _mutate_run(world.a_token, run_id, "cancel")
+    assert status == 200, body
+
+
 def test_write_grantee_can_cancel_runs(world: World) -> None:
     workflow_id = f"vis.writer.{uuid4().hex[:8]}"
     _publish_workflow(world, workflow_id)
@@ -789,6 +812,36 @@ def test_decision_replay_is_reauthorized_against_the_run(world: World, decision:
 
     assert replay_status == 404, replay_body
     assert replay_body["error"]["code"] == "APPROVAL_NOT_FOUND"
+
+
+@pytest.mark.parametrize("decision", ["approve", "reject"])
+def test_decision_replay_is_reauthorized_against_the_version_write(
+    world: World, decision: str
+) -> None:
+    """Once C's grant drops to read, a same-key replay of C's decision
+    answers 403, not the cached 200."""
+    workflow_id = f"vis.apprwrreplay.{uuid4().hex[:8]}"
+    _publish_workflow(world, workflow_id)
+    _set_family_visibility(world.ws, workflow_id, "shared_explicitly")
+    _grant_family(world, workflow_id, ["read", "write"])
+    _run_id, approval_id = _pending_approval(world, workflow_id, world.b)
+    key = str(uuid4())
+
+    first_status, first_body = _decide(world.c_token, approval_id, decision, key)
+    assert first_status == 200, first_body
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE resource_grants SET actions = ARRAY['read'] "
+                "WHERE workspace_id = :ws AND grantee_account_id = :account"
+            ),
+            {"ws": world.ws, "account": world.c_account},
+        )
+    replay_status, replay_body = _decide(world.c_token, approval_id, decision, key)
+
+    assert replay_status == 403, replay_body
+    assert replay_body["error"]["code"] == "INSUFFICIENT_ROLE"
 
 
 def test_decision_waits_for_an_in_flight_visibility_change(world: World) -> None:
