@@ -9,6 +9,7 @@ workspaces are unaffected.
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -33,6 +34,7 @@ from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
 from ecc.domains.automation.adapters import AdapterRegistry
 from ecc.main import app
+from ecc.platform.connector_security import membership_mutation_lock_key
 
 settings = get_settings()
 pytestmark = pytest.mark.skipif(
@@ -97,6 +99,12 @@ def world() -> Iterator[_World]:
         yield _World(workspace_id, owner, admin, member)
     finally:
         with engine.begin() as connection:
+            account_ids = list(
+                connection.execute(
+                    text("SELECT account_id FROM users WHERE workspace_id = :ws"),
+                    {"ws": workspace_id},
+                ).scalars()
+            )
             for table in (
                 "approval_requests",
                 "workflow_run_steps",
@@ -108,6 +116,7 @@ def world() -> Iterator[_World]:
                 "audit_events",
                 "idempotency_records",
                 "sessions",
+                "workspace_memberships",
                 "users",
             ):
                 connection.execute(
@@ -115,6 +124,9 @@ def world() -> Iterator[_World]:
                     {"ws": workspace_id},
                 )
             connection.execute(text("DELETE FROM workspaces WHERE id = :ws"), {"ws": workspace_id})
+            connection.execute(
+                text("DELETE FROM accounts WHERE id = ANY(:ids)"), {"ids": account_ids}
+            )
 
 
 def _client(member: _Member) -> TestClient:
@@ -412,3 +424,85 @@ def test_admin_can_still_rename_the_workspace(world: _World) -> None:
         )
     assert response.status_code == 200, response.text
     assert response.json()["name"] == "Renamed by admin"
+
+
+def test_turning_the_setting_on_needs_a_second_possible_approver(world: _World) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE workspace_memberships SET role = 'viewer' "
+                "WHERE workspace_id = :ws AND users_id IN (:a, :m)"
+            ),
+            {"ws": world.workspace_id, "a": world.admin.user_id, "m": world.member.user_id},
+        )
+    with _client(world.owner) as client:
+        response = client.patch(
+            f"/api/v1/identity/workspaces/{world.workspace_id}",
+            json={"require_distinct_approver": True},
+            headers=_headers(world.owner),
+        )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "DISTINCT_APPROVER_REQUIRES_SECOND_MEMBER"
+
+
+def _wait_for_advisory_waiter(holder_pid: int) -> None:
+    deadline = time.monotonic() + 10
+    while True:
+        with engine.connect() as probe:
+            waiting = probe.execute(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname = current_database() AND wait_event_type = 'Lock' "
+                    "AND wait_event = 'advisory' "
+                    "AND pg_blocking_pids(pid) @> ARRAY[CAST(:holder AS integer)]"
+                ),
+                {"holder": holder_pid},
+            ).scalar_one()
+        if waiting:
+            return
+        if time.monotonic() > deadline:
+            raise AssertionError("the PATCH never waited on the membership lock")
+        time.sleep(0.05)
+
+
+def test_owner_demoted_while_patch_waits_cannot_change_the_setting(world: _World) -> None:
+    """The PATCH takes the membership lock first: a demotion holding the
+    exclusive side commits before the PATCH reads the caller's role."""
+    _set_distinct_approver(world, True)
+    result: dict[str, Any] = {}
+
+    def patch() -> None:
+        with _client(world.owner) as client:
+            result["response"] = client.patch(
+                f"/api/v1/identity/workspaces/{world.workspace_id}",
+                json={"require_distinct_approver": False},
+                headers=_headers(world.owner),
+            )
+
+    with engine.connect() as holder:
+        transaction = holder.begin()
+        holder_pid = holder_backend_pid(holder)
+        holder.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+            {"key": membership_mutation_lock_key(world.workspace_id)},
+        )
+        holder.execute(
+            text(
+                "UPDATE workspace_memberships SET role = 'admin' "
+                "WHERE workspace_id = :ws AND users_id = :uid"
+            ),
+            {"ws": world.workspace_id, "uid": world.owner.user_id},
+        )
+        worker = threading.Thread(target=patch)
+        worker.start()
+        _wait_for_advisory_waiter(holder_pid)
+        transaction.commit()
+    worker.join(timeout=10)
+    assert not worker.is_alive()
+    assert result["response"].status_code == 403
+    with engine.connect() as connection:
+        value = connection.execute(
+            text("SELECT require_distinct_approver FROM workspaces WHERE id = :ws"),
+            {"ws": world.workspace_id},
+        ).scalar_one()
+    assert value is True

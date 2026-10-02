@@ -36,7 +36,8 @@ A workspace owner can require a distinct approver with `PATCH /api/v1/identity/w
 
 - `POST /automations/approvals/{id}/approve` by the run's starter returns `403 SELF_APPROVAL_FORBIDDEN`; the request stays `pending` and the run stays paused until another member approves it, it is rejected, or it expires. The owner is not exempt.
 - Rejecting is still allowed for the starter -- declining an action is always safe.
-- Only an `owner` can change the setting (`INSUFFICIENT_ROLE` for anyone else): an admin able to switch it off could remove the control meant to constrain them.
+- Only an `owner` can change the setting (`INSUFFICIENT_ROLE` for anyone else): an admin able to switch it off could remove the control meant to constrain them. Turning it on requires at least two active members who could approve (`owner`/`admin`/`member`), else `409 DISTINCT_APPROVER_REQUIRES_SECOND_MEMBER`. If members later leave so that only the starter remains, that run's high-impact steps can only be rejected or left to expire until the owner switches the setting off.
+- "Distinct" means distinct from the run's **starter** (`workflow_runs.created_by`; for a scheduled run, the trigger's creator) -- not from the workflow's author or the policy's creator. Someone who authored a workflow can still approve a run another member started.
 - `decide_approval` reads the setting `FOR SHARE` on the `workspaces` row, so an owner enabling it while a decision is in flight either applies to that decision or waits for it to commit -- never half-way.
 
 ## Expiry and rate limits (resolved)

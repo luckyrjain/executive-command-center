@@ -851,6 +851,11 @@ def patch_workspace_endpoint(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="WORKSPACE_NOT_FOUND")
     now = datetime.now(UTC)
     with session.begin():
+        # First statement: a demotion or removal committing mid-request is
+        # either seen by the role read below or waits for this transaction
+        # -- this endpoint now guards `require_distinct_approver`, a
+        # security setting, not just the name/timezone.
+        authz.lock_membership_for_write(session, auth)
         membership = (
             session.execute(
                 text(
@@ -876,6 +881,23 @@ def patch_workspace_endpoint(
         if payload.timezone is not None:
             updates["timezone"] = payload.timezone
         if payload.require_distinct_approver is not None:
+            if payload.require_distinct_approver:
+                # Turning it on with nobody else who could approve would
+                # leave every high-impact step only rejectable. (A member
+                # leaving later can still cause this; the docs say so.)
+                approvers = session.execute(
+                    text(
+                        "SELECT count(*) FROM workspace_memberships "
+                        "WHERE workspace_id = :workspace_id AND status = 'active' "
+                        "AND role IN ('owner', 'admin', 'member')"
+                    ),
+                    {"workspace_id": workspace_id},
+                ).scalar_one()
+                if approvers < 2:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="DISTINCT_APPROVER_REQUIRES_SECOND_MEMBER",
+                    )
             updates["require_distinct_approver"] = payload.require_distinct_approver
         if updates:
             set_clause = ", ".join(f"{column} = :{column}" for column in updates)
