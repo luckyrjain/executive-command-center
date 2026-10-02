@@ -1,4 +1,5 @@
 import os
+import warnings
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -310,11 +311,15 @@ def test_reverse_with_200_rehomed_relationships_p95_under_budget(
     p95, samples = _measure_reverse_p95(client, workspace_id, "initial")
     if p95 >= REVERSE_BUDGET_SECONDS:
         first_p95, first_samples = p95, samples
-        print(
-            f"\n[reverse budget] initial pass p95 {first_p95 * 1000:.1f} ms exceeded "
+        # A warning, not a print: pytest captures stdout of passing tests, so a
+        # pass-on-retry would otherwise leave no trace in CI. The warnings
+        # summary is shown even when the test passes.
+        warnings.warn(
+            f"[reverse budget] initial pass p95 {first_p95 * 1000:.1f} ms exceeded "
             f"{REVERSE_BUDGET_SECONDS * 1000:.0f} ms budget; retrying once with a fresh "
             f"measurement pass before failing. samples(ms)="
-            f"{[round(s * 1000, 1) for s in first_samples]}"
+            f"{[round(s * 1000, 1) for s in first_samples]}",
+            stacklevel=1,
         )
         p95, samples = _measure_reverse_p95(client, workspace_id, "retry")
         assert p95 < REVERSE_BUDGET_SECONDS, (
