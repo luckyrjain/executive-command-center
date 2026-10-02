@@ -359,15 +359,13 @@ def update_note(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session, auth, idempotency_key, req_hash, domain="notes", response_model=NoteResponse
-        )
-        if cached is not None:
-            return cached
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. The idempotency
+        # cache is read only after these checks too: a caller who has since
+        # lost access (removed, suspended, demoted, or no longer able to see
+        # the row) must not have a cached success replayed to them.
         current = _get_row(session, auth, note_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="NOTE_NOT_FOUND")
@@ -379,6 +377,16 @@ def update_note(
             session, auth, resource_type="notes", resource_id=note_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+        # After authz, before the state/version checks: a same-key replay of a
+        # successful write finds the row already changed and must still get the
+        # cached response, not a 409.
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="notes", response_model=NoteResponse
+        )
+        if cached is not None:
+            return cached
+
         _check_version(current, payload.expected_version)
         if current["archived_at"] is not None:
             raise HTTPException(status_code=409, detail="NOTE_ARCHIVED")
@@ -468,15 +476,13 @@ def _lifecycle(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session, auth, idempotency_key, req_hash, domain="notes", response_model=NoteResponse
-        )
-        if cached is not None:
-            return cached
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. The idempotency
+        # cache is read only after these checks too: a caller who has since
+        # lost access (removed, suspended, demoted, or no longer able to see
+        # the row) must not have a cached success replayed to them.
         current = _get_row(session, auth, note_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="NOTE_NOT_FOUND")
@@ -488,6 +494,16 @@ def _lifecycle(
             session, auth, resource_type="notes", resource_id=note_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+        # After authz, before the state/version checks: a same-key replay of a
+        # successful write finds the row already changed and must still get the
+        # cached response, not a 409.
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="notes", response_model=NoteResponse
+        )
+        if cached is not None:
+            return cached
+
         _check_version(current, payload.expected_version)
         if action == "archive" and current["archived_at"] is not None:
             response = _to_response(current.copy())
