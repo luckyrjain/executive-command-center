@@ -142,7 +142,26 @@ def create_recommendation(
         raise
     validate_action(payload.target_type, payload.proposed_action)
     is_create = payload.proposed_action.get("operation") == "create"
-    cached = _start(session, auth, idempotency_key, digest)
+    lock_idempotency(session, auth, idempotency_key)
+    if not is_create:
+        # A non-create operation names an existing task/commitment/risk.
+        # Authorize reading it before anything below touches it: without
+        # this, `target_version`'s 404/409 split and the `superseded`
+        # UPDATE answered for (and mutated recommendations on) rows the
+        # caller cannot see. A target the caller cannot read gets the
+        # same 404 as a nonexistent id. The idempotency cache is read only
+        # after this check, so a replay is refused to a caller who has
+        # since lost sight of the target.
+        assert payload.target_id is not None
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type=f"{payload.target_type}s",
+            resource_id=payload.target_id,
+            action="read",
+        ):
+            raise HTTPException(status_code=404, detail="TARGET_NOT_FOUND")
+    cached = load_cached(session, auth, idempotency_key, digest)
     if cached is not None:
         return cached
     if write_guard is not None:
