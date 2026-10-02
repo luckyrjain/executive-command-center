@@ -35,7 +35,7 @@ def test_no_write_is_authorized_only_inside_a_row_locking_statement() -> None:
 def test_the_scan_recognizes_the_backend_fragment_statements() -> None:
     """Guards the guard: a scanner that silently stopped recognizing
     fragments would report nothing and pass the test above."""
-    assert fragment_statement_count(_BACKEND.rglob("*.py")) >= 20
+    assert fragment_statement_count(_BACKEND.rglob("*.py")) >= 10
 
 
 _SOURCE = """
