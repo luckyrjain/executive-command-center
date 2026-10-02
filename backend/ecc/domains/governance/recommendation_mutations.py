@@ -180,6 +180,27 @@ def create_recommendation(
         if current_version != payload.expected_version:
             raise HTTPException(status_code=409, detail="TARGET_VERSION_CONFLICT")
     now = datetime.now(UTC)
+    # Superseding is a write to each pending recommendation, attributed to
+    # the caller, so only the ones the caller could read and write through
+    # the single-recommendation endpoints are superseded. Another member's
+    # private (or read-only shared) pending recommendation on the same
+    # target stays live: it is theirs to resolve.
+    read_sql, read_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="recommendations",
+        action="read",
+        table_alias="recommendations",
+        param_prefix="read_",
+    )
+    write_sql, write_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="recommendations",
+        action="write",
+        table_alias="recommendations",
+        param_prefix="write_",
+    )
     superseded = (
         session.execute(
             text(
@@ -192,8 +213,10 @@ def create_recommendation(
                   AND target_id=:target_id
                   AND status IN ('proposed','pending_confirmation')
                   AND archived_at IS NULL
+                  AND {read_sql}
+                  AND {write_sql}
                 RETURNING {FIELDS}
-                """
+                """  # noqa: S608 -- authz visibility fragments; values bound
             ),
             {
                 "now": now,
@@ -201,6 +224,8 @@ def create_recommendation(
                 "workspace_id": auth.workspace_id,
                 "target_type": payload.target_type,
                 "target_id": payload.target_id,
+                **read_params,
+                **write_params,
             },
         )
         .mappings()
