@@ -416,6 +416,7 @@ def test_the_workflow_versions_author_cannot_approve_a_run_someone_else_started(
     response = _approve(world, world.owner, pending)
     assert response.status_code == 403
     assert response.json()["error"]["code"] == "SELF_APPROVAL_FORBIDDEN"
+    assert response.json()["error"]["details"] == {"reason": "version_author"}
     assert _approval_status(world, pending.id) == "pending"
 
     # A third member, who neither wrote nor started it, can.
