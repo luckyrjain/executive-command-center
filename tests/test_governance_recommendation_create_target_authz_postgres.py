@@ -91,10 +91,16 @@ def _seed_risk(conn: Connection, w: RaceWorld, owner: UUID, visibility: str) -> 
 
 
 def _seed_owner_recommendation(
-    conn: Connection, w: RaceWorld, *, target_type: str, target_id: UUID, action: dict[str, Any]
+    conn: Connection,
+    w: RaceWorld,
+    *,
+    target_type: str,
+    target_id: UUID,
+    action: dict[str, Any],
+    visibility: str,
 ) -> UUID:
-    """C's own pending recommendation on C's private target, which a
-    successful create by B would have superseded."""
+    """C's own pending recommendation on C's target, which a successful
+    create by B supersedes."""
     recommendation_id = uuid4()
     now = datetime.now(UTC)
     conn.execute(
@@ -104,7 +110,7 @@ def _seed_owner_recommendation(
             "source, created_by, updated_by, created_at, updated_at, owner_id, visibility) "
             "VALUES (:id, :ws, 'owner_detected', :target_type, :target_id, "
             "CAST(:action AS jsonb), 1, 'Owner rationale', 0.9, 'proposed', "
-            "'rule', :c, :c, :now, :now, :c, 'private')"
+            "'rule', :c, :c, :now, :now, :c, :vis)"
         ),
         {
             "id": recommendation_id,
@@ -114,6 +120,7 @@ def _seed_owner_recommendation(
             "target_type": target_type,
             "target_id": target_id,
             "action": dumps(action),
+            "vis": visibility,
         },
     )
     return recommendation_id
@@ -197,7 +204,12 @@ def test_create_against_unreadable_target_is_indistinguishable_from_missing(
     with engine.begin() as connection:
         target_id = case.seed(connection, world, world.c, "private")
         owner_rec_id = _seed_owner_recommendation(
-            connection, world, target_type=case.target_type, target_id=target_id, action=case.action
+            connection,
+            world,
+            target_type=case.target_type,
+            target_id=target_id,
+            action=case.action,
+            visibility="private",
         )
     target_before = row_snapshot(case.table, target_id)
     owner_rec_before = row_snapshot("recommendations", owner_rec_id)
@@ -227,7 +239,12 @@ def test_create_against_readable_target_still_works(world: RaceWorld, name: str)
     with engine.begin() as connection:
         target_id = case.seed(connection, world, world.c, "workspace")
         owner_rec_id = _seed_owner_recommendation(
-            connection, world, target_type=case.target_type, target_id=target_id, action=case.action
+            connection,
+            world,
+            target_type=case.target_type,
+            target_id=target_id,
+            action=case.action,
+            visibility="workspace",
         )
 
     status, body = _post(world, _body(case, target_id, 99))
