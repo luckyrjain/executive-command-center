@@ -211,6 +211,28 @@ def test_dispatch_fails_closed_under_another_workflows_policy(world: World) -> N
     assert step_rows(world, run.id) == []
 
 
+def test_dispatch_gate_names_no_policy_as_the_block_reason(world: World) -> None:
+    """The block is the policy mismatch, not some other gate."""
+    foreign = _foreign_policy(world)
+    workflow_id = f"test.mismatch.{uuid4().hex}"
+    _activate_pre_fix(world, workflow_id, foreign)
+    adapter = FakeAdapter("fake.mismatch")
+    with SessionFactory() as session, session.begin():
+        queued = automation_worker.enqueue_run(
+            session, world.workspace_id, world.user_id, workflow_id=workflow_id
+        )
+    assert isinstance(queued, automation_worker.WorkflowRun), queued
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-mismatch")
+    assert claimed is not None and claimed.id == queued.id
+
+    with SessionFactory() as session:
+        outcome = automation_worker.run_step(session, claimed, 0, registry_of(adapter))
+
+    assert outcome == automation_worker.StepBlockedByPolicy(0, "no_policy")
+    assert adapter.execute_calls == 0
+
+
 class _RebindPolicyThenFail(FakeAdapter):
     """Fails after moving the run's policy to another workflow, so the
     compensation that follows sees a run whose policy is not its own -- the
