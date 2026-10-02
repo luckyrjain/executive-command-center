@@ -54,10 +54,10 @@ BRIEF_P95_BUDGET_SECONDS = 3.2 if _IN_CI else 2.0
 # index ceil(0.95 * 15) - 1 = 14 -- the maximum -- so a single GC pause or
 # checkpoint write on a shared CI runner failed the whole gate. At 20 samples
 # p95 is the 19th-ranked value, so one outlier per pass is tolerated. A pass
-# with two or more samples over budget triggers one retry, which is judged on
-# the pooled 40 samples of both passes (p95 = 38th-ranked, so up to two
-# outliers across both passes). The gate therefore fails only when three or
-# more of those 40 samples are over budget; see `_assert_p95_under_budget`.
+# with two or more samples over budget triggers one retry. The gate then fails
+# only when three or more of the pooled 40 samples are over budget (pooled p95
+# is the 38th-ranked value) AND at least one of them is in the retry; see
+# `_assert_p95_under_budget`.
 # One discarded warm-up request per pass absorbs first-call costs (plan
 # caching, connection checkout). Warm-up + samples (21) stays under the
 # mutation rate limiter's 40-requests-per-session window; see `_mint_session`.
@@ -169,7 +169,10 @@ def _assert_p95_under_budget(
     regression (say 10% of calls slow) through whenever its slow calls
     happen to land at most once in the retry's 20 samples, however many
     the first pass caught. Pooling keeps that evidence: the gate fails when
-    three or more of the 40 pooled samples exceed the budget.
+    three or more of the 40 pooled samples exceed the budget. The retry must
+    still corroborate it with at least one over-budget sample of its own, so
+    a single burst (one checkpoint slowing three calls of the first pass)
+    followed by a clean retry passes, as the retry exists to allow.
     """
     key_prefix = name.replace(" ", "-")
     first_p95, first_samples = _measure_pass(workspace_id, user_id, request_once, key_prefix)
@@ -189,10 +192,12 @@ def _assert_p95_under_budget(
         workspace_id, user_id, request_once, f"{key_prefix}-retry"
     )
     pooled_p95 = _p95(first_samples + retry_samples)
-    assert pooled_p95 < budget_seconds, (
+    retry_over_budget = sum(sample >= budget_seconds for sample in retry_samples)
+    assert pooled_p95 < budget_seconds or retry_over_budget == 0, (
         f"{name} p95 over both passes ({len(first_samples) + len(retry_samples)} samples) "
         f"is {pooled_p95 * 1000:.1f} ms, exceeding the {budget_seconds * 1000:.0f} ms "
-        f"budget (in_ci={_IN_CI}; initial pass p95 {first_p95 * 1000:.1f} ms, retry p95 "
+        f"budget, and the retry corroborated it with {retry_over_budget} over-budget "
+        f"sample(s) (in_ci={_IN_CI}; initial pass p95 {first_p95 * 1000:.1f} ms, retry p95 "
         f"{retry_p95 * 1000:.1f} ms); this indicates a real regression, not one-off "
         f"environmental noise. initial samples(ms)="
         f"{[round(s * 1000, 1) for s in first_samples]}; "
