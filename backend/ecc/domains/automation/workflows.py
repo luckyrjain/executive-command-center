@@ -593,8 +593,8 @@ def create_workflow_draft(
     matching Decision 2 verbatim ("Editing a workflow always inserts a new
     row with `version = previous + 1`").
 
-    Locking (`FOR UPDATE` on the family row, or on the existing version
-    rows when the family already exists) serializes concurrent callers
+    Locking (`FOR NO KEY UPDATE` on the family row, `FOR UPDATE` on the
+    latest version row when the family already exists) serializes concurrent callers
     deriving the next version number for the same `workflow_id`, mirroring
     `capacity.py`'s `_current_profile(for_update=True)`/`ai_runtime.prompts.
     activate_prompt_version`'s identical race-closing rationale. The
@@ -602,13 +602,18 @@ def create_workflow_draft(
     backstop if two callers still race past the lock under a lower
     isolation level -- the caller (the HTTP endpoint below) converts that
     into a clean 409 rather than a raw `IntegrityError`.
+
+    Does no authorization of its own: it will append to any family in
+    `workspace_id`. The HTTP endpoint authorizes the caller against an
+    existing family first (`_lock_and_authorize_family`).
     """
     now = datetime.now(UTC)
     family = (
         session.execute(
             text(
                 "SELECT id FROM workflow_definitions "
-                "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id FOR UPDATE"
+                "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id "
+                "FOR NO KEY UPDATE"
             ),
             {"workspace_id": workspace_id, "workflow_id": workflow_id},
         )
@@ -958,17 +963,129 @@ def _to_response(version: WorkflowVersion) -> WorkflowVersionResponse:
     )
 
 
-def _policy_ref_exists(session: Session, workspace_id: UUID, policy_ref: UUID) -> bool:
-    return (
-        session.execute(
-            text(
-                "SELECT 1 FROM automation_policies WHERE workspace_id = :workspace_id "
-                "AND id = :id LIMIT 1"
-            ),
-            {"workspace_id": workspace_id, "id": policy_ref},
-        ).first()
-        is not None
-    )
+def _lock_and_authorize_family(session: Session, auth: AuthContext, workflow_id: str) -> None:
+    """Gate appending a draft to an existing `workflow_id` family: the
+    caller must be able to read (else `404 WORKFLOW_NOT_FOUND`) and write
+    (else `403 INSUFFICIENT_ROLE`) both the family's latest version and its
+    active version. The latest is the one the new draft supersedes (and
+    whose number the response's `version` discloses); the active one is
+    what publishing the new draft would retire. Checking only the latest
+    would let a visible draft stacked on someone else's private active
+    version open the family. A family that does not exist yet passes: the
+    caller is creating it.
+
+    All read checks run before any write check, so a family with any
+    version the caller cannot see answers the same 404, never a 403 that
+    shows part of it is visible. That 404 is the one an unknown
+    `version_id` answers, and carries no version number. A taken slug
+    still cannot be created as a new family -- `workflow_id` is unique per
+    workspace -- so that one bit is inherent; nothing else is disclosed.
+
+    Must run inside the write transaction, after the membership and
+    idempotency locks and before `load_cached` (ADR-0014). The family row
+    and both version rows are locked first, so an ownership or visibility
+    change committed while this waits is what the checks see.
+    `create_workflow_draft` re-locks the same rows (a no-op).
+    """
+    # NO KEY UPDATE: still serializes concurrent appends to this family,
+    # without also waiting on every transaction that holds a foreign-key
+    # share lock on it (any write to one of its version rows).
+    family = session.execute(
+        text(
+            "SELECT id FROM workflow_definitions "
+            "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id "
+            "FOR NO KEY UPDATE"
+        ),
+        {"workspace_id": auth.workspace_id, "workflow_id": workflow_id},
+    ).one_or_none()
+    if family is None:
+        return
+    params = {"workspace_id": auth.workspace_id, "workflow_id": workflow_id}
+    # Latest first, then active: the same order `activate_workflow_version`
+    # takes (its target, then the active row), so the two cannot deadlock.
+    latest_id = session.execute(
+        text(
+            "SELECT id FROM workflow_versions "
+            "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id "
+            "ORDER BY version DESC LIMIT 1 FOR UPDATE"
+        ),
+        params,
+    ).scalar_one_or_none()
+    active_id = session.execute(
+        text(
+            "SELECT id FROM workflow_versions "
+            "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id "
+            "AND status = 'active' FOR UPDATE"
+        ),
+        params,
+    ).scalar_one_or_none()
+    version_ids = list(dict.fromkeys(v for v in (latest_id, active_id) if v is not None))
+    for version_id in version_ids:
+        if not authz.authorize(
+            session, auth, resource_type="workflow_versions", resource_id=version_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="WORKFLOW_NOT_FOUND")
+    for version_id in version_ids:
+        if not authz.authorize(
+            session, auth, resource_type="workflow_versions", resource_id=version_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+
+def _lock_and_authorize_policy_ref(session: Session, auth: AuthContext, policy_ref: UUID) -> None:
+    """A `policy_ref` must name a policy the caller can read: one that does
+    not exist and one they cannot see both answer `404 POLICY_NOT_FOUND`,
+    so the reference cannot be used to probe for policy ids. Read, not
+    write: the draft only points at the policy. `FOR SHARE` holds off a
+    visibility or ownership change until this transaction ends.
+    """
+    locked = session.execute(
+        text(
+            "SELECT id FROM automation_policies "
+            "WHERE workspace_id = :workspace_id AND id = :id FOR SHARE"
+        ),
+        {"workspace_id": auth.workspace_id, "id": policy_ref},
+    ).one_or_none()
+    if locked is None or not authz.authorize(
+        session, auth, resource_type="automation_policies", resource_id=policy_ref, action="read"
+    ):
+        raise HTTPException(status_code=404, detail="POLICY_NOT_FOUND")
+
+
+def _authorize_retiring_active_version(
+    session: Session, auth: AuthContext, version_id: UUID
+) -> None:
+    """Publishing a draft retires the family's current active version, so
+    the caller must be able to write that version too, not only the draft
+    -- otherwise anyone who owns a draft in a family could switch off the
+    version someone else made active. Locked here, before the check, and
+    re-locked as a no-op by `activate_workflow_version`.
+
+    A version the caller cannot read answers `403 INSUFFICIENT_ROLE` as
+    well, not 404: the caller can read the draft they are publishing, so
+    they already know the family exists, and a 404 would misreport that
+    visible draft as missing. A 403 here discloses only that the active
+    version is not theirs to change.
+    """
+    active_id = session.execute(
+        text(
+            "SELECT a.id FROM workflow_versions AS a "
+            "JOIN workflow_versions AS t "
+            "  ON t.workspace_id = a.workspace_id AND t.workflow_id = a.workflow_id "
+            "WHERE t.workspace_id = :workspace_id AND t.id = :id "
+            "AND a.status = 'active' AND a.id <> t.id "
+            "FOR UPDATE OF a"
+        ),
+        {"workspace_id": auth.workspace_id, "id": version_id},
+    ).scalar_one_or_none()
+    if active_id is None:
+        return
+    if not authz.authorize(
+        session, auth, resource_type="workflow_versions", resource_id=active_id, action="read"
+    ) or not authz.authorize(
+        session, auth, resource_type="workflow_versions", resource_id=active_id, action="write"
+    ):
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
 
 @router.get("/workflows", response_model=WorkflowListResponse)
@@ -1021,6 +1138,12 @@ def create_workflow_endpoint(
     both "create a new workflow" and "edit an existing one" (Decision 2:
     editing always inserts a new row), matching this task's constrained API
     surface (`API-SCHEMAS.md` lists no separate "add version" route).
+
+    Appending to an existing family requires read and write on its latest
+    and active versions, and a `policy_ref` must be readable
+    (`_lock_and_authorize_family`/`_lock_and_authorize_policy_ref`). Both
+    run before the idempotency cache, so a same-key replay is
+    re-authorized (ADR-0014).
     """
     authz.require_role_action(session, auth, "write")
     graph_dict = payload.graph.model_dump(mode="json")
@@ -1035,6 +1158,9 @@ def create_workflow_endpoint(
     with session.begin():
         authz.lock_membership_for_write(session, auth, role_action="write")
         lock_idempotency(session, auth, idempotency_key)
+        _lock_and_authorize_family(session, auth, payload.workflow_id)
+        if payload.policy_ref is not None:
+            _lock_and_authorize_policy_ref(session, auth, payload.policy_ref)
         cached = load_cached(
             session,
             auth,
@@ -1045,11 +1171,6 @@ def create_workflow_endpoint(
         )
         if cached is not None:
             return cached
-
-        if payload.policy_ref is not None and not _policy_ref_exists(
-            session, auth.workspace_id, payload.policy_ref
-        ):
-            raise HTTPException(status_code=404, detail="POLICY_NOT_FOUND")
 
         try:
             created = create_workflow_draft(
@@ -1134,6 +1255,7 @@ def publish_workflow_endpoint(
             session, auth, resource_type="workflow_versions", resource_id=version_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        _authorize_retiring_active_version(session, auth, version_id)
 
         # After authz, before the state checks in the helper below: a
         # same-key replay of a successful call finds the row already

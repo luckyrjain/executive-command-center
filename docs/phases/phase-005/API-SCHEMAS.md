@@ -52,6 +52,8 @@ GET /automations/triggers
 
 Every endpoint that creates or mutates a `workflow_runs`/`approval_requests`/`automation_policies` row is resolved server-side against the actor's own workspace and the policy already bound to the target workflow -- no endpoint accepts a caller-supplied `policy_id` override for an existing workflow, closing the confused-deputy path the design doc's Threat model section names (a request can ask "run workflow X," never "run workflow X under policy Y").
 
+**`POST /automations/workflows` against an existing `workflow_id` is an edit of that workflow, and is authorized as one.** The caller must be able to read the family's latest version and its active version (if any), else `404 WORKFLOW_NOT_FOUND`, and to write both, else `403 INSUFFICIENT_ROLE`. All read checks run before any write check, so a family with any version the caller cannot see answers the same `404` an unknown version id does, and the response never carries the next version number. Only the fact that the slug is taken leaks; `workflow_id` is unique per workspace, so that bit is inherent. A `policy_ref` the caller cannot read answers `404 POLICY_NOT_FOUND`, the same as one that does not exist. `POST /automations/workflows/{id}/publish` additionally requires read and write on the active version it would retire, else `403 INSUFFICIENT_ROLE` (not `404`: the caller can see the draft, so the family's existence is already known). All of these run under the row locks and before the idempotency cache, so a same-key replay is re-authorized (ADR-0014).
+
 Idempotency, session-derived identity, audit redaction and 404 isolation apply, matching every existing Phase 1-4 endpoint convention.
 
 ## Errors
