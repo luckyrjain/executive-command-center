@@ -90,6 +90,23 @@ describe('RunWorkspace', () => {
     expect(await screen.findByText(/A kill switch is active for workflow "weekly-digest"/)).toBeTruthy()
   })
 
+  it.each([
+    [404, 'WORKFLOW_NOT_FOUND', 'Workflow Not Found', 'No workflow with this id exists in this workspace that you can run.'],
+    [403, 'INSUFFICIENT_ROLE', 'Insufficient Role', 'You can view this workflow but not run it -- ask its owner for write access (or a workspace admin, if your workspace role is read-only).'],
+  ])('explains a %i %s start-run refusal', async (status, code, message, copy) => {
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ runs: [] }))
+      .mockImplementationOnce(() => response({ error: { code, message } }, status))
+    vi.stubGlobal('fetch', fetch)
+    renderWorkspace()
+
+    await waitFor(() => expect(screen.getByText('No runs match this filter.')).toBeTruthy())
+    fireEvent.change(screen.getByLabelText('Run a workflow (manual trigger)'), { target: { value: 'weekly-digest' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+
+    expect((await screen.findByRole('alert')).textContent).toBe(copy)
+  })
+
   it('shows a run\'s detail including status description, steps and compensation ledger', async () => {
     const detail: RunDetail = {
       ...baseRun,

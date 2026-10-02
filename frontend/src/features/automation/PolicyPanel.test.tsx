@@ -116,6 +116,21 @@ describe('PolicyPanel', () => {
     expect(await screen.findByText(/already expired/)).toBeTruthy()
   })
 
+  it('explains a 403 on revoke without blaming the workflow', async () => {
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ policies: [activePolicy] }))
+      .mockImplementationOnce(() => response({ error: { code: 'INSUFFICIENT_ROLE', message: 'Insufficient Role' } }, 403))
+    withAdapters(fetch)
+    renderPanel()
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Revoke policy for weekly-digest' })).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: 'Revoke policy for weekly-digest' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('do not have permission to revoke this policy')
+    expect(alert.textContent).not.toContain('Insufficient Role')
+  })
+
   it('takes every control\'s accessible name from its own visible label text (WCAG 2.5.3 Label in Name)', async () => {
     withAdapters(vi.fn(() => response({ policies: [] })))
     renderPanel()

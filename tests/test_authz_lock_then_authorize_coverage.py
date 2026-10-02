@@ -14,12 +14,9 @@ _REPO = Path(__file__).resolve().parents[1]
 _BACKEND = _REPO / "backend" / "ecc"
 
 # Known violations being fixed elsewhere: tolerated while present, not
-# required. `create_recommendation`'s supersede UPDATE carries its read and
-# write fragments in the WHERE; luckyrjain/executive-command-center#383
-# converts it to lock-then-authorize. Remove this entry once that lands.
-_PENDING: frozenset[tuple[str, str]] = frozenset(
-    {("backend/ecc/domains/governance/recommendation_mutations.py", "create_recommendation")}
-)
+# required. Each entry is `(module path, function name)`; remove it once
+# the fix lands.
+_PENDING: frozenset[tuple[str, str]] = frozenset()
 
 
 def test_no_write_is_authorized_only_inside_a_row_locking_statement() -> None:
