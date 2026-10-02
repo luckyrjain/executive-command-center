@@ -10,6 +10,8 @@ same-key request and get the cached success. The cache is now read only
 after the locked read (404) and write (403) checks pass, and still before
 the version/state checks, so a still-authorized replay gets the cached 200
 rather than a 409 from a row its own first request already changed.
+Confirm also checks an email-derived recommendation's `email` consent
+ahead of the cache, so a replay after the consent is withdrawn is refused.
 """
 
 from __future__ import annotations
@@ -29,7 +31,10 @@ from sqlalchemy import Connection, text
 
 from ecc.config import get_settings
 from ecc.database import engine
+from ecc.domains.engineering.crypto import encrypt_credential
+from ecc.domains.personal.gmail_shared import pack_credential
 from ecc.main import app
+from ecc.platform.connector_security import EmailConsentInactiveError
 
 pytestmark = pytest.mark.skipif(
     not get_settings().database_url.startswith("postgresql"),
@@ -49,7 +54,15 @@ _SIDE_EFFECT_TABLES = (
 def world() -> Iterator[RaceWorld]:
     with race_world(
         "Governance Idempotent Replay",
-        ("recommendation_feedback", "recommendations", "tasks", "risks"),
+        (
+            "recommendation_feedback",
+            "recommendations",
+            "tasks",
+            "risks",
+            "domain_consents",
+            "personal_domains",
+            "connector_accounts",
+        ),
     ) as w:
         yield w
 
@@ -333,3 +346,122 @@ def test_replay_after_demotion_to_viewer_is_refused_403(world: RaceWorld, name: 
     assert refused.json()["error"]["code"] == "INSUFFICIENT_ROLE"
     assert _side_effect_counts(world.ws) == counts_before
     assert _row(case.table, row_id) == row_before
+
+
+def _seed_email_consent(conn: Connection, w: RaceWorld, owner: UUID) -> None:
+    """An active `email` consent for `owner`: the enabled domain, the consent
+    row and a live Gmail connector -- what `require_email_consent_locked`
+    reads."""
+    now = datetime.now(UTC)
+    credential = pack_credential("replay-access", "replay-refresh", now + timedelta(hours=1))
+    conn.execute(
+        text(
+            "INSERT INTO connector_accounts (id, workspace_id, provider, external_account_id, "
+            "display_name, granted_scopes, encrypted_credentials, status, version, created_by, "
+            "updated_by, created_at, updated_at, owner_id, visibility) "
+            "VALUES (:id, :ws, 'gmail', :external, 'Replay Gmail', "
+            "ARRAY['https://www.googleapis.com/auth/gmail.readonly'], :encrypted, 'active', 1, "
+            ":owner, :owner, :now, :now, :owner, 'private')"
+        ),
+        {
+            "id": uuid4(),
+            "ws": w.ws,
+            "external": f"replay-{owner}@example.com",
+            "encrypted": encrypt_credential(credential),
+            "owner": owner,
+            "now": now,
+        },
+    )
+    conn.execute(
+        text(
+            "INSERT INTO personal_domains (id, workspace_id, owner_id, domain_key, "
+            "classification, enabled, enabled_at, created_by, updated_by, created_at, "
+            "updated_at, version) "
+            "VALUES (:id, :ws, :owner, 'email', 'high_stakes', true, :now, :owner, :owner, "
+            ":now, :now, 1)"
+        ),
+        {"id": uuid4(), "ws": w.ws, "owner": owner, "now": now},
+    )
+    conn.execute(
+        text(
+            "INSERT INTO domain_consents (id, workspace_id, owner_id, domain_key, granted_at, "
+            "created_at) VALUES (:id, :ws, :owner, 'email', :now, :now)"
+        ),
+        {"id": uuid4(), "ws": w.ws, "owner": owner, "now": now},
+    )
+
+
+def _seed_email_recommendation(conn: Connection, w: RaceWorld, owner: UUID) -> tuple[UUID, UUID]:
+    """A pending `email_action_detected` recommendation owned by `owner`
+    that moves one of their tasks to `in_progress`."""
+    task_id, recommendation_id = uuid4(), uuid4()
+    now = datetime.now(UTC)
+    conn.execute(
+        text(
+            "INSERT INTO tasks (id, workspace_id, owner_id, title, created_by, updated_by, "
+            "created_at, updated_at, visibility) "
+            "VALUES (:id, :ws, :owner, 'Replay task', :owner, :owner, :now, :now, 'private')"
+        ),
+        {"id": task_id, "ws": w.ws, "owner": owner, "now": now},
+    )
+    conn.execute(
+        text(
+            "INSERT INTO recommendations (id, workspace_id, recommendation_type, target_type, "
+            "target_id, proposed_action, expected_version, rationale, confidence, status, "
+            "source, created_by, updated_by, created_at, updated_at, owner_id, visibility) "
+            "VALUES (:id, :ws, 'email_action_detected', 'task', :task, CAST(:action AS jsonb), "
+            "1, 'Replay rationale', 0.9, 'pending_confirmation', 'rule', :owner, :owner, :now, "
+            ":now, :owner, 'private')"
+        ),
+        {
+            "id": recommendation_id,
+            "ws": w.ws,
+            "task": task_id,
+            "action": dumps({"operation": "set_status", "value": "in_progress"}),
+            "owner": owner,
+            "now": now,
+        },
+    )
+    return recommendation_id, task_id
+
+
+def test_confirm_replay_after_email_consent_is_withdrawn_is_refused_403(
+    world: RaceWorld,
+) -> None:
+    """Confirm checks the email-derived recommendation's consent before it
+    reads the cache: once the owner withdraws `email` consent, a same-key
+    replay of the confirm that already ran gets 403, not the cached 200."""
+    with engine.begin() as connection:
+        _seed_email_consent(connection, world, world.b)
+        recommendation_id, task_id = _seed_email_recommendation(connection, world, world.b)
+    case = CASES["recommendation_confirm"]
+    body = {"expected_version": 1, "target_expected_version": 1}
+    request_headers = headers(world.b_token)
+    client = TestClient(app)
+    client.cookies.set("ecc_session", world.b_token)
+    try:
+        _write_then_replay(client, case, recommendation_id, request_headers, body)
+        assert _row("tasks", task_id)["status"] == "in_progress"
+
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE domain_consents SET revoked_at = :now "
+                    "WHERE workspace_id = :ws AND owner_id = :b AND domain_key = 'email'"
+                ),
+                {"now": datetime.now(UTC), "ws": world.ws, "b": world.b},
+            )
+        counts_before = _side_effect_counts(world.ws)
+        recommendation_before = _row("recommendations", recommendation_id)
+        task_before = _row("tasks", task_id)
+        refused = client.post(
+            case.path.format(id=recommendation_id), headers=request_headers, json=body
+        )
+    finally:
+        client.close()
+
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["error"]["code"] == EmailConsentInactiveError.code
+    assert _side_effect_counts(world.ws) == counts_before
+    assert _row("recommendations", recommendation_id) == recommendation_before
+    assert _row("tasks", task_id) == task_before
