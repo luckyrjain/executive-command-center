@@ -250,6 +250,7 @@ def _cleanup_workspace(workspace_id: UUID) -> None:
     with engine.begin() as connection:
         for table in (
             "approval_requests",
+            "resource_grants",
             "workflow_run_steps",
             "workflow_runs",
             "triggers",
@@ -1064,3 +1065,227 @@ def test_fire_transaction_db_error_defers_the_trigger_without_stopping_the_tick(
     assert [type(o) for o in retry if getattr(o, "trigger_id", None) == deferred] == [
         automation_scheduler.TriggerFired
     ]
+
+
+# ---------------------------------------------------------------------------
+# Fire-time authorization: the schedule runs as its creator, so the creator
+# must still be able to read and write the workflow's active version.
+# ---------------------------------------------------------------------------
+
+
+def _add_member(workspace_id: UUID) -> tuple[UUID, UUID]:
+    """A second, `member`-role identity; returns (users_id, accounts_id)."""
+    user_id = uuid4()
+    with engine.begin() as connection:
+        account_id = create_identity(
+            connection, workspace_id=workspace_id, user_id=user_id, role="member"
+        )
+    return user_id, account_id
+
+
+def _set_family_visibility(workspace_id: UUID, workflow_id: str, visibility: str) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE workflow_versions SET visibility = :v "
+                "WHERE workspace_id = :ws AND workflow_id = :wf"
+            ),
+            {"v": visibility, "ws": workspace_id, "wf": workflow_id},
+        )
+
+
+def _grant(
+    workspace_id: UUID, owner_id: UUID, account_id: UUID, version_id: UUID, actions: list[str]
+) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO resource_grants (id, workspace_id, grantee_account_id, "
+                "resource_type, resource_id, actions, granted_by, created_at) "
+                "VALUES (:id, :ws, :account, 'workflow_versions', :rid, :actions, :by, now())"
+            ),
+            {
+                "id": uuid4(),
+                "ws": workspace_id,
+                "account": account_id,
+                "rid": version_id,
+                "actions": actions,
+                "by": owner_id,
+            },
+        )
+
+
+def _due_trigger(
+    workspace_id: UUID, creator: UUID, workflow_id: str
+) -> automation_triggers.Trigger:
+    trigger = _create_schedule_trigger(
+        workspace_id, creator, workflow_id, schedule_expression="0 * * * *", timezone="UTC"
+    )
+    _set_created_at(trigger.id, datetime(2026, 3, 1, 0, 0, tzinfo=UTC))
+    return trigger
+
+
+_FIRE_TICK = datetime(2026, 3, 1, 1, 30, tzinfo=UTC)
+
+
+def _fire_state(workspace_id: UUID, trigger_id: UUID) -> tuple[int, datetime | None, list[Any]]:
+    """(runs in the workspace, the trigger's anchor, its fire_denied audit rows)."""
+    with engine.connect() as connection:
+        runs = int(
+            connection.execute(
+                text("SELECT count(*) FROM workflow_runs WHERE workspace_id = :ws"),
+                {"ws": workspace_id},
+            ).scalar_one()
+        )
+        anchor = connection.execute(
+            text("SELECT last_fired_at FROM triggers WHERE id = :id"), {"id": trigger_id}
+        ).scalar_one()
+        audits = list(
+            connection.execute(
+                text(
+                    "SELECT actor_id, authorization_result, failure_code, metadata "
+                    "FROM audit_events WHERE workspace_id = :ws "
+                    "AND event_type = 'trigger.fire_denied' AND aggregate_id = :id"
+                ),
+                {"ws": workspace_id, "id": trigger_id},
+            ).mappings()
+        )
+    return runs, anchor, audits
+
+
+def _mine(
+    outcomes: list[automation_scheduler.TriggerEvaluationOutcome], trigger_id: UUID
+) -> list[automation_scheduler.TriggerEvaluationOutcome]:
+    return [o for o in outcomes if getattr(o, "trigger_id", None) == trigger_id]
+
+
+@pytest.mark.parametrize(
+    ("visibility", "grant", "denied_action"),
+    [("private", None, "read"), ("shared_explicitly", ["read"], "write")],
+)
+def test_scheduled_fire_denied_when_creator_lost_access_to_the_workflow(
+    scheduler_test_context: tuple[UUID, UUID],
+    visibility: str,
+    grant: list[str] | None,
+    denied_action: str,
+) -> None:
+    """The creator stays an active member but the workflow was made
+    private (read denied) or shared with them read-only (write denied)
+    after the trigger was created: no run, an audit row, anchor advanced."""
+    workspace_id, owner_id = scheduler_test_context
+    creator, creator_account = _add_member(workspace_id)
+    workflow_id = f"test.sched-authz.{uuid4().hex}"
+    active = _publish_workflow(workspace_id, owner_id, workflow_id)
+    trigger = _due_trigger(workspace_id, creator, workflow_id)
+    _set_family_visibility(workspace_id, workflow_id, visibility)
+    if grant is not None:
+        _grant(workspace_id, owner_id, creator_account, active.id, grant)
+
+    outcomes = automation_scheduler.run_scheduler_once(SessionFactory, now=_FIRE_TICK)
+
+    assert _mine(outcomes, trigger.id) == [
+        automation_scheduler.TriggerFireFailedActorUnauthorized(
+            trigger_id=trigger.id,
+            workflow_id=workflow_id,
+            users_id=creator,
+            denied_action=denied_action,
+        )
+    ]
+    runs, anchor, audits = _fire_state(workspace_id, trigger.id)
+    assert runs == 0
+    assert anchor == _FIRE_TICK
+    assert len(audits) == 1
+    assert audits[0]["actor_id"] == creator
+    assert audits[0]["authorization_result"] == "denied"
+    assert audits[0]["failure_code"] == "TRIGGER_CREATOR_UNAUTHORIZED"
+    assert audits[0]["metadata"] == {"workflow_id": workflow_id, "denied_action": denied_action}
+
+
+def test_scheduled_fire_by_a_write_grantee_still_runs(
+    scheduler_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, owner_id = scheduler_test_context
+    creator, creator_account = _add_member(workspace_id)
+    workflow_id = f"test.sched-grant.{uuid4().hex}"
+    active = _publish_workflow(workspace_id, owner_id, workflow_id)
+    trigger = _due_trigger(workspace_id, creator, workflow_id)
+    _set_family_visibility(workspace_id, workflow_id, "shared_explicitly")
+    _grant(workspace_id, owner_id, creator_account, active.id, ["read", "write"])
+
+    outcomes = automation_scheduler.run_scheduler_once(SessionFactory, now=_FIRE_TICK)
+
+    assert [type(o) for o in _mine(outcomes, trigger.id)] == [automation_scheduler.TriggerFired]
+    runs, _, audits = _fire_state(workspace_id, trigger.id)
+    assert runs == 1
+    assert audits == []
+
+
+def _waiting_on_active_row(holder_pid: int) -> int:
+    with engine.connect() as probe:
+        return int(
+            probe.execute(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname = current_database() AND wait_event_type = 'Lock' "
+                    "AND pg_blocking_pids(pid) @> ARRAY[CAST(:holder AS integer)] "
+                    "AND query ~* 'FROM workflow_versions\\s.*FOR SHARE'"
+                ),
+                {"holder": holder_pid},
+            ).scalar_one()
+        )
+
+
+@pytest.mark.parametrize("make_private", [True, False])
+def test_scheduled_fire_waits_on_the_active_row_and_sees_a_committed_visibility_change(
+    scheduler_test_context: tuple[UUID, UUID], make_private: bool
+) -> None:
+    """A visibility change (as an ownership transfer would: FOR UPDATE on
+    the active row) commits while the fire waits on that row: the fire must
+    authorize the creator against the committed row and enqueue nothing.
+    Control (`make_private=False`): the same wait still fires the run."""
+    workspace_id, owner_id = scheduler_test_context
+    creator, _ = _add_member(workspace_id)
+    workflow_id = f"test.sched-rowlock.{uuid4().hex}"
+    active = _publish_workflow(workspace_id, owner_id, workflow_id)
+    trigger = _due_trigger(workspace_id, creator, workflow_id)
+
+    with ThreadPoolExecutor(max_workers=1) as pool, engine.connect() as holder:
+        holder_tx = holder.begin()
+        try:
+            holder_pid = int(holder.execute(text("SELECT pg_backend_pid()")).scalar_one())
+            holder.execute(
+                text("SELECT id FROM workflow_versions WHERE id = :id FOR UPDATE"),
+                {"id": active.id},
+            )
+            if make_private:
+                holder.execute(
+                    text(
+                        "UPDATE workflow_versions SET visibility = 'private' "
+                        "WHERE workspace_id = :ws AND workflow_id = :wf"
+                    ),
+                    {"ws": workspace_id, "wf": workflow_id},
+                )
+            tick = pool.submit(
+                automation_scheduler.run_scheduler_once, SessionFactory, now=_FIRE_TICK
+            )
+            deadline = time.monotonic() + 15
+            while _waiting_on_active_row(holder_pid) < 1:
+                assert not tick.done(), f"tick finished without waiting: {tick.result()}"
+                assert time.monotonic() < deadline, "tick never waited on the active row"
+                time.sleep(0.05)
+            holder_tx.commit()
+        finally:
+            if holder_tx.is_active:
+                holder_tx.rollback()
+        outcomes = tick.result(timeout=15)
+
+    runs, anchor, _ = _fire_state(workspace_id, trigger.id)
+    assert anchor == _FIRE_TICK
+    if make_private:
+        assert [type(o) for o in _mine(outcomes, trigger.id)] == [
+            automation_scheduler.TriggerFireFailedActorUnauthorized
+        ]
+        assert runs == 0
+    else:
+        assert [type(o) for o in _mine(outcomes, trigger.id)] == [automation_scheduler.TriggerFired]
+        assert runs == 1

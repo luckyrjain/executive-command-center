@@ -188,10 +188,13 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
+from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
+from ecc.auth import AuthContext
 from ecc.observability import record_schedule_lag
+from ecc.platform import audit_outbox, authz
 from ecc.platform.connector_security import lock_membership_shared
 
 from . import triggers as triggers_module
@@ -280,6 +283,26 @@ class TriggerFireFailedActorInactive:
 
 
 @dataclass(frozen=True, slots=True)
+class TriggerFireFailedActorUnauthorized:
+    """The trigger fired (its schedule was due), but `trigger.created_by`,
+    still an active member, can no longer read or write the workflow's
+    active version -- an ownership transfer, a visibility change or a
+    revoked grant since the trigger was created. The same read/write
+    check `POST /automations/runs` makes, against the same locked row, so
+    a schedule cannot keep running a workflow its creator could no longer
+    start by hand. Audited (`trigger.fire_denied`), no run written, and
+    the anchor still advances, mirroring `TriggerFireFailedActorInactive`:
+    the trigger is left in place and fires again at its next occurrence
+    if access is restored. `denied_action` is the first check that failed.
+    """
+
+    trigger_id: UUID
+    workflow_id: str
+    users_id: UUID
+    denied_action: str
+
+
+@dataclass(frozen=True, slots=True)
 class TriggerFireFailedRateLimited:
     """The trigger fired (its schedule was due), but `worker.enqueue_run`
     rejected it -- this workflow has already used its authorizing policy's
@@ -355,6 +378,7 @@ TriggerEvaluationOutcome = (
     | TriggerFireFailedWorkflowNotActive
     | TriggerFireFailedWorkflowKilled
     | TriggerFireFailedActorInactive
+    | TriggerFireFailedActorUnauthorized
     | TriggerFireFailedRateLimited
     | TriggerMisfireSkipped
     | TriggerRaceLost
@@ -438,6 +462,79 @@ def _evaluate_schedule(
     if missed_a_whole_window and skip_missed:
         return _MisfireSkip(new_anchor=now, first_due=first_due)
     return _Due(new_anchor=now, first_due=first_due)
+
+
+# ---------------------------------------------------------------------------
+# Fire-time authorization of the trigger's creator.
+# ---------------------------------------------------------------------------
+
+_ACTIVE_VERSION_FOR_SHARE = text(
+    "SELECT id FROM workflow_versions "
+    "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id "
+    "AND status = 'active' FOR SHARE"
+)
+
+
+def _creator_denied_action(session: Session, trigger: triggers_module.Trigger) -> str | None:
+    """`"read"`/`"write"` if `trigger.created_by` fails that check on the
+    workflow's active version, else `None`. Same lock and checks as
+    `runs.create_run_endpoint`: the active row is held FOR SHARE (blocks
+    an ownership transfer, visibility change or publish until this fire
+    commits) and re-read once if a publish committed while this waited.
+    `None` too when there is no active version or the creator is no
+    longer an active member, leaving those to `enqueue_run`'s own
+    `WorkflowNotActive`/`ActorMembershipInactive` outcomes."""
+    params = {"workspace_id": trigger.workspace_id, "workflow_id": trigger.workflow_id}
+    version_id = session.execute(_ACTIVE_VERSION_FOR_SHARE, params).scalar_one_or_none()
+    if version_id is None:
+        version_id = session.execute(_ACTIVE_VERSION_FOR_SHARE, params).scalar_one_or_none()
+    if version_id is None:
+        return None
+    is_member = session.execute(
+        text(
+            "SELECT 1 FROM workspace_memberships "
+            "WHERE workspace_id = :workspace_id AND users_id = :users_id AND status = 'active'"
+        ),
+        {"workspace_id": trigger.workspace_id, "users_id": trigger.created_by},
+    ).one_or_none()
+    if is_member is None:
+        return None
+    auth = AuthContext(
+        workspace_id=trigger.workspace_id, user_id=trigger.created_by, timezone="UTC"
+    )
+    for action in authz.ACTIONS:
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="workflow_versions",
+            resource_id=version_id,
+            action=action,
+        ):
+            return action
+    return None
+
+
+def _audit_fire_denied(
+    session: Session, trigger: triggers_module.Trigger, denied_action: str, now: datetime
+) -> None:
+    audit_outbox.write_audit_and_outbox(
+        session,
+        AuthContext(workspace_id=trigger.workspace_id, user_id=trigger.created_by, timezone="UTC"),
+        None,
+        event_type="trigger.fire_denied",
+        aggregate_type="trigger",
+        aggregate_id=trigger.id,
+        aggregate_version=0,
+        changed_fields=[],
+        payload={},
+        metadata={"workflow_id": trigger.workflow_id, "denied_action": denied_action},
+        now=now,
+        domain="automation_trigger",
+        source="automation",
+        authorization_result="denied",
+        failure_code="TRIGGER_CREATOR_UNAUTHORIZED",
+        emit_outbox=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -549,6 +646,25 @@ def run_scheduler_once(
                 if not won_race:
                     session.commit()
                     outcomes.append(TriggerRaceLost(trigger_id=trigger.id))
+                    continue
+
+                # The schedule runs as its creator, so the creator must
+                # still be allowed to run the workflow by hand: denied
+                # (transfer, visibility change, revoked grant) means no
+                # run, an audit row, and the anchor still advances.
+                denied_action = _creator_denied_action(session, trigger)
+                if denied_action is not None:
+                    _audit_fire_denied(session, trigger, denied_action, datetime.now(UTC))
+                    session.commit()
+                    record_schedule_lag((moment - decision.first_due).total_seconds())
+                    outcomes.append(
+                        TriggerFireFailedActorUnauthorized(
+                            trigger_id=trigger.id,
+                            workflow_id=trigger.workflow_id,
+                            users_id=trigger.created_by,
+                            denied_action=denied_action,
+                        )
+                    )
                     continue
 
                 run = worker_module.enqueue_run(
