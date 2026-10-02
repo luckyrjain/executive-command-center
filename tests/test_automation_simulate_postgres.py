@@ -57,6 +57,7 @@ from ecc.domains.automation import kill_switches as automation_kill_switches
 from ecc.domains.automation import policy as automation_policy
 from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
+from ecc.domains.automation.adapter_contract import ACTION_TYPES
 from ecc.domains.automation.adapters import AdapterRegistry
 from ecc.main import app
 
@@ -252,8 +253,8 @@ def _publish_workflow_direct(
             workspace_id,
             user_id,
             workflow_id=workflow_id,
-            action_types=[],
-            data_classes=[],
+            action_types=sorted(ACTION_TYPES),
+            data_classes=["sensitive"],
             value_limit=Decimal("1000000"),
             count_limit=count_limit,
             rate_limit=None,
@@ -873,6 +874,8 @@ class _SucceedingAdapter:
         self.output_schema = _EchoOutput
         self.reversible = True
         self.high_impact_categories: frozenset[str] = frozenset()
+        self.action_type = "fake.external"
+        self.data_class = "internal"
 
     def simulate(self, action_input: _EchoInput) -> _EchoOutput:  # noqa: D102
         return _EchoOutput(value=action_input.value)
@@ -888,6 +891,8 @@ class _FailingAdapter:
         self.output_schema = _EchoOutput
         self.reversible = True
         self.high_impact_categories: frozenset[str] = frozenset()
+        self.action_type = "fake.external"
+        self.data_class = "internal"
 
     def simulate(self, action_input: _EchoInput) -> _EchoOutput:  # noqa: D102
         return _EchoOutput(value=action_input.value)
@@ -903,6 +908,8 @@ class _CompensatableAdapter:
         self.output_schema = _EchoOutput
         self.reversible = True
         self.high_impact_categories: frozenset[str] = frozenset()
+        self.action_type = "fake.external"
+        self.data_class = "internal"
 
     def simulate(self, action_input: _EchoInput) -> _EchoOutput:  # noqa: D102
         return _EchoOutput(value=action_input.value)

@@ -100,6 +100,8 @@ from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 from ecc.platform.request_models import EmptyBody as _EmptyBody
 
+from .adapter_contract import ACTION_TYPES, DATA_CLASSES
+
 ApprovalMode = Literal["preview_only", "per_run", "bounded_recurring"]
 PolicyLifecycleStatus = Literal["active", "expired", "revoked"]
 
@@ -109,7 +111,7 @@ _DEFAULT_RATE_LIMIT: dict[str, Any] = {"runs_per_workflow_per_hour": 10}
 _POLICY_FIELDS = """
     id, workspace_id, workflow_id, action_types, data_classes, value_limit,
     count_limit, rate_limit, schedule, approval_mode, expires_at, revoked_at,
-    version, created_by, updated_by, created_at, updated_at
+    version, created_by, updated_by, created_at, updated_at, scope_enforced
 """
 
 
@@ -132,6 +134,10 @@ class AutomationPolicy:
     updated_by: UUID
     created_at: datetime
     updated_at: datetime
+    # False for a legacy row (created before migration 0086, or by a
+    # pre-0086 app instance): its scope fields are not enforced. Every
+    # policy `create_policy` writes is enforced.
+    scope_enforced: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +153,42 @@ class PolicyAlreadyRevoked:
 @dataclass(frozen=True, slots=True)
 class PolicyAlreadyExpired:
     expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyScopeInvalid:
+    """`create_policy` refused the requested scope: `code` is
+    `POLICY_SCOPE_EMPTY` (no action type or no data class -- an empty scope
+    would authorize nothing) or `POLICY_SCOPE_UNKNOWN_VALUE` (a value
+    outside the closed vocabulary)."""
+
+    code: Literal["POLICY_SCOPE_EMPTY", "POLICY_SCOPE_UNKNOWN_VALUE"]
+    field: Literal["action_types", "data_classes"]
+    values: tuple[str, ...]
+    allowed: tuple[str, ...]
+
+
+def validate_policy_scope(
+    action_types: list[str], data_classes: list[str]
+) -> PolicyScopeInvalid | None:
+    """The scope a new policy may be created with (scope-enforcement
+    design, Decision 3 item 3): at least one action type and one data
+    class, each from the closed vocabularies. Lives in the domain function,
+    not a Pydantic validator, so direct callers are covered and the API
+    answers `POLICY_SCOPE_*` rather than a generic validation error."""
+    checks: tuple[
+        tuple[Literal["action_types", "data_classes"], list[str], tuple[str, ...]], ...
+    ] = (
+        ("action_types", action_types, tuple(sorted(ACTION_TYPES))),
+        ("data_classes", data_classes, DATA_CLASSES),
+    )
+    for field, values, allowed in checks:
+        if not values:
+            return PolicyScopeInvalid("POLICY_SCOPE_EMPTY", field, (), allowed)
+        unknown = tuple(sorted({v for v in values if v not in allowed}))
+        if unknown:
+            return PolicyScopeInvalid("POLICY_SCOPE_UNKNOWN_VALUE", field, unknown, allowed)
+    return None
 
 
 def policy_status(
@@ -196,6 +238,7 @@ def _row_to_policy(row: dict[str, Any]) -> AutomationPolicy:
         updated_by=row["updated_by"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        scope_enforced=row["scope_enforced"],
     )
 
 
@@ -261,8 +304,13 @@ def create_policy(
     rate_limit: dict[str, Any] | None,
     schedule: str | None,
     approval_mode: ApprovalMode,
-) -> AutomationPolicy:
-    """`expires_at` is always `now + 90 days` -- never caller-supplied
+) -> AutomationPolicy | PolicyScopeInvalid:
+    """Refuses an empty or out-of-vocabulary scope (`PolicyScopeInvalid`,
+    `validate_policy_scope`), and writes every policy it creates with
+    `scope_enforced = true` explicitly -- migration 0086 leaves the column's
+    default false so only this code path creates enforced rows.
+
+    `expires_at` is always `now + 90 days` -- never caller-supplied
     (design doc Decision 6's default, computed here rather than left to a
     DB `server_default` per this task's own instruction). `rate_limit`
     falls back to `APPROVAL-POLICY.md`'s resolved system-wide default (10
@@ -270,6 +318,9 @@ def create_policy(
     this doc gives a concrete default for, unlike `value_limit`/
     `count_limit`.
     """
+    invalid = validate_policy_scope(action_types, data_classes)
+    if invalid is not None:
+        return invalid
     now = datetime.now(UTC)
     policy_id = uuid4()
     session.execute(
@@ -279,12 +330,12 @@ def create_policy(
                 id, workspace_id, workflow_id, action_types, data_classes,
                 value_limit, count_limit, rate_limit, schedule, approval_mode,
                 expires_at, revoked_at, version, created_by, updated_by,
-                created_at, updated_at, owner_id, visibility
+                created_at, updated_at, owner_id, visibility, scope_enforced
             ) VALUES (
                 :id, :workspace_id, :workflow_id, :action_types, :data_classes,
                 :value_limit, :count_limit, CAST(:rate_limit AS jsonb), :schedule,
                 :approval_mode, :expires_at, NULL, 1, :created_by, :updated_by,
-                :now, :now, :created_by, 'workspace'
+                :now, :now, :created_by, 'workspace', true
             )
             """
         ),
@@ -398,6 +449,7 @@ class PolicyResponse(BaseModel):
     version: int
     created_at: datetime
     updated_at: datetime
+    scope_enforced: bool
 
 
 class PolicyListResponse(BaseModel):
@@ -421,6 +473,7 @@ def _to_response(policy: AutomationPolicy) -> PolicyResponse:
         version=policy.version,
         created_at=policy.created_at,
         updated_at=policy.updated_at,
+        scope_enforced=policy.scope_enforced,
     )
 
 
@@ -476,6 +529,18 @@ def create_policy_endpoint(
             schedule=payload.schedule,
             approval_mode=payload.approval_mode,
         )
+        if isinstance(created, PolicyScopeInvalid):
+            # Raised inside the transaction: nothing was written, and the
+            # idempotency record below is never stored for a refusal.
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": created.code,
+                    "field": created.field,
+                    "values": list(created.values),
+                    "allowed": list(created.allowed),
+                },
+            )
         response = _to_response(created)
         audit_outbox.write_audit_and_outbox(
             session,

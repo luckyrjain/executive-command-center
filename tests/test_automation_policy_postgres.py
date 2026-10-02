@@ -31,6 +31,7 @@ from sqlalchemy.exc import IntegrityError
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
 from ecc.domains.automation import policy as automation_policy
+from ecc.domains.automation.adapter_contract import ACTION_TYPES
 from ecc.main import app
 
 settings = get_settings()
@@ -169,8 +170,9 @@ def _make_policy(
         id=uuid4(),
         workspace_id=uuid4(),
         workflow_id="test.workflow",
-        action_types=(),
-        data_classes=(),
+        action_types=tuple(sorted(ACTION_TYPES)),
+        data_classes=("sensitive",),
+        scope_enforced=True,
         value_limit=Decimal("0"),
         count_limit=0,
         rate_limit={"runs_per_workflow_per_hour": 10},
@@ -224,7 +226,7 @@ def test_create_policy_defaults_expires_at_to_90_days_and_default_rate_limit(
                 workspace_id,
                 user_id,
                 workflow_id=workflow_id,
-                action_types=["local.create_note"],
+                action_types=["note.create"],
                 data_classes=["internal"],
                 value_limit=Decimal("100.00"),
                 count_limit=5,
@@ -254,8 +256,8 @@ def test_revoke_policy_sets_revoked_at_and_bumps_version(
                 workspace_id,
                 user_id,
                 workflow_id=workflow_id,
-                action_types=[],
-                data_classes=[],
+                action_types=sorted(ACTION_TYPES),
+                data_classes=["sensitive"],
                 value_limit=Decimal("0"),
                 count_limit=0,
                 rate_limit=None,
@@ -284,8 +286,8 @@ def test_revoke_policy_already_revoked_returns_already_revoked(
                 workspace_id,
                 user_id,
                 workflow_id=workflow_id,
-                action_types=[],
-                data_classes=[],
+                action_types=sorted(ACTION_TYPES),
+                data_classes=["sensitive"],
                 value_limit=Decimal("0"),
                 count_limit=0,
                 rate_limit=None,
@@ -315,8 +317,8 @@ def test_revoke_policy_already_expired_returns_already_expired(
                 workspace_id,
                 user_id,
                 workflow_id=workflow_id,
-                action_types=[],
-                data_classes=[],
+                action_types=sorted(ACTION_TYPES),
+                data_classes=["sensitive"],
                 value_limit=Decimal("0"),
                 count_limit=0,
                 rate_limit=None,
@@ -425,7 +427,7 @@ def test_create_policy_via_endpoint(
         "/api/v1/automations/policies",
         json={
             "workflow_id": workflow_id,
-            "action_types": ["local.create_note"],
+            "action_types": ["note.create"],
             "data_classes": ["internal"],
             "value_limit": "50.00",
             "count_limit": 3,
@@ -464,6 +466,8 @@ def test_create_policy_for_unknown_workflow_is_404(
         "/api/v1/automations/policies",
         json={
             "workflow_id": f"test.no-such-workflow.{uuid4().hex}",
+            "action_types": ["note.create"],
+            "data_classes": ["internal"],
             "value_limit": "1",
             "count_limit": 1,
             "approval_mode": "per_run",
@@ -488,6 +492,8 @@ def test_list_policies_filters_by_workflow_id(
             "/api/v1/automations/policies",
             json={
                 "workflow_id": workflow_id,
+                "action_types": ["note.create"],
+                "data_classes": ["internal"],
                 "value_limit": "1",
                 "count_limit": 1,
                 "approval_mode": "per_run",
@@ -511,6 +517,8 @@ def test_revoke_policy_via_endpoint(
         "/api/v1/automations/policies",
         json={
             "workflow_id": workflow_id,
+            "action_types": ["note.create"],
+            "data_classes": ["internal"],
             "value_limit": "1",
             "count_limit": 1,
             "approval_mode": "per_run",
@@ -537,6 +545,8 @@ def test_revoke_policy_twice_is_policy_revoked(
         "/api/v1/automations/policies",
         json={
             "workflow_id": workflow_id,
+            "action_types": ["note.create"],
+            "data_classes": ["internal"],
             "value_limit": "1",
             "count_limit": 1,
             "approval_mode": "per_run",
@@ -566,6 +576,8 @@ def test_revoke_expired_policy_is_policy_expired(
         "/api/v1/automations/policies",
         json={
             "workflow_id": workflow_id,
+            "action_types": ["note.create"],
+            "data_classes": ["internal"],
             "value_limit": "1",
             "count_limit": 1,
             "approval_mode": "per_run",
@@ -609,6 +621,8 @@ def test_create_policy_requires_csrf(
         "/api/v1/automations/policies",
         json={
             "workflow_id": workflow_id,
+            "action_types": ["note.create"],
+            "data_classes": ["internal"],
             "value_limit": "1",
             "count_limit": 1,
             "approval_mode": "per_run",
@@ -629,6 +643,8 @@ def test_create_policy_requires_authentication(
         "/api/v1/automations/policies",
         json={
             "workflow_id": workflow_id,
+            "action_types": ["note.create"],
+            "data_classes": ["internal"],
             "value_limit": "1",
             "count_limit": 1,
             "approval_mode": "per_run",
@@ -648,6 +664,8 @@ def test_policy_is_hidden_across_workspaces(
         "/api/v1/automations/policies",
         json={
             "workflow_id": workflow_id,
+            "action_types": ["note.create"],
+            "data_classes": ["internal"],
             "value_limit": "1",
             "count_limit": 1,
             "approval_mode": "per_run",
@@ -752,6 +770,8 @@ def test_revoke_policy_idempotency_key_replays_cached_response(
         "/api/v1/automations/policies",
         json={
             "workflow_id": workflow_id,
+            "action_types": ["note.create"],
+            "data_classes": ["internal"],
             "value_limit": "1",
             "count_limit": 1,
             "approval_mode": "per_run",
@@ -808,6 +828,8 @@ def test_revoke_policy_same_key_different_policy_is_idempotency_conflict(
             "/api/v1/automations/policies",
             json={
                 "workflow_id": workflow_id,
+                "action_types": ["note.create"],
+                "data_classes": ["internal"],
                 "value_limit": "1",
                 "count_limit": 1,
                 "approval_mode": "per_run",

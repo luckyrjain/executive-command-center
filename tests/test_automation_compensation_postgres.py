@@ -74,6 +74,7 @@ from ecc.domains.automation import approvals as automation_approvals
 from ecc.domains.automation import policy as automation_policy
 from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
+from ecc.domains.automation.adapter_contract import ACTION_TYPES
 from ecc.domains.automation.adapters import AdapterRegistry
 
 settings = get_settings()
@@ -105,6 +106,8 @@ class SucceedingAdapter:
         self.output_schema = EchoOutput
         self.reversible = True
         self.high_impact_categories: frozenset[str] = frozenset()
+        self.action_type = "fake.external"
+        self.data_class = "internal"
         self.execute_calls = 0
 
     def simulate(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
@@ -124,6 +127,8 @@ class FailingAdapter:
         self.output_schema = EchoOutput
         self.reversible = True
         self.high_impact_categories: frozenset[str] = frozenset()
+        self.action_type = "fake.external"
+        self.data_class = "internal"
         self.execute_calls = 0
 
     def simulate(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
@@ -148,6 +153,8 @@ class CompensatableAdapter:
         self.output_schema = EchoOutput
         self.reversible = True
         self.high_impact_categories: frozenset[str] = frozenset()
+        self.action_type = "fake.external"
+        self.data_class = "internal"
         self.execute_calls = 0
         self.compensate_calls = 0
         self.last_compensated_value: str | None = None
@@ -177,6 +184,8 @@ class FailingCompensationAdapter:
         self.output_schema = EchoOutput
         self.reversible = True
         self.high_impact_categories: frozenset[str] = frozenset()
+        self.action_type = "fake.external"
+        self.data_class = "internal"
         self.compensate_calls = 0
 
     def simulate(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
@@ -219,6 +228,8 @@ class PolicyRevokingFailingAdapter:
         self.output_schema = EchoOutput
         self.reversible = True
         self.high_impact_categories: frozenset[str] = frozenset()
+        self.action_type = "fake.external"
+        self.data_class = "internal"
         self.execute_calls = 0
         self._workspace_id = workspace_id
         self._policy_id = policy_id
@@ -268,6 +279,8 @@ class HighImpactUndoAdapter:
         self.output_schema = EchoOutput
         self.reversible = False
         self.high_impact_categories: frozenset[str] = frozenset({"person-directed"})
+        self.action_type = "fake.external"
+        self.data_class = "internal"
         self.execute_calls = 0
 
     def simulate(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
@@ -290,6 +303,8 @@ class DedicatedUndoAdapter:
         self.output_schema = EchoOutput
         self.reversible = True
         self.high_impact_categories: frozenset[str] = frozenset()
+        self.action_type = "fake.external"
+        self.data_class = "internal"
         self.execute_calls = 0
         self.last_executed_value: str | None = None
 
@@ -316,6 +331,8 @@ class HighImpactAdapter:
         self.output_schema = EchoOutput
         self.reversible = False
         self.high_impact_categories: frozenset[str] = frozenset({"person-directed"})
+        self.action_type = "fake.external"
+        self.data_class = "internal"
         self.execute_calls = 0
 
     def simulate(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
@@ -342,6 +359,8 @@ class LeaseHandoverFailingAdapter:
         self.output_schema = EchoOutput
         self.reversible = True
         self.high_impact_categories: frozenset[str] = frozenset()
+        self.action_type = "fake.external"
+        self.data_class = "internal"
         self._run_id = run_id
         self.execute_calls = 0
 
@@ -498,8 +517,8 @@ def _publish_workflow(
             workspace_id,
             user_id,
             workflow_id=workflow_id,
-            action_types=[],
-            data_classes=[],
+            action_types=sorted(ACTION_TYPES),
+            data_classes=["sensitive"],
             value_limit=Decimal("1000000"),
             count_limit=1000,
             rate_limit=None,

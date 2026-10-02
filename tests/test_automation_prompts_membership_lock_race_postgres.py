@@ -272,6 +272,8 @@ CASES: dict[str, Case] = {
         "/api/v1/automations/policies",
         lambda ids: {
             "workflow_id": ids["wf"],
+            "action_types": ["note.create"],
+            "data_classes": ["internal"],
             "value_limit": 0,
             "count_limit": 0,
             "approval_mode": "per_run",

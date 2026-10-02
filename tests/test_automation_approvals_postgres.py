@@ -44,6 +44,7 @@ from ecc.domains.automation import approvals as automation_approvals
 from ecc.domains.automation import policy as automation_policy
 from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
+from ecc.domains.automation.adapter_contract import ACTION_TYPES
 from ecc.domains.automation.adapters import ActionAdapter, AdapterRegistry
 from ecc.main import app
 
@@ -155,6 +156,8 @@ class _HighImpactAdapter:
     output_schema = _Output
     reversible = False
     high_impact_categories: frozenset[str] = frozenset({"person-directed"})
+    action_type = "fake.external"
+    data_class = "internal"
 
     def __init__(self) -> None:
         self.execute_calls = 0
@@ -192,8 +195,8 @@ def _create_policy(
             workspace_id,
             user_id,
             workflow_id=workflow_id,
-            action_types=[],
-            data_classes=[],
+            action_types=sorted(ACTION_TYPES),
+            data_classes=["sensitive"],
             value_limit=Decimal("1000000"),
             count_limit=count_limit,
             rate_limit=None,
@@ -275,6 +278,8 @@ def _fake_adapter(categories: frozenset[str]) -> ActionAdapter:
         output_schema = _Output
         reversible = True
         high_impact_categories = categories
+        action_type = "fake.external"
+        data_class = "internal"
 
         def simulate(self, action_input: _Input) -> _Output:  # noqa: D102
             return _Output(value=action_input.value)
@@ -293,8 +298,9 @@ def _fake_policy(
         id=uuid4(),
         workspace_id=uuid4(),
         workflow_id="test.workflow",
-        action_types=(),
-        data_classes=(),
+        action_types=tuple(sorted(ACTION_TYPES)),
+        data_classes=("sensitive",),
+        scope_enforced=True,
         value_limit=Decimal("0"),
         count_limit=count_limit,
         rate_limit={"runs_per_workflow_per_hour": 10},

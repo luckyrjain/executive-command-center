@@ -317,6 +317,8 @@ class GitHubAddIssueCommentAdapter:
     output_schema: type[BaseModel] = GitHubAddIssueCommentOutput
     reversible = True
     high_impact_categories: frozenset[str] = frozenset({"public"})
+    action_type = "comment.create"
+    data_class = "sensitive"
 
     def __init__(
         self, *, transport: httpx.BaseTransport | None = None, timeout_seconds: float = 10.0
@@ -448,6 +450,8 @@ class GitLabAddNoteAdapter:
     output_schema: type[BaseModel] = GitLabAddNoteOutput
     reversible = True
     high_impact_categories: frozenset[str] = frozenset({"public"})
+    action_type = "comment.create"
+    data_class = "sensitive"
 
     def __init__(
         self,
@@ -583,6 +587,8 @@ class JiraAddCommentAdapter:
     output_schema: type[BaseModel] = JiraAddCommentOutput
     reversible = True
     high_impact_categories: frozenset[str] = frozenset({"public"})
+    action_type = "comment.create"
+    data_class = "sensitive"
 
     def __init__(
         self, *, transport: httpx.BaseTransport | None = None, timeout_seconds: float = 10.0

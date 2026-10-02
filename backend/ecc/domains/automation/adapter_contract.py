@@ -31,7 +31,22 @@ already uses for tool input/output, no new validation mechanism), `reversible`
 `HIGH_IMPACT_CATEGORIES` below, Decision 5's closed enumeration -- static
 per adapter, evaluated at registration time, never computed at runtime
 from a step's input), `simulate(action_input) -> BaseModel` and
-`execute(action_input) -> BaseModel`. `compensate(action_input) ->
+`execute(action_input) -> BaseModel`.
+
+**Policy-scope metadata** (`docs/superpowers/specs/2026-10-01-automation-
+policy-scope-enforcement-design.md` Decision 1): every adapter also
+declares `action_type` (one of `ACTION_TYPES`) and `data_class` (one of
+`DATA_CLASSES`, the *highest* class of workspace data its input may carry
+-- an ordinal ceiling), both static and validated at registration, and may
+define `dispatch_value(validated_input) -> Decimal` (the monetary value one
+dispatch moves; absent means `Decimal("0")`, required when the adapter
+declares `financial`). An authorizing policy's `action_types`/
+`data_classes`/`value_limit` are enforced against these. Omission is
+impossible (required members, closed vocabularies); under-declaration --
+e.g. `public` for an adapter whose input can carry sensitive data -- is the
+same adapter-author trust `high_impact_categories` already relies on.
+
+`compensate(action_input) ->
 BaseModel` is deliberately **not** part of the `ActionAdapter` protocol
 itself -- Decision 9 makes it optional, present only for an adapter with a
 genuine compensating action, so a caller checks `hasattr(adapter,
@@ -53,6 +68,7 @@ adapter author's own `simulate()` body is actually side-effect-free
 author contract obligation the runtime cannot mechanically prove").
 """
 
+from decimal import Decimal
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel
@@ -76,6 +92,31 @@ HIGH_IMPACT_CATEGORIES: frozenset[str] = frozenset(
     }
 )
 
+# The closed action-type vocabulary a policy's `action_types` names
+# (scope-enforcement design, Decision 1 / Owner decision 1: coarse kinds,
+# not adapter ids, so one policy entry covers e.g. every comment adapter).
+# Grows with adapters; enforced in the application only, never as a DB
+# CHECK, so adding a member needs no migration.
+ACTION_TYPES: frozenset[str] = frozenset(
+    {
+        "note.create",
+        "notification.send",
+        "comment.create",
+        "fake.external",
+    }
+)
+
+# Phase 4's data-class vocabulary (`ai_runtime.runtime.DataClass`), in
+# ascending sensitivity -- the order is the comparison. Duplicated rather
+# than imported so this module stays a dependency-free leaf; a parity test
+# pins it to `DataClass`, and another pins migration 0086's CHECK literal.
+DATA_CLASSES: tuple[str, ...] = ("public", "internal", "sensitive", "restricted")
+
+
+def data_class_rank(data_class: str) -> int:
+    """Index of `data_class` in `DATA_CLASSES` (`ValueError` if unknown)."""
+    return DATA_CLASSES.index(data_class)
+
 
 @runtime_checkable
 class ActionAdapter(Protocol):
@@ -91,6 +132,8 @@ class ActionAdapter(Protocol):
     output_schema: type[BaseModel]
     reversible: bool
     high_impact_categories: frozenset[str]
+    action_type: str
+    data_class: str
 
     def simulate(self, action_input: BaseModel) -> BaseModel:
         """Must not perform the real side effect, by contract (Decision 4)
@@ -144,6 +187,23 @@ class AdapterCategoryInvalid(ValueError):
     """
 
 
+class AdapterActionTypeInvalid(ValueError):
+    """Raised by `AdapterRegistry.register` when `action_type` is not one of
+    `ACTION_TYPES` -- an adapter cannot be authorized by a policy scope it
+    cannot be named in."""
+
+
+class AdapterDataClassInvalid(ValueError):
+    """Raised by `AdapterRegistry.register` when `data_class` is not exactly
+    one of `DATA_CLASSES` (a set, an empty string or a typo all fail)."""
+
+
+class AdapterValueUndeclared(ValueError):
+    """Raised by `AdapterRegistry.register` when an adapter declares the
+    `financial` high-impact category but no `dispatch_value` -- its value
+    would silently count as 0 against every policy's `value_limit`."""
+
+
 class AdapterRegistry:
     """A small in-process `dict[str, ActionAdapter]`-backed registry
     (design doc Decision 8) `ecc.domains.automation.worker` resolves a
@@ -173,6 +233,20 @@ class AdapterRegistry:
                 f"adapter '{adapter.adapter_id}' declares unknown high_impact_categories "
                 f"{sorted(invalid)}; must be a subset of {sorted(HIGH_IMPACT_CATEGORIES)}"
             )
+        if not isinstance(adapter.action_type, str) or adapter.action_type not in ACTION_TYPES:
+            raise AdapterActionTypeInvalid(
+                f"adapter '{adapter.adapter_id}' declares action_type "
+                f"{adapter.action_type!r}; must be one of {sorted(ACTION_TYPES)}"
+            )
+        if not isinstance(adapter.data_class, str) or adapter.data_class not in DATA_CLASSES:
+            raise AdapterDataClassInvalid(
+                f"adapter '{adapter.adapter_id}' declares data_class {adapter.data_class!r}; "
+                f"must be exactly one of {list(DATA_CLASSES)}"
+            )
+        if "financial" in adapter.high_impact_categories and not has_dispatch_value(adapter):
+            raise AdapterValueUndeclared(
+                f"adapter '{adapter.adapter_id}' is financial but declares no dispatch_value"
+            )
         self._by_id[adapter.adapter_id] = adapter
 
     def get(self, adapter_id: str) -> ActionAdapter | None:
@@ -186,6 +260,27 @@ class AdapterRegistry:
 
     def __len__(self) -> int:
         return len(self._by_id)
+
+
+def has_dispatch_value(adapter: ActionAdapter) -> bool:
+    """Whether `adapter` defines the optional `dispatch_value` method."""
+    return hasattr(adapter, "dispatch_value") and callable(adapter.dispatch_value)
+
+
+def dispatch_value(adapter: ActionAdapter, action_input: BaseModel) -> Decimal:
+    """The monetary value one dispatch of `adapter` with the *validated*
+    `action_input` moves -- `adapter.dispatch_value(...)` when defined, else
+    `Decimal("0")` (scope-enforcement design, Decision 1/4)."""
+    if not has_dispatch_value(adapter):
+        return Decimal("0")
+    method: Any = adapter.dispatch_value  # type: ignore[attr-defined]
+    value = method(action_input)
+    if not isinstance(value, Decimal) or value < 0:
+        raise ValueError(
+            f"adapter '{adapter.adapter_id}' dispatch_value returned {value!r}; "
+            "must be a non-negative Decimal"
+        )
+    return value
 
 
 def compensable(adapter: ActionAdapter) -> bool:

@@ -1803,11 +1803,11 @@ def _seed_automation(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUI
             id, workspace_id, workflow_id, action_types, data_classes,
             value_limit, count_limit, rate_limit, schedule, approval_mode,
             expires_at, revoked_at, version, created_by, updated_by,
-            created_at, updated_at
+            created_at, updated_at, scope_enforced
         ) VALUES (
             %(id)s, %(workspace_id)s, %(workflow_id)s, %(action_types)s, %(data_classes)s,
             0, 1, %(rate_limit)s, NULL, 'preview_only', %(expires_at)s, NULL, 1,
-            %(actor)s, %(actor)s, %(now)s, %(now)s
+            %(actor)s, %(actor)s, %(now)s, %(now)s, true
         )
         ON CONFLICT (id) DO NOTHING
         """,
@@ -1815,8 +1815,11 @@ def _seed_automation(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUI
             "id": ids["automation_policy"],
             "workspace_id": ids["workspace"],
             "workflow_id": _AUTOMATION_WORKFLOW_ID,
-            "action_types": ["bounded"],
-            "data_classes": ["internal"],
+            # Enforced scope (migration 0086) covering the seeded graph's one
+            # step, `local.send_test_notification`: action type
+            # `notification.send`, data class `sensitive`.
+            "action_types": ["notification.send"],
+            "data_classes": ["sensitive"],
             "rate_limit": '{"runs_per_workflow_per_hour": 10}',
             "expires_at": SEED_EPOCH + timedelta(days=90),
             "actor": ids["user"],
