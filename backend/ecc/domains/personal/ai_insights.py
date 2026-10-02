@@ -157,7 +157,12 @@ def generate_insight_endpoint(
     now = datetime.now(UTC)
 
     with held_idempotency_lock(auth, idempotency_key):
+        # A same-key replay is authorized like a fresh request (ADR-0014):
+        # a member suspended or removed since the first request gets 403,
+        # not their cached insight. Under `held_idempotency_lock`, like the
+        # insert below -- the accepted lock-order inversion.
         with session.begin():
+            authz.lock_membership_for_write(session, auth, role_action="read")
             cached = load_cached(
                 session, auth, idempotency_key, req_hash, domain="personal_insight"
             )
@@ -234,10 +239,9 @@ def generate_insight_endpoint(
         output = run.output
         cited_record_ids: list[str] = list(output.get("cited_record_ids", []))
         # The only transaction here that writes the caller's personal data,
-        # so the only one that takes the membership lock (ADR-0014) -- after
-        # the model call, never across it. The cache read above and the
-        # idempotency-bookkeeping writes around it store only the caller's
-        # own cached response.
+        # so it takes the membership lock (ADR-0014) -- after the model
+        # call, never across it. The idempotency-bookkeeping writes around
+        # it store only the caller's own cached response and stay unlocked.
         with session.begin():
             authz.lock_membership_for_write(session, auth, role_action="read")
             period_start, period_end = _cited_record_period(
