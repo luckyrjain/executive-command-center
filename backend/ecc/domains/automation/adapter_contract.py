@@ -68,7 +68,7 @@ adapter author's own `simulate()` body is actually side-effect-free
 author contract obligation the runtime cannot mechanically prove").
 """
 
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel
@@ -262,6 +262,10 @@ class AdapterRegistry:
         return len(self._by_id)
 
 
+_CENTS = Decimal("0.01")
+_MAX_DISPATCH_VALUE = Decimal(10) ** 12
+
+
 def has_dispatch_value(adapter: ActionAdapter) -> bool:
     """Whether `adapter` defines the optional `dispatch_value` method."""
     return hasattr(adapter, "dispatch_value") and callable(adapter.dispatch_value)
@@ -275,12 +279,21 @@ def dispatch_value(adapter: ActionAdapter, action_input: BaseModel) -> Decimal:
         return Decimal("0")
     method: Any = adapter.dispatch_value  # type: ignore[attr-defined]
     value = method(action_input)
-    if not isinstance(value, Decimal) or value < 0:
+    if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
         raise ValueError(
             f"adapter '{adapter.adapter_id}' dispatch_value returned {value!r}; "
             "must be a non-negative Decimal"
         )
-    return value
+    # Exactly what `workflow_run_steps.dispatch_value numeric(14,2)` stores,
+    # so the gate compares the same value the run sum will later read back;
+    # anything that cannot be stored is refused here (the gate turns the
+    # ValueError into a failed step) rather than failing the INSERT.
+    stored = value.quantize(_CENTS, rounding=ROUND_HALF_UP)  # Postgres numeric rounding
+    if stored >= _MAX_DISPATCH_VALUE:
+        raise ValueError(
+            f"adapter '{adapter.adapter_id}' dispatch_value {value} exceeds numeric(14,2)"
+        )
+    return stored
 
 
 def compensable(adapter: ActionAdapter) -> bool:

@@ -14,6 +14,7 @@ from uuid import UUID
 import pytest
 from automation_scope_support import (
     FakeAdapter,
+    FakeInput,
     FinancialFakeAdapter,
     World,
     action_step,
@@ -31,6 +32,7 @@ from ecc.database import SessionFactory
 from ecc.domains.automation import approvals as automation_approvals
 from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
+from ecc.domains.automation.adapter_contract import dispatch_value
 from ecc.domains.automation.adapters import AdapterRegistry
 
 settings = get_settings()
@@ -198,3 +200,25 @@ def test_value_zero_never_trips_and_returns_none(world: World) -> None:
     )
     finished = run_once(world, workflow_id, registry_of(bounded))
     assert finished.status == "succeeded"
+
+
+def test_dispatch_value_is_stored_exactly_as_the_gate_compares_it() -> None:
+    money = FinancialFakeAdapter("test.pay")
+    assert dispatch_value(money, FakeInput(amount=Decimal("1.005"))) == Decimal("1.01")
+    with pytest.raises(ValueError, match="numeric"):
+        dispatch_value(money, FakeInput(amount=Decimal(10) ** 12))
+
+
+def test_an_unstorable_value_fails_the_step_instead_of_wedging_the_run(world: World) -> None:
+    money = FinancialFakeAdapter("test.pay")
+    workflow_id, _ = publish(
+        world,
+        {"steps": [action_step("s1", "test.pay", input_mapping={"amount": "1e13"})]},
+        value_limit=Decimal("9999999999.99"),
+    )
+    finished = run_once(world, workflow_id, registry_of(money))
+    assert finished.status == "failed"
+    assert [(r["status"], r["error_class"]) for r in step_rows(world, finished.id)] == [
+        ("failed", "ValueError")
+    ]
+    assert money.execute_calls == 0

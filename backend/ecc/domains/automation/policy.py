@@ -429,7 +429,10 @@ class PolicyResponse(BaseModel):
     version: int
     created_at: datetime
     updated_at: datetime
-    scope_enforced: bool
+    # Defaulted, not required: idempotent replays (`load_cached`, kept up to
+    # a year) re-validate response bodies cached before this field existed,
+    # and every such policy is legacy anyway.
+    scope_enforced: bool = False
 
 
 class PolicyListResponse(BaseModel):

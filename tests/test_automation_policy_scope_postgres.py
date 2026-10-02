@@ -243,3 +243,25 @@ def test_a_legacy_policy_dispatches_exactly_as_before(world: World) -> None:
     finished = run_once(world, workflow_id, registry_of(adapter))
     assert finished.status == "succeeded"
     assert adapter.execute_calls == 1
+
+
+def test_a_response_cached_before_the_field_existed_still_replays() -> None:
+    """Idempotent replays re-validate bodies cached up to a year ago."""
+    body = {
+        "id": str(uuid4()),
+        "workflow_id": "wf",
+        "action_types": [],
+        "data_classes": [],
+        "value_limit": "0",
+        "count_limit": 1,
+        "rate_limit": {},
+        "schedule": None,
+        "approval_mode": "per_run",
+        "expires_at": "2026-12-01T00:00:00Z",
+        "revoked_at": None,
+        "status": "active",
+        "version": 1,
+        "created_at": "2026-09-01T00:00:00Z",
+        "updated_at": "2026-09-01T00:00:00Z",
+    }
+    assert automation_policy.PolicyResponse.model_validate(body).scope_enforced is False

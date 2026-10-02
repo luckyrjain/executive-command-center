@@ -3284,7 +3284,8 @@ def latest_scope_block(
     row = session.execute(
         text(
             "SELECT metadata FROM audit_events WHERE workspace_id = :workspace_id "
-            "AND aggregate_id = :run_id AND event_type = 'automation.step_blocked' "
+            "AND aggregate_type = 'workflow_run' AND aggregate_id = :run_id "
+            "AND event_type = 'automation.step_blocked' "
             "ORDER BY occurred_at DESC LIMIT 1"
         ),
         {"workspace_id": workspace_id, "run_id": run_id},

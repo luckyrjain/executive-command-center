@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 from automation_scope_support import (
@@ -29,6 +30,7 @@ from automation_scope_support import (
 )
 from sqlalchemy import text
 
+from ecc.auth import AuthContext
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
 from ecc.domains.automation import worker as automation_worker
@@ -312,32 +314,34 @@ def test_unregistered_compensation_adapter_fails_the_compensation_not_the_worker
     assert [entry.status for entry in ledger] == ["failed"]
 
 
-def test_step_blocked_event_rolls_back_with_a_lost_lease(world: World) -> None:
-    """The event and the needs_review transition commit together: if the
-    lease was lost meanwhile, neither is written."""
+def test_step_blocked_event_rolls_back_with_a_lost_lease(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The event and the needs_review transition commit together: when the
+    lease is lost by the time `_pause_run` writes `needs_review` (simulated
+    by that write asserting a different lease holder, so its lease-guarded
+    UPDATE matches nothing and rolls back), the already-written event rolls
+    back with it. `test_out_of_scope_step_blocks_before_any_approval` is the
+    positive control: with the lease held, exactly one event commits."""
     adapter = FakeAdapter("test.scoped", action_type="note.create")
     workflow_id, _ = publish(world, {"steps": [action_step("s1", "test.scoped")]})
-    with SessionFactory() as session, session.begin():
-        queued = automation_worker.enqueue_run(
-            session, world.workspace_id, world.user_id, workflow_id=workflow_id
-        )
-    assert isinstance(queued, automation_worker.WorkflowRun)
-    with SessionFactory() as session:
-        claimed = automation_worker.claim_next_run(session, "worker-scope")
-        assert claimed is not None and claimed.id == queued.id
-        with engine.begin() as connection:
-            connection.execute(
-                text("UPDATE workflow_runs SET leased_by = 'someone-else' WHERE id = :id"),
-                {"id": claimed.id},
-            )
-        automation_worker.process_claimed_run(
-            session, claimed, registry_of(adapter), "worker-scope"
-        )
+    real_pause_run = automation_worker._pause_run
+    seen: list[str] = []
 
-    assert step_blocked_events(world, queued.id) == []
-    assert step_blocked_payloads(world, queued.id) == []
-    with engine.connect() as connection:
-        status = connection.execute(
-            text("SELECT status FROM workflow_runs WHERE id = :id"), {"id": queued.id}
-        ).scalar_one()
-    assert status != "needs_review"
+    def pause_after_losing_the_lease(session: Any, run: Any, status: Any, worker_id: str) -> Any:
+        seen.append(status)
+        return real_pause_run(session, run, status, "someone-else")
+
+    monkeypatch.setattr(automation_worker, "_pause_run", pause_after_losing_the_lease)
+    run_once(world, workflow_id, registry_of(adapter))
+
+    assert seen == ["needs_review"]  # the scope block was reached
+    with SessionFactory() as session:
+        runs = automation_worker.list_runs(
+            session,
+            AuthContext(workspace_id=world.workspace_id, user_id=world.user_id, timezone="UTC"),
+        )
+    (run,) = [r for r in runs if r.workflow_id == workflow_id]
+    assert run.status != "needs_review"
+    assert step_blocked_events(world, run.id) == []
+    assert step_blocked_payloads(world, run.id) == []
