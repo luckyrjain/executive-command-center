@@ -1,6 +1,6 @@
 # Automation Policy Scope Enforcement Design
 
-**Status of this document:** planning artifact only, awaiting repository-owner approval. It changes no code and does not by itself change the status of `docs/phases/phase-005/APPROVAL-POLICY.md`'s "Accepted limitation" section. Implementation may not begin until the owner has reviewed and accepted the decisions below, including the six marked **Owner sign-off**. This document is the "design change of its own" that `APPROVAL-POLICY.md:45` and `backend/ecc/domains/automation/policy.py:62-73` say enforcement needs.
+**Status of this document:** **accepted by the repository owner on 2026-10-02** (PR #359): Decisions 1-6 as recommended, with the answers recorded in "Owner decisions" at the end. It changes no code itself; `docs/phases/phase-005/APPROVAL-POLICY.md`'s "Accepted limitation" section changes in the implementation PR, not here. Implementation may now begin, in Decision 6's order. This document is the "design change of its own" that `APPROVAL-POLICY.md:45` and `backend/ecc/domains/automation/policy.py:62-73` say enforcement needs.
 
 ## Outcome
 
@@ -67,7 +67,7 @@ Turn `automation_policies.action_types`, `data_classes` and `value_limit` from s
   - every newly registered adapter silently falls outside every existing policy;
   - the column name promises a kind, not an identity.
 
-  It stays a fallback if the owner prefers exactness over grouping. See Open question 1.
+  It stays a fallback if the owner prefers exactness over grouping. The owner chose the coarse vocabulary (Owner decision 1).
 - **D1-b: put metadata in a separate registry table or config file** keyed by `adapter_id`. Rejected because it splits one adapter's declarations across two places. `high_impact_categories` is static and lives on the adapter class, and this design keeps the same "static per adapter, validated at registration" rule (`adapter_contract.py:30-33`).
 - **D1-c: classify data per dispatch from the resolved input.** This would be more precise. It is deferred because it needs provenance tracking through `input_mapping` that does not exist, and a wrong runtime classifier would silently fail open.
 
@@ -82,7 +82,7 @@ Turn `automation_policies.action_types`, `data_classes` and `value_limit` from s
 
 This is the stricter reading of the `high_impact_categories` precedent. That precedent fails closed only on *unknown* values (`:170-175`), and `APPROVAL-POLICY.md:29` admits it does not stop an adapter from under-declaring. Here, under-declaring is mechanically impossible because the members are required and `data_classes` must be non-empty.
 
-## Decision 3: empty-list semantics and compatibility for existing rows (**Owner sign-off**)
+## Decision 3: empty-list semantics and compatibility for existing rows (**Owner: accepted**)
 
 **The risk.** Production rows hold whatever authors typed into free-text fields. That is most likely `[]`, since both the API and the UI default to an empty list. It may also be adapter ids (`local.create_note`) or ad-hoc strings that are not in the new vocabulary. Applying any single rule to those rows when enforcement ships has one of two effects:
 
@@ -118,7 +118,7 @@ Neither outcome is acceptable unannounced.
 - **D3-c: backfill legacy `[]` to the full current vocabulary.** This preserves effective authority and makes it visible. Rejected because it writes authority the author never chose into an "immutable" policy row. It also still fails on legacy non-empty values that are not in the vocabulary, such as `local.create_note`, which would need a guessed mapping.
 - **D3-d: enforce legacy non-empty rows as stored.** Rejected. Free-text values that are not in the vocabulary would deny everything, which is a silent break, and values that happen to match would narrow authority the author was told was not enforced.
 
-## Decision 4: `value_limit` semantics (**Owner sign-off**)
+## Decision 4: `value_limit` semantics (**Owner: accepted**)
 
 **Recommendation: dispatch value per step, cumulative per run, enforced as `policy-limit-exceeding`.**
 
@@ -175,7 +175,7 @@ The rule: a step is in scope when `adapter.action_type ∈ policy.action_types` 
 
 **Value enforcement** extends `evaluate_approval_requirement` with a required `run_value_so_far: Decimal` keyword. Like the count, it is required so that a forgotten argument cannot fall through to 0 (`approvals.py:247-251`). It returns `True` when `run_value_so_far + step_value > policy.value_limit`.
 
-**Adjacent gap, flagged for the owner.** `_evaluate_approval_gate` stores `adapter.high_impact_categories` on the approval row (`worker.py:2062`). For a count- or value-triggered approval on a bounded adapter, that set is empty, so the approver is never told the reason is `policy-limit-exceeding`. The recommendation is for `evaluate_approval_requirement` to return the effective category set, adding `policy-limit-exceeding` when a limit tripped, and to persist that set instead. This is in scope only if the owner agrees (Open question 5).
+**Adjacent gap, flagged for the owner.** `_evaluate_approval_gate` stores `adapter.high_impact_categories` on the approval row (`worker.py:2062`). For a count- or value-triggered approval on a bounded adapter, that set is empty, so the approver is never told the reason is `policy-limit-exceeding`. The recommendation is for `evaluate_approval_requirement` to return the effective category set, adding `policy-limit-exceeding` when a limit tripped, and to persist that set instead. **In scope for the implementation PR** (Owner decision 5).
 
 **Error and API surfacing:**
 
@@ -246,15 +246,15 @@ Before merging, run the Decision 3 report query against production and include t
 - `docs/phases/phase-005/IMPLEMENTATION-STATUS.md:287` (Gap 3): mark it resolved.
 - `docs/phases/phase-006/CONNECTOR-CONTRACT.md:114`: the "never enforced" parenthetical becomes the enforced `comment.create` / `sensitive` scope.
 
-## Open questions for the owner
+## Owner decisions (2026-10-02)
 
-1. **Action-type granularity (Decision 1):** use the coarse closed vocabulary (`note.create`, `notification.send`, `comment.create`, `fake.external`), or D1-a, where `action_types` is an exact `adapter_id` allowlist?
-2. **Legacy compatibility (Decision 3):** accept grandfathering until expiry (at most 90 days), or revoke and recreate all live policies at deploy time (D3-b with a manual migration)?
-3. **`value_limit` window (Decision 4):** use per run, matching `count_limit` as implemented, and correct the doc's "per day"; or build the per-policy-per-day ledger now (D4-a); or defer value entirely (D4-b)?
-4. **Data classification of real adapters:** is `sensitive` right for the three connector comment adapters and `local.create_note`, given that their input can carry any workspace content? Is `internal` right for `fake.external_action`?
-5. **Approval category accuracy:** should count- and value-triggered approvals record `policy-limit-exceeding` on the approval row (adjacent gap, Decision 5) in this PR?
-6. **Should scope also constrain `connector targets`?** `APPROVAL-POLICY.md:11` names connector targets as a policy dimension, but there is no column for them. Connector authorization is currently per actor (#351). This design leaves it out of scope.
+1. **Action-type granularity:** the coarse closed vocabulary (`note.create`, `notification.send`, `comment.create`, `fake.external`). D1-a (exact `adapter_id` allowlist) is not adopted.
+2. **Legacy compatibility:** grandfather live policies (`scope_enforced = false`) until they expire, at most 90 days. No revoke-and-recreate at deploy. New and renewed policies are enforced from the first dispatch.
+3. **`value_limit` window:** per run, matching `count_limit`. The implementation PR corrects `APPROVAL-POLICY.md`'s "per policy per day" row to "per run" for both limits. The per-day ledger (D4-a) stays deferred until an adapter with a nonzero value exists.
+4. **Data classification:** as proposed. `sensitive` for `local.create_note`, `local.send_test_notification` and the three connector comment adapters; `internal` for `fake.external_action`.
+5. **Approval category accuracy:** yes, in the same implementation PR. Count- and value-triggered approvals record `policy-limit-exceeding` on the approval row.
+6. **Connector targets:** out of scope. Per-actor connector authorization (#351) covers misuse today. A per-policy connector allowlist would need its own column and design.
 
 ## Completion boundary for this planning pass
 
-This document is complete when the owner accepts or amends Decisions 1-6 and answers Open questions 1-6. No code, migration or contract document changes before that. The implementation PR then follows Decision 6's order and test list.
+Complete: the owner has accepted Decisions 1-6 and answered the open questions above. The implementation PR follows Decision 6's order and test list. It uses the next free migration number at that time (`0085` is taken by `0085_distinct_approver.py`, PR #361).
