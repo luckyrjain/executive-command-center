@@ -1999,8 +1999,10 @@ def _run_dispatch_totals(session: Session, workspace_id: UUID, run_id: UUID) -> 
     `policy-limit-exceeding` needs (`approvals.evaluate_approval_
     requirement`). Any status fails closed: a failed/unknown/retrying step
     may still have moved value. NULL values (compensation rows, rejected
-    approvals, failed validation, pre-migration rows) count as 0. Same
-    "prior steps only" reasoning as `_count_dispatched_action_steps`."""
+    approvals, failed validation, pre-migration rows) count as 0. Every row
+    this module inserts is for an `action` step, and the gate only runs
+    when no row exists yet for the step under evaluation, so this counts
+    exactly the *prior* steps -- never off-by-one against that step."""
     row = session.execute(
         text(
             "SELECT COUNT(*), COALESCE(SUM(dispatch_value), 0) FROM workflow_run_steps "
@@ -2009,29 +2011,6 @@ def _run_dispatch_totals(session: Session, workspace_id: UUID, run_id: UUID) -> 
         {"workspace_id": workspace_id, "run_id": run_id},
     ).one()
     return int(row[0] or 0), Decimal(row[1] or 0)
-
-
-def _count_dispatched_action_steps(session: Session, workspace_id: UUID, run_id: UUID) -> int:
-    """How many `workflow_run_steps` rows (any status) this run has
-    already written -- every row this module ever inserts is for an
-    `action` step (module docstring / `UnsupportedStepType`), so this is
-    exactly "how many action steps has this run already attempted," the
-    count `policy-limit-exceeding` (`approvals.evaluate_approval_
-    requirement`) needs. Counts rows for the step currently being gated
-    too if one somehow already existed (it never does here -- this is only
-    ever called from the `else:` branch below, which is only reached when
-    no row exists yet for this exact `step_index`), so it is exactly the
-    count of *prior* steps, never off-by-one against the step under
-    evaluation.
-    """
-    result = session.execute(
-        text(
-            "SELECT COUNT(*) FROM workflow_run_steps "
-            "WHERE workspace_id = :workspace_id AND run_id = :run_id"
-        ),
-        {"workspace_id": workspace_id, "run_id": run_id},
-    ).scalar()
-    return int(result or 0)
 
 
 def _resolve_usable_policy(
@@ -3116,8 +3095,12 @@ def _dispatch_compensation_step(
     # own adapter will run through execute(). An original adapter's own
     # compensate() undoes an action the gate already authorized, and
     # denying the undo would leave the side effect behind.
-    if not (original_adapter is not None and compensable(original_adapter)):
-        assert compensation_adapter is not None
+    # An unregistered compensation adapter is left to the `try` below, which
+    # records it as a failed compensation exactly as before.
+    if (
+        not (original_adapter is not None and compensable(original_adapter))
+        and compensation_adapter is not None
+    ):
         scope_policy = (
             policy_module.get_policy(session, run.workspace_id, run.policy_id)
             if run.policy_id is not None
@@ -3286,7 +3269,29 @@ def _write_step_blocked_event(
         now=datetime.now(UTC),
         domain="automation",
         source="automation",
+        # Also on the durable audit row (the outbox is a delivery queue), so
+        # the run detail can show an operator why the run stopped.
+        metadata={"step_index": outcome.step_index, "reason": outcome.reason},
     )
+
+
+def latest_scope_block(
+    session: Session, workspace_id: UUID, run_id: UUID
+) -> tuple[int, str] | None:
+    """`(step_index, reason)` of the most recent `automation.step_blocked`
+    audit row for this run, or `None`. A scope block writes no step row, so
+    this is the only place its cause survives."""
+    row = session.execute(
+        text(
+            "SELECT metadata FROM audit_events WHERE workspace_id = :workspace_id "
+            "AND aggregate_id = :run_id AND event_type = 'automation.step_blocked' "
+            "ORDER BY occurred_at DESC LIMIT 1"
+        ),
+        {"workspace_id": workspace_id, "run_id": run_id},
+    ).scalar_one_or_none()
+    if not row or "reason" not in row:
+        return None
+    return int(row["step_index"]), str(row["reason"])
 
 
 def process_claimed_run(

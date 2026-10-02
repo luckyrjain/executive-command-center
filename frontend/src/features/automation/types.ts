@@ -237,7 +237,11 @@ export type Run = {
   updated_at: string
 }
 
-export type RunDetail = Run & { steps: RunStep[]; compensation_steps: CompensationStep[] }
+/** Why a `needs_review` run stopped, when its policy's scope did not
+ * authorize a step (the block writes no step row). */
+export type ScopeBlock = { step_index: number; reason: PolicyBlockReason | string }
+
+export type RunDetail = Run & { steps: RunStep[]; compensation_steps: CompensationStep[]; scope_block?: ScopeBlock | null }
 export type RunListResponse = { runs: Run[] }
 
 // --- Kill switches -----------------------------------------------------

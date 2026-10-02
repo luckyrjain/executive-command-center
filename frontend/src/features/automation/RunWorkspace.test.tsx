@@ -143,6 +143,31 @@ describe('RunWorkspace', () => {
     expect(statusLine?.textContent).not.toMatch(/retrying/)
   })
 
+  it('names a scope block as the cause, instead of "no further cause"', async () => {
+    const detail: RunDetail = {
+      ...baseRun,
+      status: 'needs_review',
+      policy_id: 'policy-1',
+      steps: [],
+      compensation_steps: [],
+      scope_block: { step_index: 0, reason: 'action_type_not_authorized' },
+    }
+    vi.stubGlobal('fetch', mockFetchByPath({
+      '/api/v1/automations/runs/run-1': detail,
+      '/api/v1/automations/runs': { runs: [{ ...baseRun, status: 'needs_review' }] },
+      '/kill_switch': noSwitch,
+      '/policies': { policies: [] },
+    }))
+    renderWorkspace()
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'View' })).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: 'View' }))
+
+    await waitFor(() => expect(screen.getByText(/Step 0 was blocked because this run's policy does not authorize it/)).toBeTruthy())
+    expect(screen.getByText(/action type is not in the policy's action types/)).toBeTruthy()
+    expect(screen.queryByText(/No further cause is determinable/)).toBeNull()
+  })
+
   it('shows a needs_review run with the strongest available cause: its own revoked policy', async () => {
     const detail: RunDetail = {
       ...baseRun,

@@ -1065,8 +1065,7 @@ def list_adapters_endpoint(auth: AuthDep, session: SessionDep) -> AdapterListRes
     text (scope-enforcement design, Decision 5 surfacing table). The
     registry is process-global, so this returns no workspace data; an
     active membership is still required, like every automation read."""
-    authz.require_active_role(session, auth)
-    session.rollback()
+    authz.require_active_role(session, auth)  # rolls back its own read
     adapters = [
         _production_adapter_registry.get(adapter_id)
         for adapter_id in _production_adapter_registry.adapter_ids()
@@ -1783,7 +1782,9 @@ def _simulate_steps(
             )
         )
         action_step_count_so_far += 1
-        if step_value is not None:
+        # Only a step real dispatch would actually record a value for: a
+        # blocked or invalid step writes no `dispatched` row.
+        if step_value is not None and dispatch_gate in ("clear", "requires_approval"):
             run_value_so_far += step_value
 
     return results

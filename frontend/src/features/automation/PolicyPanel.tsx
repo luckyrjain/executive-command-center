@@ -1,4 +1,4 @@
-import { useRef, useState, type FormEvent } from 'react'
+import { useId, useRef, useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
@@ -61,6 +61,7 @@ export default function PolicyPanel() {
   const [formError, setFormError] = useState<string | null>(null)
   const [createStepIndex, setCreateStepIndex] = useState(0)
   const createFormRef = useRef<HTMLFormElement>(null)
+  const scopeIdPrefix = useId()
   const createStep = CREATE_STEPS[createStepIndex] ?? 'scope'
   const [invalidField, setInvalidField] = useState<string | null>(null)
   const createStepHeadingRef = useWizardStepFocus(
@@ -227,6 +228,7 @@ export default function PolicyPanel() {
                     <label>{actionType}
                       <input
                         type="checkbox"
+                        aria-describedby={`${scopeIdPrefix}-${actionType}-adapters`}
                         checked={draft.actionTypes.includes(actionType)}
                         onChange={(e) => setDraft({
                           ...draft,
@@ -236,16 +238,16 @@ export default function PolicyPanel() {
                         })}
                       />
                     </label>
-                    <small>{adaptersByType(actionType).join(', ')}</small>
+                    <small id={`${scopeIdPrefix}-${actionType}-adapters`}>{adaptersByType(actionType).join(', ')}</small>
                   </div>
                 ))}
               </fieldset>
             ) : null}
             {dataClasses.length ? (
-              <label><span id="policy-data-class-label">{DATA_CLASS_LABEL}</span>
+              <label><span id={`${scopeIdPrefix}-data-class-label`}>{DATA_CLASS_LABEL}</span>
                 {/* aria-labelledby: a select nested in its label would otherwise
                     also take the selected option's text into its name. */}
-                <select aria-labelledby="policy-data-class-label" value={draft.dataClass} onChange={(e) => setDraft({ ...draft, dataClass: e.target.value })}>
+                <select aria-labelledby={`${scopeIdPrefix}-data-class-label`} value={draft.dataClass} onChange={(e) => setDraft({ ...draft, dataClass: e.target.value })}>
                   <option value="">Choose a data class</option>
                   {dataClasses.map((dataClass) => <option key={dataClass} value={dataClass}>{dataClass}</option>)}
                 </select>

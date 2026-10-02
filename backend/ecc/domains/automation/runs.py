@@ -201,9 +201,18 @@ class CompensationStepResponse(BaseModel):
     error_class: str | None
 
 
+class ScopeBlockResponse(BaseModel):
+    step_index: int
+    reason: str
+
+
 class RunDetailResponse(RunResponse):
     steps: list[RunStepResponse]
     compensation_steps: list[CompensationStepResponse]
+    # Set while the run is `needs_review` because its policy's scope did not
+    # authorize a step (`automation.step_blocked`); such a block writes no
+    # step row, so this is the only way the reason reaches the run view.
+    scope_block: ScopeBlockResponse | None = None
 
 
 class RunListResponse(BaseModel):
@@ -285,12 +294,18 @@ def _to_detail_response(
     steps: list[WorkflowRunStep],
     compensation_steps: list[worker_module.CompensationStep],
     action_ref_by_index: dict[int, str],
+    scope_block: tuple[int, str] | None = None,
 ) -> RunDetailResponse:
     base = _to_response(run)
     return RunDetailResponse(
         **base.model_dump(),
         steps=[_step_to_response(s, action_ref_by_index) for s in steps],
         compensation_steps=[_compensation_step_to_response(c) for c in compensation_steps],
+        scope_block=(
+            ScopeBlockResponse(step_index=scope_block[0], reason=scope_block[1])
+            if scope_block is not None
+            else None
+        ),
     )
 
 
@@ -357,7 +372,12 @@ def get_run_endpoint(run_id: UUID, auth: AuthDep, session: SessionDep) -> RunDet
     steps = worker_module.list_run_steps(session, auth.workspace_id, run_id)
     compensation_steps = worker_module.list_compensation_steps(session, auth.workspace_id, run_id)
     action_ref_by_index = _action_ref_by_step_index(session, run)
-    return _to_detail_response(run, steps, compensation_steps, action_ref_by_index)
+    scope_block = (
+        worker_module.latest_scope_block(session, auth.workspace_id, run_id)
+        if run.status == "needs_review"
+        else None
+    )
+    return _to_detail_response(run, steps, compensation_steps, action_ref_by_index, scope_block)
 
 
 @router.post("/runs", response_model=RunResponse, status_code=status.HTTP_201_CREATED)

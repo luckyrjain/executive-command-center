@@ -225,7 +225,7 @@ This closes an adjacent gap (Owner decision 5): today a count-triggered approval
 | `PolicyPanel.tsx` | replaces the two free-text inputs (`:195-200`) with a checkbox group of action types fed by `/automations/adapters`, and a single choice of the **highest data class the policy allows** (ordinal ceiling; it submits `[chosen]`); shows a "Legacy scope: not enforced, expires {date}" badge for `scope_enforced=false` |
 | `frontend/src/features/automation/types.ts` | `Policy` gains `scope_enforced: boolean`; `PolicyBlockReason` gains the two new reasons; `DispatchGate` gains `'input_invalid'`; `SimulateStepResult` gains `action_type?: string \| null`, `data_class?: string \| null` and `dispatch_value?: string \| null` (a decimal string, as `value_limit` already is); a new `AutomationAdapter` type for the adapters endpoint |
 | `SimulationView.tsx` | `GATE_LABEL: Record<DispatchGate, string>` (`:7-13`) needs an `input_invalid` label, or it stops type-checking once `DispatchGate` gains the member |
-| `RunWorkspace` / approval card | shows the block reason; shows `policy-limit-exceeding` when present |
+| `RunWorkspace` / approval card | shows the block reason (implemented as `RunDetailResponse.scope_block`, read from the `automation.step_blocked` audit row's metadata); shows `policy-limit-exceeding` when present |
 
 ## Decision 6: rollout, tests, and documentation
 
@@ -275,7 +275,7 @@ Before merging, run the Decision 3 report query against production and include t
   - a compensation `execute()` that is out of scope gives `PolicyScopeViolationDuringCompensation` / `compensation_failed`;
   - an original adapter's `compensate()` is not blocked;
   - `preview_only` with an out-of-scope step blocks on scope.
-- Input validation inside the gate (extend `tests/test_automation_worker_postgres.py`):
+- Input validation inside the gate (implemented in `tests/test_automation_scope_enforcement_postgres.py`, alongside the other dispatch-path tests):
   - an input that fails `input_schema` validation writes one `failed` step row with `error_class='ValidationError'` and no `dispatched` intermediate, creates no `approval_requests` row, and never calls `execute()`;
   - with a revoked policy the same step blocks (`needs_review`) instead; under `preview_only` it returns the preview-only block and writes no `failed` row;
   - an invalid input on an out-of-scope step lands in `needs_review` with one `automation.step_blocked` event and writes no `failed` row;

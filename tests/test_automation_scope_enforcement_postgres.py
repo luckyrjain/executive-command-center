@@ -16,6 +16,7 @@ from automation_scope_support import (
     World,
     action_step,
     approval_rows,
+    client_for,
     compensation_step,
     make_world,
     publish,
@@ -271,3 +272,72 @@ def test_cleared_step_records_dispatch_value_and_unregistered_still_fails(world:
     rows = step_rows(world, finished.id)
     assert (rows[0]["status"], rows[0]["dispatch_value"]) == ("succeeded", 0)
     assert (rows[1]["status"], rows[1]["error_class"]) == ("failed", "AdapterNotRegistered")
+
+
+def test_run_detail_names_the_scope_block(world: World) -> None:
+    adapter = FakeAdapter("test.scoped", action_type="note.create")
+    workflow_id, _ = publish(world, {"steps": [action_step("s1", "test.scoped")]})
+    finished = run_once(world, workflow_id, registry_of(adapter))
+    with client_for(world) as client:
+        response = client.get(f"/api/v1/automations/runs/{finished.id}")
+    assert response.status_code == 200, response.text
+    assert response.json()["scope_block"] == {
+        "step_index": 0,
+        "reason": "action_type_not_authorized",
+    }
+
+
+def test_unregistered_compensation_adapter_fails_the_compensation_not_the_worker(
+    world: World,
+) -> None:
+    """Original adapter has no compensate() and the compensation step's own
+    adapter is unregistered: a failed compensation row, as before scope
+    enforcement -- never an exception out of the worker."""
+    done = FakeAdapter("test.done")
+    failing = FakeAdapter("test.failing", mode="fail")
+    workflow_id, _ = publish(
+        world,
+        {
+            "steps": [
+                action_step("s0", "test.done", compensate_ref="c0"),
+                action_step("s1", "test.failing"),
+                compensation_step("c0", "test.not-registered"),
+            ]
+        },
+    )
+    finished = run_once(world, workflow_id, registry_of(done, failing))
+    assert finished.status == "compensation_failed"
+    with SessionFactory() as session:
+        ledger = automation_worker.list_compensation_steps(session, world.workspace_id, finished.id)
+    assert [entry.status for entry in ledger] == ["failed"]
+
+
+def test_step_blocked_event_rolls_back_with_a_lost_lease(world: World) -> None:
+    """The event and the needs_review transition commit together: if the
+    lease was lost meanwhile, neither is written."""
+    adapter = FakeAdapter("test.scoped", action_type="note.create")
+    workflow_id, _ = publish(world, {"steps": [action_step("s1", "test.scoped")]})
+    with SessionFactory() as session, session.begin():
+        queued = automation_worker.enqueue_run(
+            session, world.workspace_id, world.user_id, workflow_id=workflow_id
+        )
+    assert isinstance(queued, automation_worker.WorkflowRun)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-scope")
+        assert claimed is not None and claimed.id == queued.id
+        with engine.begin() as connection:
+            connection.execute(
+                text("UPDATE workflow_runs SET leased_by = 'someone-else' WHERE id = :id"),
+                {"id": claimed.id},
+            )
+        automation_worker.process_claimed_run(
+            session, claimed, registry_of(adapter), "worker-scope"
+        )
+
+    assert step_blocked_events(world, queued.id) == []
+    assert step_blocked_payloads(world, queued.id) == []
+    with engine.connect() as connection:
+        status = connection.execute(
+            text("SELECT status FROM workflow_runs WHERE id = :id"), {"id": queued.id}
+        ).scalar_one()
+    assert status != "needs_review"
