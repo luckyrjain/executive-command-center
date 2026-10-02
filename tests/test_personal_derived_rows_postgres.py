@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 import time
+import warnings
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -1113,26 +1114,69 @@ def _timed_counts_and_probes(world: GmailSyncWorld, params: dict[str, Any]) -> N
             connection.execute(text(f"ANALYZE {table}"))
         connection.execute(text("SET LOCAL statement_timeout = '5s'"))
         for table, row_ids in ids.items():
-            started = time.perf_counter()
-            remaining = connection.execute(
-                text(authz._owned_count_sql(table, exclude_personal_data=True)), params
-            ).scalar_one()
-            elapsed = time.perf_counter() - started
-            started = time.perf_counter()
-            for index, row_id in enumerate(row_ids[:50]):
-                assert connection.execute(
-                    text(connector_security._SHARE_REFUSED_STATEMENTS[table]),
-                    {"id": row_id, **personal_sql_params()},
-                ).scalar_one() is (index < 2_500)
-            probe_elapsed = time.perf_counter() - started
-            print(
-                f"{table}: removal count {elapsed * 1000:.1f} ms; "
-                f"50 share probes {probe_elapsed * 1000:.1f} ms"
+            remaining, elapsed, probe_elapsed = _time_count_and_probes(
+                connection, table, row_ids, params
             )
             assert remaining == baseline[table] + 2_500
-            assert elapsed < 2.0, (table, elapsed)
-            assert probe_elapsed < 1.0, (table, probe_elapsed)
+            if elapsed >= _COUNT_BUDGET_SECONDS or probe_elapsed >= _PROBE_BUDGET_SECONDS:
+                # Wall-clock bounds trip under heavy machine load (50 probes
+                # took 3.3 s at load ~150 vs ~0.1-0.4 s normally), so one
+                # re-measurement on the same rows is allowed, as for the
+                # ranking budget in `test_risks_attention_postgres.py`. A
+                # real plan regression is slow on both passes. Surfaced as a
+                # warning, not a print: pytest drops a passing test's captured
+                # stdout, so a pass-on-retry would otherwise leave no trace in
+                # CI. The warnings summary is shown even when the test passes.
+                first = (elapsed, probe_elapsed)
+                warnings.warn(
+                    f"[share-probe budget] {table}: initial pass count "
+                    f"{elapsed * 1000:.1f} ms / probes {probe_elapsed * 1000:.1f} ms "
+                    f"over the {_COUNT_BUDGET_SECONDS * 1000:.0f} / "
+                    f"{_PROBE_BUDGET_SECONDS * 1000:.0f} ms budget; retrying once",
+                    stacklevel=2,
+                )
+                _, elapsed, probe_elapsed = _time_count_and_probes(
+                    connection, table, row_ids, params
+                )
+                assert elapsed < _COUNT_BUDGET_SECONDS, (
+                    f"{table}: count exceeded the budget on both the initial pass "
+                    f"({first[0] * 1000:.1f} ms) and the retry ({elapsed * 1000:.1f} ms)"
+                )
+                assert probe_elapsed < _PROBE_BUDGET_SECONDS, (
+                    f"{table}: probes exceeded the budget on both the initial pass "
+                    f"({first[1] * 1000:.1f} ms) and the retry ({probe_elapsed * 1000:.1f} ms)"
+                )
+            assert elapsed < _COUNT_BUDGET_SECONDS, (table, elapsed)
+            assert probe_elapsed < _PROBE_BUDGET_SECONDS, (table, probe_elapsed)
         transaction.rollback()
+
+
+_COUNT_BUDGET_SECONDS = 2.0
+_PROBE_BUDGET_SECONDS = 1.0
+
+
+def _time_count_and_probes(
+    connection: Any, table: str, row_ids: list[UUID], params: dict[str, Any]
+) -> tuple[int, float, float]:
+    """One timed removal count plus 50 timed share probes on `table`; the
+    probes' answers are asserted on every pass."""
+    started = time.perf_counter()
+    remaining = connection.execute(
+        text(authz._owned_count_sql(table, exclude_personal_data=True)), params
+    ).scalar_one()
+    elapsed = time.perf_counter() - started
+    started = time.perf_counter()
+    for index, row_id in enumerate(row_ids[:50]):
+        assert connection.execute(
+            text(connector_security._SHARE_REFUSED_STATEMENTS[table]),
+            {"id": row_id, **personal_sql_params()},
+        ).scalar_one() is (index < 2_500)
+    probe_elapsed = time.perf_counter() - started
+    print(
+        f"{table}: removal count {elapsed * 1000:.1f} ms; "
+        f"50 share probes {probe_elapsed * 1000:.1f} ms"
+    )
+    return remaining, elapsed, probe_elapsed
 
 
 def _feedback_ids(recommendation_id: UUID) -> list[UUID]:

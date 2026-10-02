@@ -812,10 +812,11 @@ def _advance_run_after_decision(
     )
 
 
-def _lock_visible_approval(session: Session, auth: AuthContext, approval_id: UUID) -> bool:
+def _lock_visible_approval(session: Session, auth: AuthContext, approval_id: UUID) -> UUID | None:
     """Locks the request, its run and the run's pinned version, in that
     order (`decide_approval` and `_advance_run_after_decision` lock the
-    first two in the same order), then checks read on all three.
+    first two in the same order), then checks read on all three. Returns
+    the pinned version's id when all three are readable, else `None`.
 
     Lock before authorizing: an ownership transfer or visibility change
     that commits while this waits on a lock must be seen by the checks
@@ -831,7 +832,7 @@ def _lock_visible_approval(session: Session, auth: AuthContext, approval_id: UUI
         {"workspace_id": auth.workspace_id, "id": approval_id},
     ).scalar_one_or_none()
     if run_id is None:
-        return False
+        return None
     session.execute(
         text(
             "SELECT id FROM workflow_runs "
@@ -839,9 +840,28 @@ def _lock_visible_approval(session: Session, auth: AuthContext, approval_id: UUI
         ),
         {"workspace_id": auth.workspace_id, "id": run_id},
     )
-    return run_visibility.run_visible(session, auth, run_id, lock_version=True) and authz.authorize(
+    version_id = run_visibility.visible_run_version_id(session, auth, run_id, lock_version=True)
+    if version_id is None or not authz.authorize(
         session, auth, resource_type="approval_requests", resource_id=approval_id, action="read"
-    )
+    ):
+        return None
+    return version_id
+
+
+def _authorize_decision(session: Session, auth: AuthContext, approval_id: UUID) -> None:
+    """Read on the request, its run and the run's version (`404`), then
+    write on the request and on the version (`403`): approving lets the run
+    act and rejecting fails it, so a read-only grantee on the workflow, who
+    cannot cancel the run, cannot decide its approvals either."""
+    version_id = _lock_visible_approval(session, auth, approval_id)
+    if version_id is None:
+        raise HTTPException(status_code=404, detail="APPROVAL_NOT_FOUND")
+    if not authz.authorize(
+        session, auth, resource_type="approval_requests", resource_id=approval_id, action="write"
+    ) or not authz.authorize(
+        session, auth, resource_type="workflow_versions", resource_id=version_id, action="write"
+    ):
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
 
 @router.get("/approvals", response_model=ApprovalListResponse)
@@ -875,16 +895,7 @@ def approve_endpoint(
         # pass, so a caller who has since lost access (removed, suspended,
         # demoted, or no longer able to see the row or its run) never has a
         # cached success replayed.
-        if not _lock_visible_approval(session, auth, approval_id):
-            raise HTTPException(status_code=404, detail="APPROVAL_NOT_FOUND")
-        if not authz.authorize(
-            session,
-            auth,
-            resource_type="approval_requests",
-            resource_id=approval_id,
-            action="write",
-        ):
-            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        _authorize_decision(session, auth, approval_id)
 
         # After authz, before the state checks in the helper below: a
         # same-key replay of a successful call finds the row already
@@ -979,16 +990,7 @@ def reject_endpoint(
         # pass, so a caller who has since lost access (removed, suspended,
         # demoted, or no longer able to see the row or its run) never has a
         # cached success replayed.
-        if not _lock_visible_approval(session, auth, approval_id):
-            raise HTTPException(status_code=404, detail="APPROVAL_NOT_FOUND")
-        if not authz.authorize(
-            session,
-            auth,
-            resource_type="approval_requests",
-            resource_id=approval_id,
-            action="write",
-        ):
-            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        _authorize_decision(session, auth, approval_id)
 
         # After authz, before the state checks in the helper below: a
         # same-key replay of a successful call finds the row already

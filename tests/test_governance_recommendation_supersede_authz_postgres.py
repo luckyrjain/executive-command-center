@@ -15,20 +15,29 @@ list endpoints use: rows the caller can see and change are superseded as
 before; another member's private row, or one shared with the caller
 read-only, stays live and untouched.
 
+A grant revoked while the create waits on the row lock is honoured too:
+the supersede locks its candidate rows and only then authorizes each one,
+because a revoke locks the recommendation row without changing it, so a
+filter evaluated inside the locking statement would still see the grant.
+Rows the caller can read but not write are not locked at all.
+
 B (`admin`) is the caller; C (`member`) owns the target task.
 """
 
 from __future__ import annotations
 
+import threading
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from json import dumps
 from typing import Any
 from uuid import UUID, uuid4
 
+import lock_race_support
 import pytest
 from fastapi.testclient import TestClient
-from lock_race_support import RaceWorld, headers, race_world, row_snapshot
+from lock_race_support import RaceWorld, headers, race, race_world, row_snapshot
 from sqlalchemy import Connection, text
 
 from ecc.config import get_settings
@@ -213,3 +222,157 @@ def test_create_still_supersedes_recommendations_the_caller_can_write(
         assert row["version"] == 2
         assert row["updated_by"] == world.b
     assert _superseded_event_ids(world.ws) == set(superseded)
+
+
+def _select_or_update_waiters(table: str, *, holder_pid: int) -> int:
+    """Backends blocked by `holder_pid` on a row lock while running the
+    supersede's locking `SELECT id FROM <table>` or, before #383, its plain
+    `UPDATE <table>`. Matched on the statement's start, not on a trailing
+    `FOR UPDATE` like the shared probe: `pg_stat_activity.query` is cut at
+    `track_activity_query_size` (1 kB by default), and the SELECT with its
+    two inlined authz filters is longer than that."""
+    with engine.connect() as probe:
+        return int(
+            probe.execute(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname = current_database() AND wait_event_type = 'Lock' "
+                    "AND wait_event IN ('transactionid', 'tuple') "
+                    "AND pg_blocking_pids(pid) @> ARRAY[CAST(:holder AS integer)] "
+                    "AND query ~* :pattern"
+                ),
+                {"holder": holder_pid, "pattern": f"^\\s*(SELECT id FROM|UPDATE) {table}\\s"},
+            ).scalar_one()
+        )
+
+
+def _wait_for_select_or_update_waiter(table: str, *, holder_pid: int) -> None:
+    deadline = time.monotonic() + lock_race_support.WAIT_SECONDS
+    while True:
+        if _select_or_update_waiters(table, holder_pid=holder_pid) >= 1:
+            return
+        if time.monotonic() > deadline:
+            raise AssertionError(f"create never blocked on the {table} row lock")
+        time.sleep(0.05)
+
+
+def _create_request(w: RaceWorld, task_id: UUID) -> Any:
+    def send(client: TestClient) -> Any:
+        return client.post(
+            "/api/v1/recommendations",
+            headers=headers(w.b_token),
+            json={
+                "recommendation_type": "probe",
+                "target_type": "task",
+                "target_id": str(task_id),
+                "proposed_action": ACTION,
+                "expected_version": 1,
+                "rationale": "Caller rationale.",
+                "confidence": 0.5,
+                "evidence_ids": [],
+                "source": "rule",
+            },
+        )
+
+    return send
+
+
+@pytest.mark.parametrize("revoke", [True, False])
+def test_grant_revoked_while_the_create_waits_on_the_row_lock_is_honoured(
+    world: RaceWorld, monkeypatch: pytest.MonkeyPatch, revoke: bool
+) -> None:
+    """The holder locks C's recommendation `FOR UPDATE`, as
+    `revoke_grant_endpoint` does, and (when `revoke`) revokes B's read+write
+    grant in the same transaction while B's create waits on that lock. Once
+    it commits, B can no longer write the row, so it must stay live. Control
+    (no revoke): the same wait still supersedes it."""
+    monkeypatch.setattr(
+        lock_race_support, "wait_for_lock_waiter", _wait_for_select_or_update_waiter
+    )
+    with engine.begin() as connection:
+        task_id = _seed_task(connection, world)
+        c_shared = _seed_recommendation(
+            connection, world, task_id=task_id, owner=world.c, visibility="shared_explicitly"
+        )
+        _grant(connection, world, c_shared, ["read", "write"])
+
+    def revoke_grant(holder: Connection) -> object:
+        return holder.execute(
+            text(
+                "UPDATE resource_grants SET revoked_at = now() "
+                "WHERE resource_type = 'recommendations' AND resource_id = :rid"
+            ),
+            {"rid": c_shared},
+        )
+
+    response, before = race(
+        world,
+        table="recommendations",
+        row_id=c_shared,
+        send=_create_request(world, task_id),
+        transfer=False,
+        mutate=revoke_grant if revoke else None,
+    )
+
+    assert response.status_code == 201, response.text
+    after = row_snapshot("recommendations", c_shared)
+    if revoke:
+        assert after == before
+        assert c_shared not in _superseded_event_ids(world.ws)
+    else:
+        assert after["status"] == "superseded"
+        assert after["updated_by"] == world.b
+        assert _superseded_event_ids(world.ws) == {c_shared}
+
+
+def test_create_does_not_lock_a_row_shared_with_the_caller_read_only(
+    world: RaceWorld,
+) -> None:
+    """C's recommendation shared with B read-only is never superseded by B,
+    so B's create must not take its row lock either: with the row held
+    `FOR UPDATE` elsewhere, the create finishes without queuing behind it.
+    Before, the locking SELECT filtered on read access only, so B's create
+    locked (here: waited on) a row it could never supersede."""
+    with engine.begin() as connection:
+        task_id = _seed_task(connection, world)
+        c_read_only = _seed_recommendation(
+            connection, world, task_id=task_id, owner=world.c, visibility="shared_explicitly"
+        )
+        _grant(connection, world, c_read_only, ["read"])
+    before = row_snapshot("recommendations", c_read_only)
+    client = TestClient(app)
+    client.cookies.set("ecc_session", world.b_token)
+    result: dict[str, Any] = {}
+
+    def fire() -> None:
+        try:
+            result["response"] = _create_request(world, task_id)(client)
+        except BaseException as exc:  # surfaced on the main thread below
+            result["error"] = exc
+
+    holder = engine.connect()
+    holder_tx = holder.begin()
+    thread = threading.Thread(target=fire)
+    try:
+        holder_pid = lock_race_support.holder_backend_pid(holder)
+        holder.execute(
+            text("SELECT id FROM recommendations WHERE id = :id FOR UPDATE"),
+            {"id": c_read_only},
+        )
+        thread.start()
+        deadline = time.monotonic() + lock_race_support.WAIT_SECONDS
+        while thread.is_alive():
+            assert _select_or_update_waiters("recommendations", holder_pid=holder_pid) == 0, (
+                "create queued behind the lock on a row it cannot supersede"
+            )
+            assert time.monotonic() < deadline, "create never finished"
+            thread.join(timeout=0.05)
+    finally:
+        holder_tx.rollback()
+        holder.close()
+        thread.join(timeout=lock_race_support.WAIT_SECONDS)
+        client.close()
+    if "error" in result:
+        raise result["error"]
+    assert result["response"].status_code == 201, result["response"].text
+    assert row_snapshot("recommendations", c_read_only) == before
