@@ -29,6 +29,7 @@ from automation_scope_support import (
     World,
     action_step,
     client_for,
+    compensation_step,
     create_policy,
     headers,
     make_world,
@@ -37,6 +38,7 @@ from automation_scope_support import (
     run_once,
     step_rows,
 )
+from pydantic import BaseModel
 from sqlalchemy import text
 
 from ecc.config import get_settings
@@ -207,6 +209,49 @@ def test_dispatch_fails_closed_under_another_workflows_policy(world: World) -> N
     assert run.status == "needs_review"
     assert adapter.execute_calls == 0
     assert step_rows(world, run.id) == []
+
+
+class _RebindPolicyThenFail(FakeAdapter):
+    """Fails after moving the run's policy to another workflow, so the
+    compensation that follows sees a run whose policy is not its own -- the
+    state of a run dispatched under a borrowed policy before this fix."""
+
+    def __init__(self, adapter_id: str, policy_id: UUID, other_workflow_id: str) -> None:
+        super().__init__(adapter_id, mode="fail")
+        self.policy_id = policy_id
+        self.other_workflow_id = other_workflow_id
+
+    def execute(self, action_input: BaseModel) -> BaseModel:
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE automation_policies SET workflow_id = :wf WHERE id = :id"),
+                {"wf": self.other_workflow_id, "id": self.policy_id},
+            )
+        return super().execute(action_input)
+
+
+def test_compensation_fails_closed_under_another_workflows_policy(world: World) -> None:
+    done = FakeAdapter("test.done")  # no compensate(): c0's own adapter undoes s0
+    undo = FakeAdapter("test.undo")
+    workflow_id, policy = publish(
+        world,
+        {
+            "steps": [
+                action_step("s0", "test.done", compensate_ref="c0"),
+                action_step("s1", "test.failing"),
+                compensation_step("c0", "test.undo"),
+            ]
+        },
+    )
+    other_workflow_id, _ = publish(world, _graph())
+    failing = _RebindPolicyThenFail("test.failing", policy.id, other_workflow_id)
+
+    finished = run_once(world, workflow_id, registry_of(done, failing, undo))
+
+    assert finished.status == "compensation_failed"
+    assert undo.execute_calls == 0
+    errors = {row["error_class"] for row in step_rows(world, finished.id)}
+    assert "PolicyUnusableDuringCompensation" in errors
 
 
 def test_enqueue_ignores_the_rate_limit_of_another_workflows_policy(world: World) -> None:
