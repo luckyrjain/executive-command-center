@@ -369,16 +369,6 @@ def create_candidate(
     with session.begin():
         authz.lock_membership_for_write(session, auth, role_action="write")
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session,
-            auth,
-            idempotency_key,
-            req_hash,
-            domain="knowledge_resolution",
-            response_model=ResolutionCandidateResult,
-        )
-        if cached is not None:
-            return cached
 
         # Proposing a review candidate must not let a caller confirm the
         # existence of an entity they cannot otherwise see -- both sides
@@ -390,6 +380,20 @@ def create_candidate(
                 session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
             ):
                 raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+
+        # After the read checks on both entities, so a caller who can no
+        # longer see either one does not have a cached proposal replayed to
+        # them (the write role itself is enforced by the membership lock).
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="knowledge_resolution",
+            response_model=ResolutionCandidateResult,
+        )
+        if cached is not None:
+            return cached
 
         # Normalize pair ordering so (A, B) and (B, A) are always the same
         # candidate row, and so a prior rejection of this unchanged pair is
@@ -703,20 +707,13 @@ def _decide_candidate(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session,
-            auth,
-            idempotency_key,
-            req_hash,
-            domain="knowledge_resolution",
-            response_model=ResolutionCandidateResponse,
-        )
-        if cached is not None:
-            return cached
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. The idempotency
+        # cache is read only after these checks too: a caller who has since
+        # lost access (removed, suspended, demoted, or no longer able to see
+        # the row) must not have a cached success replayed to them.
         current = (
             session.execute(
                 text(
@@ -762,6 +759,21 @@ def _decide_candidate(
                 session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
             ):
                 raise HTTPException(status_code=404, detail="CANDIDATE_NOT_FOUND")
+
+        # After authz, before the state/version checks: a same-key replay of a
+        # successful write finds the row already changed and must still get the
+        # cached response, not a 409.
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="knowledge_resolution",
+            response_model=ResolutionCandidateResponse,
+        )
+        if cached is not None:
+            return cached
+
         # Confirm/reject are idempotent per the contract: deciding an
         # already-decided candidate the same way returns the existing
         # record rather than erroring.
@@ -884,22 +896,13 @@ def defer_candidate(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session,
-            auth,
-            idempotency_key,
-            req_hash,
-            domain="knowledge_resolution",
-            response_model=ResolutionCandidateResponse,
-        )
-        if cached is not None:
-            return cached
-        if payload.deferred_until <= now:
-            raise HTTPException(status_code=422, detail="DEFER_UNTIL_MUST_BE_FUTURE")
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. The idempotency
+        # cache is read only after these checks too: a caller who has since
+        # lost access (removed, suspended, demoted, or no longer able to see
+        # the row) must not have a cached success replayed to them.
         current = (
             session.execute(
                 text(
@@ -940,6 +943,25 @@ def defer_candidate(
                 session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
             ):
                 raise HTTPException(status_code=404, detail="CANDIDATE_NOT_FOUND")
+
+        # After authz, before the state/version checks: a same-key replay of a
+        # successful write finds the row already changed and must still get the
+        # cached response, not a 409.
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="knowledge_resolution",
+            response_model=ResolutionCandidateResponse,
+        )
+        if cached is not None:
+            return cached
+
+        # Below the cache: a same-key replay of a successful defer, sent once
+        # the requested time has passed, must still get the cached 200.
+        if payload.deferred_until <= now:
+            raise HTTPException(status_code=422, detail="DEFER_UNTIL_MUST_BE_FUTURE")
         if current["status"] != "open":
             raise HTTPException(status_code=409, detail="CANDIDATE_NOT_OPEN")
         if current["deferred_until"] == payload.deferred_until:
