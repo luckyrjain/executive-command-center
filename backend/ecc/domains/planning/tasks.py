@@ -450,16 +450,6 @@ def update_task(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         idempotency.lock_idempotency(session, auth, idempotency_key)
-        cached = idempotency.load_cached(
-            session,
-            auth,
-            idempotency_key,
-            request_hash,
-            domain="tasks",
-            response_model=TaskResponse,
-        )
-        if cached is not None:
-            return cached
         # Two-phase read-then-write authz check: a plain existence lookup
         # then a write-only authorize() call would let a suspended member
         # distinguish 404 from 403 for a task id in their former
@@ -469,7 +459,10 @@ def update_task(
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. Ahead of the
+        # idempotency cache too: a caller who has since lost access (removed,
+        # suspended, demoted, or no longer able to see the row) must not have
+        # a cached success replayed to them.
         current = _get_task_row(session, auth, task_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="TASK_NOT_FOUND")
@@ -481,6 +474,21 @@ def update_task(
             session, auth, resource_type="tasks", resource_id=task_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+        # After authz, before the version/state checks: a same-key replay of a
+        # successful update finds the version already bumped and must get
+        # the cached 200, not a 409.
+        cached = idempotency.load_cached(
+            session,
+            auth,
+            idempotency_key,
+            request_hash,
+            domain="tasks",
+            response_model=TaskResponse,
+        )
+        if cached is not None:
+            return cached
+
         _raise_version_conflict(current, payload.expected_version)
         if current["archived_at"] is not None:
             raise HTTPException(status_code=409, detail="TASK_ARCHIVED")
@@ -705,10 +713,34 @@ def lifecycle_task_write(
     scheme; nesting a second `session.begin()` here would raise) -- mirrors
     `insert_task`'s own precedent exactly.
     """
+    current = _lock_authorized_task_row(session, auth, task_id)
+    return _apply_task_lifecycle(
+        session,
+        auth,
+        current,
+        task_id,
+        action,
+        expected_version=expected_version,
+        reason=reason,
+        request_id=request_id,
+        correlation_id=correlation_id,
+        idempotency_key=idempotency_key,
+        now=now,
+    )
+
+
+def _lock_authorized_task_row(session: Session, auth: AuthContext, task_id: UUID) -> dict[str, Any]:
+    """Lock the task row and run the read (404) and write (403) checks
+    against it, returning the locked row. Split out of
+    `lifecycle_task_write` so `_lifecycle_task` can authorize before reading
+    its idempotency cache."""
     # Lock before authorizing: an ownership transfer that commits while
     # this request waits on the row lock must be seen by the checks below
     # (READ COMMITTED: each later statement reads the committed row), not
-    # by checks that ran against the pre-transfer row.
+    # by checks that ran against the pre-transfer row. Ahead of the
+    # idempotency cache too (see `_lifecycle_task`): a caller who has since
+    # lost access (removed, suspended, demoted, or no longer able to see the
+    # task) must not have a cached success replayed to them.
     current = _get_task_row(session, auth, task_id, for_update=True)
     if current is None:
         raise HTTPException(status_code=404, detail="TASK_NOT_FOUND")
@@ -720,6 +752,26 @@ def lifecycle_task_write(
         session, auth, resource_type="tasks", resource_id=task_id, action="write"
     ):
         raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+    return current
+
+
+def _apply_task_lifecycle(
+    session: Session,
+    auth: AuthContext,
+    current: dict[str, Any],
+    task_id: UUID,
+    action: Literal["complete", "cancel", "archive", "restore"],
+    *,
+    expected_version: int,
+    reason: str | None,
+    request_id: UUID,
+    correlation_id: UUID,
+    idempotency_key: str,
+    now: datetime,
+) -> TaskResponse:
+    """`lifecycle_task_write`'s guards, row write and audit/outbox emission,
+    run against a row `_lock_authorized_task_row` already locked and
+    authorized."""
     _raise_version_conflict(current, expected_version)
 
     target_reached = (
@@ -835,6 +887,10 @@ def _lifecycle_task(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         idempotency.lock_idempotency(session, auth, idempotency_key)
+        current = _lock_authorized_task_row(session, auth, task_id)
+        # After authz, before the version/state checks: a same-key replay of a
+        # successful transition finds the version already bumped and must get
+        # the cached 200, not a 409.
         cached = idempotency.load_cached(
             session,
             auth,
@@ -845,9 +901,10 @@ def _lifecycle_task(
         )
         if cached is not None:
             return cached
-        response = lifecycle_task_write(
+        response = _apply_task_lifecycle(
             session,
             auth,
+            current,
             task_id,
             action,
             expected_version=payload.expected_version,
