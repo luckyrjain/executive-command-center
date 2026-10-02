@@ -30,6 +30,8 @@ from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
 from ecc.domains.automation import approvals as automation_approvals
 from ecc.domains.automation import policy as automation_policy
+from ecc.domains.automation import scheduler as automation_scheduler
+from ecc.domains.automation import triggers as automation_triggers
 from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
 from ecc.domains.automation.adapters import AdapterRegistry
@@ -109,6 +111,7 @@ def world() -> Iterator[_World]:
                 "approval_requests",
                 "workflow_run_steps",
                 "workflow_runs",
+                "triggers",
                 "automation_policies",
                 "workflow_versions",
                 "workflow_definitions",
@@ -178,10 +181,17 @@ class _HighImpactAdapter:
 
 
 def _pause_run(
-    world: _World, starter: UUID
+    world: _World,
+    starter: UUID,
+    *,
+    author: UUID | None = None,
+    scheduled: bool = False,
 ) -> tuple[automation_approvals.ApprovalRequest, _HighImpactAdapter, AdapterRegistry]:
-    """Publish a one-step high-impact workflow, let `starter` start it, and
-    run it to its `waiting_approval` pause."""
+    """`author` (default: `starter`) publishes a one-step high-impact
+    workflow; `starter` starts it -- manually, or (`scheduled`) by owning a
+    schedule trigger the scheduler fires -- and it runs to its
+    `waiting_approval` pause."""
+    author = author if author is not None else starter
     workflow_id = f"test.distinct-approver.{uuid4().hex}"
     step = {
         "step_id": "s1",
@@ -195,7 +205,7 @@ def _pause_run(
         automation_workflows.create_workflow_draft(
             session,
             world.workspace_id,
-            starter,
+            author,
             workflow_id=workflow_id,
             graph={"steps": [step]},
             trigger_refs=[],
@@ -205,7 +215,7 @@ def _pause_run(
         policy_row = automation_policy.create_policy(
             session,
             world.workspace_id,
-            starter,
+            author,
             workflow_id=workflow_id,
             action_types=[],
             data_classes=[],
@@ -219,7 +229,7 @@ def _pause_run(
         draft = automation_workflows.create_workflow_draft(
             session,
             world.workspace_id,
-            starter,
+            author,
             workflow_id=workflow_id,
             graph={"steps": [step]},
             trigger_refs=[],
@@ -230,23 +240,48 @@ def _pause_run(
         )
     assert isinstance(activated, automation_workflows.WorkflowVersion)
 
-    with SessionFactory() as session, session.begin():
-        queued = automation_worker.enqueue_run(
-            session, world.workspace_id, starter, workflow_id=workflow_id
+    if scheduled:
+        with SessionFactory() as session, session.begin():
+            trigger = automation_triggers.create_trigger(
+                session,
+                world.workspace_id,
+                starter,
+                workflow_id=workflow_id,
+                trigger_type="schedule",
+                schedule_expression="0 * * * *",
+                timezone="UTC",
+            )
+        with engine.begin() as connection:
+            connection.execute(
+                text("UPDATE triggers SET created_at = :at WHERE id = :id"),
+                {"at": datetime(2026, 3, 1, 0, 0, tzinfo=UTC), "id": trigger.id},
+            )
+        automation_scheduler.run_scheduler_once(
+            SessionFactory, now=datetime(2026, 3, 1, 1, 30, tzinfo=UTC)
         )
-    assert isinstance(queued, automation_worker.WorkflowRun)
+        with engine.connect() as connection:
+            run_id, created_by = connection.execute(
+                text("SELECT id, created_by FROM workflow_runs WHERE trigger_ref = :ref"),
+                {"ref": f"schedule:{trigger.id}"},
+            ).one()
+        assert created_by == starter
+    else:
+        with SessionFactory() as session, session.begin():
+            queued = automation_worker.enqueue_run(
+                session, world.workspace_id, starter, workflow_id=workflow_id
+            )
+        assert isinstance(queued, automation_worker.WorkflowRun)
+        run_id = queued.id
     adapter = _HighImpactAdapter()
     registry = AdapterRegistry()
     registry.register(adapter)
     with SessionFactory() as session:
         claimed = automation_worker.claim_next_run(session, "worker-a")
-        assert claimed is not None and claimed.id == queued.id
+        assert claimed is not None and claimed.id == run_id
         paused = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
     assert paused.status == "waiting_approval"
     with SessionFactory() as session, session.begin():
-        pending = automation_approvals.get_pending_approval(
-            session, world.workspace_id, queued.id, 0
-        )
+        pending = automation_approvals.get_pending_approval(session, world.workspace_id, run_id, 0)
     assert pending is not None
     return pending, adapter, registry
 
@@ -341,9 +376,7 @@ def test_decide_approval_returns_self_approval_forbidden(world: _World) -> None:
             "approved",
             current_action_digest=pending.action_digest,
         )
-    assert result == automation_approvals.ApprovalSelfApprovalForbidden(
-        run_created_by=world.member.user_id
-    )
+    assert result == automation_approvals.ApprovalSelfApprovalForbidden(reason="run_starter")
 
 
 def test_setting_enabled_during_the_decision_is_applied(world: _World) -> None:
@@ -374,6 +407,50 @@ def test_setting_enabled_during_the_decision_is_applied(world: _World) -> None:
     assert adapter.execute_calls == 0
 
 
+def test_the_workflow_versions_author_cannot_approve_a_run_someone_else_started(
+    world: _World,
+) -> None:
+    _set_distinct_approver(world, True)
+    pending, adapter, registry = _pause_run(world, world.member.user_id, author=world.owner.user_id)
+
+    response = _approve(world, world.owner, pending)
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "SELF_APPROVAL_FORBIDDEN"
+    assert _approval_status(world, pending.id) == "pending"
+
+    # A third member, who neither wrote nor started it, can.
+    response = _approve(world, world.admin, pending)
+    assert response.status_code == 200, response.text
+    with SessionFactory() as session:
+        reclaimed = automation_worker.claim_next_run(session, "worker-b")
+        assert reclaimed is not None
+        finished = automation_worker.process_claimed_run(session, reclaimed, registry, "worker-b")
+    assert finished.status == "succeeded"
+    assert adapter.execute_calls == 1
+
+
+def test_scheduled_run_neither_trigger_owner_nor_author_may_approve(world: _World) -> None:
+    """The peer-review scenario: the member publishes a version of a
+    workflow, the owner's schedule trigger runs it as the owner. Neither
+    the trigger's owner (the run's starter) nor the member (the author) may
+    approve; the admin can."""
+    _set_distinct_approver(world, True)
+    pending, adapter, _registry = _pause_run(
+        world, world.owner.user_id, author=world.member.user_id, scheduled=True
+    )
+
+    for blocked, reason in ((world.owner, "run_starter"), (world.member, "version_author")):
+        response = _approve(world, blocked, pending)
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "SELF_APPROVAL_FORBIDDEN"
+        assert response.json()["error"]["details"] == {"reason": reason}
+    assert _approval_status(world, pending.id) == "pending"
+    assert adapter.execute_calls == 0
+
+    response = _approve(world, world.admin, pending)
+    assert response.status_code == 200, response.text
+
+
 # --- the workspace setting ---------------------------------------------------
 
 
@@ -395,14 +472,26 @@ def test_owner_can_turn_the_setting_on_and_off(world: _World) -> None:
             assert response.status_code == 200, response.text
             assert response.json()["require_distinct_approver"] is value
     with engine.connect() as connection:
-        changed = connection.execute(
+        rows = connection.execute(
             text(
-                "SELECT changed_fields FROM audit_events "
-                "WHERE workspace_id = :ws AND event_type = 'workspace.updated'"
+                "SELECT changed_fields, before, after FROM audit_events "
+                "WHERE workspace_id = :ws AND event_type = 'workspace.updated' "
+                "ORDER BY occurred_at"
             ),
             {"ws": world.workspace_id},
-        ).scalars()
-        assert list(changed) == [["require_distinct_approver"], ["require_distinct_approver"]]
+        ).all()
+    assert [tuple(row) for row in rows] == [
+        (
+            ["require_distinct_approver"],
+            {"require_distinct_approver": False},
+            {"require_distinct_approver": True},
+        ),
+        (
+            ["require_distinct_approver"],
+            {"require_distinct_approver": True},
+            {"require_distinct_approver": False},
+        ),
+    ]
 
 
 @pytest.mark.parametrize("role", ["admin", "member"])
@@ -433,6 +522,15 @@ def test_admin_can_still_rename_the_workspace(world: _World) -> None:
         )
     assert response.status_code == 200, response.text
     assert response.json()["name"] == "Renamed by admin"
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT changed_fields, before, after FROM audit_events "
+                "WHERE workspace_id = :ws AND event_type = 'workspace.updated'"
+            ),
+            {"ws": world.workspace_id},
+        ).one()
+    assert tuple(row) == (["name"], None, None)
 
 
 def test_turning_the_setting_on_needs_a_second_possible_approver(world: _World) -> None:

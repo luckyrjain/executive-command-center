@@ -153,6 +153,21 @@ describe('ApprovalInbox', () => {
     const fetch = vi.fn()
       .mockImplementationOnce(() => response({ approvals: [pendingApproval] }))
       .mockImplementationOnce(() => response(runDetail))
+      .mockImplementationOnce(() => response({ error: { code: 'SELF_APPROVAL_FORBIDDEN', message: 'Self Approval Forbidden', details: { reason: 'version_author' } } }, 403))
+    vi.stubGlobal('fetch', fetch)
+    renderInbox()
+
+    await waitFor(() => expect(screen.getByText(/Run run-1 · step 0/)).toBeTruthy())
+    fireEvent.change(screen.getByLabelText('Echo the action digest above to approve, run run-1 step 0'), { target: { value: 'digest-abc123' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+
+    expect(await screen.findByText(/requires a different member to approve: you wrote the workflow version/)).toBeTruthy()
+  })
+
+  it('falls back to a generic self_approval_forbidden reason when none is given', async () => {
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ approvals: [pendingApproval] }))
+      .mockImplementationOnce(() => response(runDetail))
       .mockImplementationOnce(() => response({ error: { code: 'SELF_APPROVAL_FORBIDDEN', message: 'Self Approval Forbidden' } }, 403))
     vi.stubGlobal('fetch', fetch)
     renderInbox()
@@ -161,7 +176,7 @@ describe('ApprovalInbox', () => {
     fireEvent.change(screen.getByLabelText('Echo the action digest above to approve, run run-1 step 0'), { target: { value: 'digest-abc123' } })
     fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
 
-    expect(await screen.findByText(/requires a different member to approve/)).toBeTruthy()
+    expect(await screen.findByText(/you started this run or wrote its workflow version/)).toBeTruthy()
   })
 
   it('surfaces approval_expired as a distinct state and disables both decision actions', async () => {

@@ -880,7 +880,20 @@ def patch_workspace_endpoint(
             updates["name"] = payload.name
         if payload.timezone is not None:
             updates["timezone"] = payload.timezone
+        previous_distinct_approver: bool | None = None
         if payload.require_distinct_approver is not None:
+            # The value being replaced, for the audit row's `before`. `FOR NO
+            # KEY UPDATE` (the lock the UPDATE below takes anyway, just
+            # earlier) so two owners toggling at once audit a consistent
+            # before/after pair, without blocking child-table FK checks the
+            # way `FOR UPDATE` would.
+            previous_distinct_approver = session.execute(
+                text(
+                    "SELECT require_distinct_approver FROM workspaces "
+                    "WHERE id = :workspace_id FOR NO KEY UPDATE"
+                ),
+                {"workspace_id": workspace_id},
+            ).scalar_one()
             if payload.require_distinct_approver:
                 # Turning it on with nobody else who could approve would
                 # leave every high-impact step only rejectable. (A member
@@ -916,15 +929,20 @@ def patch_workspace_endpoint(
                 # Named columns, not "*": switching the separation-of-duties
                 # control off must be distinguishable from a rename.
                 changed_fields=sorted(updates),
-                payload={
-                    "aggregate_id": str(workspace_id),
-                    "version": 1,
-                    **(
-                        {"require_distinct_approver": updates["require_distinct_approver"]}
-                        if "require_distinct_approver" in updates
-                        else {}
-                    ),
-                },
+                payload={"aggregate_id": str(workspace_id), "version": 1},
+                # The setting's old and new value in the durable audit row,
+                # so turning the control off is distinguishable from turning
+                # it on. Name/timezone values stay out, as before.
+                before=(
+                    {"require_distinct_approver": previous_distinct_approver}
+                    if "require_distinct_approver" in updates
+                    else None
+                ),
+                after=(
+                    {"require_distinct_approver": updates["require_distinct_approver"]}
+                    if "require_distinct_approver" in updates
+                    else None
+                ),
                 now=now,
                 domain="identity",
             )
