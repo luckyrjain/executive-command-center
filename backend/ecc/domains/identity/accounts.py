@@ -913,8 +913,18 @@ def patch_workspace_endpoint(
                 aggregate_type="workspace",
                 aggregate_id=workspace_id,
                 aggregate_version=1,
-                changed_fields=["*"],
-                payload={"aggregate_id": str(workspace_id), "version": 1},
+                # Named columns, not "*": switching the separation-of-duties
+                # control off must be distinguishable from a rename.
+                changed_fields=sorted(updates),
+                payload={
+                    "aggregate_id": str(workspace_id),
+                    "version": 1,
+                    **(
+                        {"require_distinct_approver": updates["require_distinct_approver"]}
+                        if "require_distinct_approver" in updates
+                        else {}
+                    ),
+                },
                 now=now,
                 domain="identity",
             )

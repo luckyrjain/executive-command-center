@@ -394,6 +394,15 @@ def test_owner_can_turn_the_setting_on_and_off(world: _World) -> None:
             )
             assert response.status_code == 200, response.text
             assert response.json()["require_distinct_approver"] is value
+    with engine.connect() as connection:
+        changed = connection.execute(
+            text(
+                "SELECT changed_fields FROM audit_events "
+                "WHERE workspace_id = :ws AND event_type = 'workspace.updated'"
+            ),
+            {"ws": world.workspace_id},
+        ).scalars()
+        assert list(changed) == [["require_distinct_approver"], ["require_distinct_approver"]]
 
 
 @pytest.mark.parametrize("role", ["admin", "member"])
