@@ -423,23 +423,16 @@ def update_meeting(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session,
-            auth,
-            idempotency_key,
-            req_hash,
-            domain="meetings",
-            response_model=MeetingResponse,
-        )
-        if cached is not None:
-            return cached
         # Two-phase read-then-write authz check -- see calendar/events.py's
         # update_calendar_event for the identical existence-leak reasoning.
         #
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. Ahead of the
+        # idempotency cache too: a caller who has since lost access (removed,
+        # suspended, demoted, or no longer able to see the row) must not have
+        # a cached success replayed to them.
         current = _get_row(session, auth, meeting_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
@@ -451,6 +444,21 @@ def update_meeting(
             session, auth, resource_type="meetings", resource_id=meeting_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+        # After authz, before the version/state checks: a same-key replay of a
+        # successful update finds the version already bumped and must get
+        # the cached 200, not a 409.
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="meetings",
+            response_model=MeetingResponse,
+        )
+        if cached is not None:
+            return cached
+
         if current["version"] != payload.expected_version:
             raise HTTPException(
                 status_code=409,
@@ -569,20 +577,13 @@ def _lifecycle(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session,
-            auth,
-            idempotency_key,
-            req_hash,
-            domain="meetings",
-            response_model=MeetingResponse,
-        )
-        if cached is not None:
-            return cached
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. Ahead of the
+        # idempotency cache too: a caller who has since lost access (removed,
+        # suspended, demoted, or no longer able to see the row) must not have
+        # a cached success replayed to them.
         current = _get_row(session, auth, meeting_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
@@ -594,6 +595,20 @@ def _lifecycle(
             session, auth, resource_type="meetings", resource_id=meeting_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+        # After authz, before the version/state checks (a replay finds the
+        # version already bumped) -- see update_meeting.
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="meetings",
+            response_model=MeetingResponse,
+        )
+        if cached is not None:
+            return cached
+
         if current["version"] != payload.expected_version:
             raise HTTPException(
                 status_code=409,
