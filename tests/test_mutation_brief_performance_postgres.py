@@ -19,6 +19,7 @@ and ``docs/phases/phase-001/TEST-PLAN.md:57`` for the exact budgets.
 """
 
 import os
+import warnings
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -163,11 +164,15 @@ def _assert_p95_under_budget(
     first_p95, first_samples = _measure_pass(workspace_id, user_id, request_once, key_prefix)
     if first_p95 < budget_seconds:
         return
-    print(
-        f"\n[{name} budget] initial pass p95 {first_p95 * 1000:.1f} ms exceeded "
-        f"{budget_seconds * 1000:.0f} ms budget; retrying once with a fresh "
-        f"measurement pass before failing. samples(ms)="
-        f"{[round(s * 1000, 1) for s in first_samples]}"
+    # A warning, not a print: pytest captures stdout of passing tests, so a
+    # pass-on-retry would otherwise leave no trace in CI. The warnings summary
+    # is shown even when the test passes.
+    warnings.warn(
+        f"[{name} budget] initial pass p95 {first_p95 * 1000:.1f} ms exceeded "
+        f"{budget_seconds * 1000:.0f} ms budget (in_ci={_IN_CI}); retrying once with a "
+        f"fresh measurement pass before failing. samples(ms)="
+        f"{[round(s * 1000, 1) for s in first_samples]}",
+        stacklevel=2,
     )
     p95, samples = _measure_pass(workspace_id, user_id, request_once, f"{key_prefix}-retry")
     assert p95 < budget_seconds, (
