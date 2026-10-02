@@ -203,7 +203,7 @@ tests:
         exp_alerts: []
 ```
 
-This test has not been run here: promtool is not available in this environment. Run it before loading the rules.
+Run with promtool 3.15.0 on 2026-10-02: `promtool check rules` (9 rules) and `promtool test rules` both pass. The same first case with a lazily created series (`_x90 1x120`, the pre-#355 behaviour) fails, so the test depends on the counters being pre-initialised. Re-run it whenever the rules change.
 
 ## Revoke-error evidence
 
@@ -235,7 +235,7 @@ No log line carries an email or account id. When the audit event is missing, ide
 
 | Version | Date | Summary | Author |
 |---|---|---|---|
-| 1.4.0 | 2026-10-01 | The Spec A counters are pre-initialised at 0 at process start (#355), so the new-series terms are removed and every rule is plain `increase()`. Kept a note on why they existed and the remaining gaps (an event before a restarted process's first scrape that brings it back to the old value; lazily created engineering-provider series). The promtool test now starts the series at 0. Identity-mismatch, owner-conflict and access-denied alerts now stay firing for a day, not about 5 minutes | Lucky Jain |
+| 1.4.0 | 2026-10-01 | The Spec A counters are pre-initialised at 0 at process start (#355), so the new-series terms are removed and every rule is plain `increase()`. Kept a note on why they existed and the remaining gaps (an event before a restarted process's first scrape that brings it back to the old value; lazily created engineering-provider series). The promtool test now starts the series at 0 and passes under promtool. Identity-mismatch, owner-conflict and access-denied alerts now stay firing for a day, not about 5 minutes | Lucky Jain |
 | 1.3.0 | 2026-10-01 | PR review: revoke errors are real by default; new "Revoke-error evidence" table lists every log line (and audit event, if any) per site, and a false positive needs an empty log search; a failed safety check counts `error` except at `adapter_callback` and `removal`; owner-conflict refusals are `skipped_unsafe` only while the other row is live; canary first action confirms user-side removal before recording it benign | Lucky Jain |
 | 1.2.0 | 2026-10-01 | Review fix (also: a fresh TSDB or replaced Prometheus server listed as a one-off false-positive cause): the new-series term is now `X unless last_over_time(X[55m] offset 5m)` (range selectors skip staleness markers and gaps), so a scrape gap or stale marker no longer re-fires existing series; a new series fires for about 5 minutes; remaining false positives (gap over 55 minutes, relabelling) documented; promtool test gains a stale/gap case | Lucky Jain |
 | 1.1.0 | 2026-10-01 | Review fix: counters create each label set lazily at 1, so `increase()` alone misses the first event after every restart. Revoke-failed, canary, identity-mismatch, owner-conflict and access-denied rules gain a new-series term (`X unless X offset 55m`). Documented the remaining blind spot until counters are pre-initialised, and added a promtool unit-test snippet | Lucky Jain |
