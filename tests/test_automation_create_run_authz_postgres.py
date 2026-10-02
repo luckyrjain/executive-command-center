@@ -500,6 +500,62 @@ def test_run_waiting_on_active_row_lock_sees_committed_visibility(world: World) 
     assert _run_count(world.ws, workflow_id) == 0
 
 
+def test_run_waiting_on_active_row_lock_sees_committed_publish(world: World) -> None:
+    """A publish (as activate_workflow_version: retire the active row,
+    promote a draft) commits while the request waits on the active row.
+    The waiting statement then matches neither row, so the request must
+    re-read and run the newly active version rather than fail closed
+    with a spurious 409."""
+    workflow_id = f"authz.publish.{uuid4().hex[:8]}"
+    active = _publish_workflow(world, workflow_id)
+    with SessionFactory() as session, session.begin():
+        draft = automation_workflows.create_workflow_draft(
+            session,
+            world.ws,
+            world.b,
+            workflow_id=workflow_id,
+            graph=active.graph,
+            trigger_refs=[],
+            policy_ref=active.policy_ref,
+        )
+    result: dict[str, Any] = {}
+    holder = engine.connect()
+    holder_tx = holder.begin()
+    thread: threading.Thread | None = None
+    try:
+        holder_pid = int(holder.execute(text("SELECT pg_backend_pid()")).scalar_one())
+        holder.execute(
+            text("SELECT id FROM workflow_versions WHERE id = :id FOR UPDATE"), {"id": active.id}
+        )
+        holder.execute(
+            text("UPDATE workflow_versions SET status = 'retired' WHERE id = :id"),
+            {"id": active.id},
+        )
+        holder.execute(
+            text("UPDATE workflow_versions SET status = 'active' WHERE id = :id"),
+            {"id": draft.id},
+        )
+        thread = _fire(world.c_token, workflow_id, result)
+        deadline = time.monotonic() + _WAIT_SECONDS
+        while _blocked_on(holder_pid) < 1:
+            assert time.monotonic() < deadline, "run request never blocked on the row lock"
+            time.sleep(0.05)
+        holder_tx.commit()
+    finally:
+        if holder_tx.is_active:
+            holder_tx.rollback()
+        holder.close()
+        if thread is not None:
+            thread.join(timeout=_WAIT_SECONDS)
+    assert thread is not None and not thread.is_alive(), "run request never finished"
+    if "error" in result:
+        raise result["error"]
+    status, body = result["response"]
+    assert status == 201, body
+    assert body["workflow_version"] == draft.version
+    assert _run_count(world.ws, workflow_id) == 1
+
+
 def test_concurrent_runs_do_not_block_each_other(world: World) -> None:
     """The lock is FOR SHARE: another run holding it does not block this one."""
     workflow_id = f"authz.shared.{uuid4().hex[:8]}"

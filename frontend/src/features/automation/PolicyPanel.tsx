@@ -25,6 +25,20 @@ const CREATE_STEP_LABELS: Record<(typeof CREATE_STEPS)[number], string> = { scop
 const CREATE_ERROR_ID = 'create-policy-error'
 const DATA_CLASS_LABEL = 'Highest data class allowed'
 
+function createErrorMessage(error: unknown): string {
+  if (error instanceof ApiError && error.code === 'INSUFFICIENT_ROLE') {
+    return 'You can see this workflow but not change it, so you cannot attach a policy to it.'
+  }
+  return errorMessage(error)
+}
+
+function revokeErrorMessage(error: unknown): string {
+  if (error instanceof ApiError && error.code === 'INSUFFICIENT_ROLE') {
+    return 'You do not have permission to revoke this policy.'
+  }
+  return errorMessage(error)
+}
+
 function errorMessage(error: unknown): string {
   if (error instanceof ApiError && error.code === 'POLICY_REVOKED') {
     const details = error.current as { revoked_at?: string } | undefined
@@ -40,8 +54,8 @@ function errorMessage(error: unknown): string {
   }
   return apiErrorMessage(error, {
     POLICY_SCOPE_EMPTY: 'Choose at least one action type and the highest data class this policy allows.',
-    WORKFLOW_NOT_FOUND: 'That workflow ID does not exist in this workspace yet -- draft the workflow first.',
-    POLICY_NOT_FOUND: 'That policy no longer exists in this workspace.',
+    WORKFLOW_NOT_FOUND: 'No workflow with this ID exists in this workspace that you can see. Check the ID.',
+    POLICY_NOT_FOUND: 'That policy no longer exists in this workspace, or you can no longer see its workflow.',
     OFFLINE: 'You are offline, so policies could not be read or changed.',
     NETWORK_ERROR: 'Could not reach the server, so policies could not be read or changed.',
     '401': 'Your session is no longer valid. Sign in again to review policies.',
@@ -166,7 +180,7 @@ export default function PolicyPanel() {
       {query.isLoading ? <p role="status">Loading policies…</p> : null}
       {query.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(query.error)}</div> : null}
       {query.data && policies.length === 0 ? <p className="empty-state">No policies recorded yet.</p> : null}
-      {revokeMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(revokeMutation.error)}</div> : null}
+      {revokeMutation.isError ? <div role="alert" className="inline-status error-panel">{revokeErrorMessage(revokeMutation.error)}</div> : null}
 
       <ol className="work-list">
         {policies.map((policy) => (
@@ -199,7 +213,7 @@ export default function PolicyPanel() {
       <form ref={createFormRef} noValidate onSubmit={attemptCreate} aria-labelledby="create-policy-title">
         <h3 id="create-policy-title">Create a policy</h3>
         {formError ? <div id={CREATE_ERROR_ID} role="alert" className="inline-status error-panel">{formError}</div> : null}
-        {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div> : null}
+        {createMutation.isError ? <div role="alert" className="inline-status error-panel">{createErrorMessage(createMutation.error)}</div> : null}
 
         <ol className="wizard-stepper" aria-label="Create policy progress">
           {CREATE_STEPS.map((step, i) => (

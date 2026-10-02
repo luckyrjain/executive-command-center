@@ -56,7 +56,7 @@ function statusDescription(status: RunStatus): string {
   }
 }
 
-function errorMessage(error: unknown): string {
+function errorMessage(error: unknown, overrides: Record<string, string> = {}): string {
   if (error instanceof ApiError) {
     const details = error.current as { workflow_id?: string; status?: string; limit?: number } | undefined
     if (error.code === 'WORKFLOW_NOT_ACTIVE') return `Workflow "${details?.workflow_id ?? ''}" has no active version -- publish a version before running it.`
@@ -71,7 +71,15 @@ function errorMessage(error: unknown): string {
   return apiErrorMessage(error, {
     RUN_NOT_FOUND: 'This run no longer exists in this workspace.',
     WORKFLOW_NOT_FOUND: 'No workflow with this id exists in this workspace that you can run.',
+    ...overrides,
   })
+}
+
+// Start-run only: a 403 there means the caller can read the workflow but
+// lacks write on it (or a write-capable workspace role), not a generic
+// role refusal. Pause/resume/cancel keep the generic copy.
+const CREATE_RUN_ERRORS: Record<string, string> = {
+  INSUFFICIENT_ROLE: 'You can view this workflow but not run it -- ask its owner for write access (or a workspace admin, if your workspace role is read-only).',
 }
 
 function RunDetailView({ run }: { run: RunDetail }) {
@@ -239,7 +247,7 @@ export default function RunWorkspace() {
           </label>
           <button type="submit" aria-busy={createMutation.isPending} disabled={createMutation.isPending || !workflowId.trim()}>{createMutation.isPending ? 'Starting…' : 'Start run'}</button>
         </form>
-        {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div> : null}
+        {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error, CREATE_RUN_ERRORS)}</div> : null}
 
         <div className="field-form">
           <label>Filter by status

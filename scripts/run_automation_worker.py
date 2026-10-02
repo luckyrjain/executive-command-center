@@ -98,6 +98,14 @@ def main() -> int:
                     # Rolled back (e.g. a lock wait behind a long member
                     # removal); the next tick retries the same occurrence.
                     print(f"{worker_id}\tscheduler\tdeferred\t{outcome.trigger_id}")
+                elif isinstance(outcome, scheduler_module.TriggerFireFailedActorUnauthorized):
+                    # The trigger's creator lost read/write on the workflow
+                    # (transfer, visibility change, revoked grant); audited
+                    # as `trigger.fire_denied`, no run written.
+                    print(
+                        f"{worker_id}\tscheduler\tcreator-unauthorized\t"
+                        f"{outcome.trigger_id}\t{outcome.workflow_id}\t{outcome.denied_action}"
+                    )
                 elif isinstance(outcome, scheduler_module.TriggerFireFailedRateLimited):
                     # Enqueue-time rate limiting (`worker.RunRateLimited`).
                     # Printed rather than silently dropped specifically

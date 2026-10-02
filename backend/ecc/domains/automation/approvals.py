@@ -153,6 +153,7 @@ from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 from ecc.platform.request_models import EmptyBody as _EmptyBody
 
+from . import run_visibility
 from .adapter_contract import DATA_CLASSES, data_class_rank
 from .adapters import ActionAdapter
 from .policy import AutomationPolicy
@@ -366,20 +367,37 @@ def list_approvals(
     *,
     status_filter: StoredStatus | None = None,
 ) -> list[ApprovalRequest]:
-    extra_clauses = []
-    extra_params: dict[str, Any] = {}
-    if status_filter is not None:
-        extra_clauses.append("status = :status_filter")
-        extra_params["status_filter"] = status_filter
-    rows = authz.list_visible_resources(
+    """Each request is filtered by its own visibility and by its run's
+    (`run_visibility`): every request row is `visibility='workspace'`, but
+    its digest and categories are the run's workflow's."""
+    approval_sql, approval_params = authz.visible_resource_filter_sql(
         session,
         auth,
-        columns=_APPROVAL_FIELDS,
         resource_type="approval_requests",
-        order_by="requested_at ASC",
-        extra_clauses=extra_clauses,
-        extra_params=extra_params,
+        action="read",
+        table_alias="approval_requests",
+        param_prefix="approval_",
     )
+    run_sql, run_params = run_visibility.visible_runs_filter_sql(session, auth)
+    # Static SQL text: the status filter is a bound parameter either way.
+    query = text(
+        f"SELECT {_APPROVAL_FIELDS} FROM approval_requests "  # noqa: S608 -- constants and authz fragments only
+        "WHERE approval_requests.workspace_id = :workspace_id "
+        f"AND {approval_sql} "
+        "AND EXISTS (SELECT 1 FROM workflow_runs "
+        "WHERE workflow_runs.workspace_id = approval_requests.workspace_id "
+        f"AND workflow_runs.id = approval_requests.run_id AND {run_sql}) "
+        "AND (CAST(:status_filter AS text) IS NULL "
+        "OR approval_requests.status = :status_filter) "
+        "ORDER BY requested_at ASC"
+    )
+    params: dict[str, Any] = {
+        **approval_params,
+        **run_params,
+        "workspace_id": auth.workspace_id,
+        "status_filter": status_filter,
+    }
+    rows = session.execute(query, params).mappings().all()
     return [_row_to_approval(dict(row)) for row in rows]
 
 
@@ -794,6 +812,58 @@ def _advance_run_after_decision(
     )
 
 
+def _lock_visible_approval(session: Session, auth: AuthContext, approval_id: UUID) -> UUID | None:
+    """Locks the request, its run and the run's pinned version, in that
+    order (`decide_approval` and `_advance_run_after_decision` lock the
+    first two in the same order), then checks read on all three. Returns
+    the pinned version's id when all three are readable, else `None`.
+
+    Lock before authorizing: an ownership transfer or visibility change
+    that commits while this waits on a lock must be seen by the checks
+    (READ COMMITTED: each later statement reads the committed row), not by
+    checks that ran against the pre-change row. (`decide_approval` and
+    `_advance_run_after_decision` re-select the first two rows FOR UPDATE:
+    no-op re-locks within this transaction.)"""
+    run_id = session.execute(
+        text(
+            "SELECT run_id FROM approval_requests "
+            "WHERE workspace_id = :workspace_id AND id = :id FOR UPDATE"
+        ),
+        {"workspace_id": auth.workspace_id, "id": approval_id},
+    ).scalar_one_or_none()
+    if run_id is None:
+        return None
+    session.execute(
+        text(
+            "SELECT id FROM workflow_runs "
+            "WHERE workspace_id = :workspace_id AND id = :id FOR UPDATE"
+        ),
+        {"workspace_id": auth.workspace_id, "id": run_id},
+    )
+    version_id = run_visibility.visible_run_version_id(session, auth, run_id, lock_version=True)
+    if version_id is None or not authz.authorize(
+        session, auth, resource_type="approval_requests", resource_id=approval_id, action="read"
+    ):
+        return None
+    return version_id
+
+
+def _authorize_decision(session: Session, auth: AuthContext, approval_id: UUID) -> None:
+    """Read on the request, its run and the run's version (`404`), then
+    write on the request and on the version (`403`): approving lets the run
+    act and rejecting fails it, so a read-only grantee on the workflow, who
+    cannot cancel the run, cannot decide its approvals either."""
+    version_id = _lock_visible_approval(session, auth, approval_id)
+    if version_id is None:
+        raise HTTPException(status_code=404, detail="APPROVAL_NOT_FOUND")
+    if not authz.authorize(
+        session, auth, resource_type="approval_requests", resource_id=approval_id, action="write"
+    ) or not authz.authorize(
+        session, auth, resource_type="workflow_versions", resource_id=version_id, action="write"
+    ):
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+
 @router.get("/approvals", response_model=ApprovalListResponse)
 def list_approvals_endpoint(
     auth: AuthDep,
@@ -821,36 +891,11 @@ def approve_endpoint(
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
 
-        # Lock before authorizing: an ownership transfer that commits while
-        # this request waits on the row lock must be seen by the checks below
-        # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row. Ahead of the
-        # idempotency cache too: it is read only after these checks pass, so
-        # a caller who has since lost access (removed, suspended, demoted, or
-        # no longer able to see the row) never has a cached success replayed.
-        # (`decide_approval` re-selects this row FOR UPDATE below:
-        # a no-op re-lock within this transaction.)
-        locked = session.execute(
-            text(
-                "SELECT id FROM approval_requests "
-                "WHERE workspace_id = :workspace_id AND id = :id FOR UPDATE"
-            ),
-            {"workspace_id": auth.workspace_id, "id": approval_id},
-        ).one_or_none()
-        if locked is None:
-            raise HTTPException(status_code=404, detail="APPROVAL_NOT_FOUND")
-        if not authz.authorize(
-            session, auth, resource_type="approval_requests", resource_id=approval_id, action="read"
-        ):
-            raise HTTPException(status_code=404, detail="APPROVAL_NOT_FOUND")
-        if not authz.authorize(
-            session,
-            auth,
-            resource_type="approval_requests",
-            resource_id=approval_id,
-            action="write",
-        ):
-            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        # Ahead of the idempotency cache: it is read only after these checks
+        # pass, so a caller who has since lost access (removed, suspended,
+        # demoted, or no longer able to see the row or its run) never has a
+        # cached success replayed.
+        _authorize_decision(session, auth, approval_id)
 
         # After authz, before the state checks in the helper below: a
         # same-key replay of a successful call finds the row already
@@ -941,36 +986,11 @@ def reject_endpoint(
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
 
-        # Lock before authorizing: an ownership transfer that commits while
-        # this request waits on the row lock must be seen by the checks below
-        # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row. Ahead of the
-        # idempotency cache too: it is read only after these checks pass, so
-        # a caller who has since lost access (removed, suspended, demoted, or
-        # no longer able to see the row) never has a cached success replayed.
-        # (`decide_approval` re-selects this row FOR UPDATE below:
-        # a no-op re-lock within this transaction.)
-        locked = session.execute(
-            text(
-                "SELECT id FROM approval_requests "
-                "WHERE workspace_id = :workspace_id AND id = :id FOR UPDATE"
-            ),
-            {"workspace_id": auth.workspace_id, "id": approval_id},
-        ).one_or_none()
-        if locked is None:
-            raise HTTPException(status_code=404, detail="APPROVAL_NOT_FOUND")
-        if not authz.authorize(
-            session, auth, resource_type="approval_requests", resource_id=approval_id, action="read"
-        ):
-            raise HTTPException(status_code=404, detail="APPROVAL_NOT_FOUND")
-        if not authz.authorize(
-            session,
-            auth,
-            resource_type="approval_requests",
-            resource_id=approval_id,
-            action="write",
-        ):
-            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        # Ahead of the idempotency cache: it is read only after these checks
+        # pass, so a caller who has since lost access (removed, suspended,
+        # demoted, or no longer able to see the row or its run) never has a
+        # cached success replayed.
+        _authorize_decision(session, auth, approval_id)
 
         # After authz, before the state checks in the helper below: a
         # same-key replay of a successful call finds the row already

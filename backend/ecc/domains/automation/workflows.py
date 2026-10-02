@@ -33,7 +33,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
 from json import dumps
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
@@ -59,6 +59,7 @@ from .policy import (
     get_policy_for_workflow,
     is_policy_usable,
     policy_status,
+    policy_visible,
 )
 
 # Task 7a: safe to import `.adapters`/`.policy`/`.approvals` here -- confirmed
@@ -1065,6 +1066,31 @@ def _to_response(version: WorkflowVersion) -> WorkflowVersionResponse:
     )
 
 
+def lock_active_version(
+    session: Session, select_sql: str, lock_clause: str, params: dict[str, Any]
+) -> UUID | None:
+    """Locks and returns the family's active version id, or `None` when it
+    has none. A publish that commits while the locking select waits on the
+    row it retires makes that select skip the row (re-checked, no longer
+    active) without seeing the newly active one (still a draft in the
+    statement's snapshot), so `None` alone does not mean "no active
+    version". A fresh, unlocked statement settles it; if it finds one, lock
+    that instead. That publish has committed, so locking its row cannot
+    deadlock with it. A row the locking select does return is active and
+    stays so while the lock is held. Each extra pass needs yet another
+    publish to have committed in between, so the loop ends.
+
+    `select_sql` must select one id filtered on `status = 'active'`;
+    `lock_clause` is the row lock to take (`FOR UPDATE`, `FOR SHARE`, ...).
+    """
+    while True:
+        locked = session.execute(text(f"{select_sql} {lock_clause}"), params).scalar_one_or_none()
+        if locked is not None:
+            return cast(UUID, locked)
+        if session.execute(text(select_sql), params).scalar_one_or_none() is None:
+            return None
+
+
 def _lock_and_authorize_family(session: Session, auth: AuthContext, workflow_id: str) -> None:
     """Gate appending a draft to an existing `workflow_id` family: the
     caller must be able to read (else `404 WORKFLOW_NOT_FOUND`) and write
@@ -1113,14 +1139,14 @@ def _lock_and_authorize_family(session: Session, auth: AuthContext, workflow_id:
         ),
         params,
     ).scalar_one_or_none()
-    active_id = session.execute(
-        text(
-            "SELECT id FROM workflow_versions "
-            "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id "
-            "AND status = 'active' FOR UPDATE"
-        ),
+    active_id = lock_active_version(
+        session,
+        "SELECT id FROM workflow_versions "
+        "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id "
+        "AND status = 'active'",
+        "FOR UPDATE",
         params,
-    ).scalar_one_or_none()
+    )
     version_ids = list(dict.fromkeys(v for v in (latest_id, active_id) if v is not None))
     for version_id in version_ids:
         if not authz.authorize(
@@ -1134,23 +1160,32 @@ def _lock_and_authorize_family(session: Session, auth: AuthContext, workflow_id:
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
 
-def _lock_and_authorize_policy_ref(session: Session, auth: AuthContext, policy_ref: UUID) -> None:
-    """A `policy_ref` must name a policy the caller can read: one that does
-    not exist and one they cannot see both answer `404 POLICY_NOT_FOUND`,
-    so the reference cannot be used to probe for policy ids. Read, not
-    write: the draft only points at the policy. `FOR SHARE` holds off a
-    visibility or ownership change until this transaction ends.
+def _lock_policy_ref(session: Session, auth: AuthContext, policy_ref: UUID) -> None:
+    """Locks the `policy_ref` row `FOR SHARE`, holding off a visibility or
+    ownership change until this transaction ends. Taken before the family
+    locks: revoke locks the policy and then its workflow's version, so
+    taking the policy after this family's versions would deadlock with a
+    revoke of a policy bound to the same workflow. A missing row is
+    answered by `_authorize_policy_ref`, after the family checks.
     """
-    locked = session.execute(
+    session.execute(
         text(
             "SELECT id FROM automation_policies "
             "WHERE workspace_id = :workspace_id AND id = :id FOR SHARE"
         ),
         {"workspace_id": auth.workspace_id, "id": policy_ref},
-    ).one_or_none()
-    if locked is None or not authz.authorize(
-        session, auth, resource_type="automation_policies", resource_id=policy_ref, action="read"
-    ):
+    )
+
+
+def _authorize_policy_ref(session: Session, auth: AuthContext, policy_ref: UUID) -> None:
+    """A `policy_ref` must name a policy the caller can see
+    (`policy.policy_visible`: the policy and its workflow's governing
+    version are readable). One that does not exist and one they cannot see
+    both answer `404 POLICY_NOT_FOUND`, so the reference cannot be used to
+    probe for policy ids. Read, not write: the draft only points at the
+    policy.
+    """
+    if not policy_visible(session, auth, policy_ref):
         raise HTTPException(status_code=404, detail="POLICY_NOT_FOUND")
 
 
@@ -1159,10 +1194,11 @@ def _require_policy_of_family(
 ) -> None:
     """A `policy_ref` must name a policy of the draft's own workflow
     family, else `422 POLICY_WORKFLOW_MISMATCH`. Runs after
-    `_lock_and_authorize_policy_ref`, so only a policy the caller can
-    already read reaches it and the 422 discloses nothing new. Without it,
-    a member could point their own workflow at a policy someone created
-    for another one and run under its authority (`API-SCHEMAS.md`'s confused-deputy rule)."""
+    `_authorize_policy_ref`, so only a policy the caller can already see
+    reaches it and the 422 discloses nothing new. Without it, a member
+    could point their own workflow at a policy someone created for another
+    one and run under its authority (`API-SCHEMAS.md`'s confused-deputy
+    rule)."""
     policy = get_policy(session, auth.workspace_id, policy_ref)
     if policy is not None and policy.workflow_id != workflow_id:
         raise HTTPException(
@@ -1189,17 +1225,16 @@ def _authorize_retiring_active_version(
     visible draft as missing. A 403 here discloses only that the active
     version is not theirs to change.
     """
-    active_id = session.execute(
-        text(
-            "SELECT a.id FROM workflow_versions AS a "
-            "JOIN workflow_versions AS t "
-            "  ON t.workspace_id = a.workspace_id AND t.workflow_id = a.workflow_id "
-            "WHERE t.workspace_id = :workspace_id AND t.id = :id "
-            "AND a.status = 'active' AND a.id <> t.id "
-            "FOR UPDATE OF a"
-        ),
+    active_id = lock_active_version(
+        session,
+        "SELECT a.id FROM workflow_versions AS a "
+        "JOIN workflow_versions AS t "
+        "  ON t.workspace_id = a.workspace_id AND t.workflow_id = a.workflow_id "
+        "WHERE t.workspace_id = :workspace_id AND t.id = :id "
+        "AND a.status = 'active' AND a.id <> t.id",
+        "FOR UPDATE OF a",
         {"workspace_id": auth.workspace_id, "id": version_id},
-    ).scalar_one_or_none()
+    )
     if active_id is None:
         return
     if not authz.authorize(
@@ -1311,7 +1346,7 @@ def create_workflow_endpoint(
     Appending to an existing family requires read and write on its latest
     and active versions, and a `policy_ref` must be readable and govern
     this same `workflow_id` (`_lock_and_authorize_family`/
-    `_lock_and_authorize_policy_ref`/`_require_policy_of_family`). All
+    `_authorize_policy_ref`/`_require_policy_of_family`). All
     run before the idempotency cache, so a same-key replay is
     re-authorized (ADR-0014).
     """
@@ -1328,9 +1363,11 @@ def create_workflow_endpoint(
     with session.begin():
         authz.lock_membership_for_write(session, auth, role_action="write")
         lock_idempotency(session, auth, idempotency_key)
+        if payload.policy_ref is not None:
+            _lock_policy_ref(session, auth, payload.policy_ref)
         _lock_and_authorize_family(session, auth, payload.workflow_id)
         if payload.policy_ref is not None:
-            _lock_and_authorize_policy_ref(session, auth, payload.policy_ref)
+            _authorize_policy_ref(session, auth, payload.policy_ref)
             _require_policy_of_family(session, auth, payload.policy_ref, payload.workflow_id)
         cached = load_cached(
             session,

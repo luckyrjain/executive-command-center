@@ -195,6 +195,22 @@ def create_recommendation(
     # the single-recommendation endpoints are superseded. Another member's
     # private (or read-only shared) pending recommendation on the same
     # target stays live: it is theirs to resolve.
+    #
+    # Lock, then authorize each row in its own statement -- not an UPDATE
+    # whose WHERE carries the authz filter. A grant revoke
+    # (`authz_grants.revoke_grant_endpoint`) locks the recommendation row
+    # but only updates `resource_grants`, never the row itself, so Postgres
+    # does not re-evaluate a waiting UPDATE's WHERE once that lock is
+    # released (it re-checks only rows that changed): the filter's grant
+    # subquery would still see the pre-revoke snapshot and supersede the
+    # row after the revoke returned. Each `authz.authorize` below is a new
+    # READ COMMITTED statement issued after the lock is granted, so it sees
+    # the committed revoke. The read and write filters on the SELECT only
+    # narrow which rows get locked (a caller never locks rows it cannot
+    # see, nor ones shared with it read-only); they are not the
+    # authorization. A stale snapshot can only make them lock a row the
+    # checks below then skip. `ORDER BY id` keeps concurrent creates on the
+    # same target locking in one order.
     read_sql, read_params = authz.visible_resource_filter_sql(
         session,
         auth,
@@ -211,13 +227,11 @@ def create_recommendation(
         table_alias="recommendations",
         param_prefix="write_",
     )
-    superseded = (
+    candidate_ids = list(
         session.execute(
             text(
                 f"""
-                UPDATE recommendations
-                SET status='superseded', version=version+1,
-                    updated_at=:now, updated_by=:actor_id
+                SELECT id FROM recommendations
                 WHERE workspace_id=:workspace_id
                   AND target_type=:target_type
                   AND target_id=:target_id
@@ -225,21 +239,56 @@ def create_recommendation(
                   AND archived_at IS NULL
                   AND {read_sql}
                   AND {write_sql}
-                RETURNING {FIELDS}
+                ORDER BY id
+                FOR UPDATE
                 """  # noqa: S608 -- authz visibility fragments; values bound
             ),
             {
-                "now": now,
-                "actor_id": auth.user_id,
                 "workspace_id": auth.workspace_id,
                 "target_type": payload.target_type,
                 "target_id": payload.target_id,
                 **read_params,
                 **write_params,
             },
+        ).scalars()
+    )
+    supersede_ids = [
+        recommendation_id
+        for recommendation_id in candidate_ids
+        if authz.authorize(
+            session,
+            auth,
+            resource_type="recommendations",
+            resource_id=recommendation_id,
+            action="read",
+        )
+        and authz.authorize(
+            session,
+            auth,
+            resource_type="recommendations",
+            resource_id=recommendation_id,
+            action="write",
+        )
+    ]
+    superseded = (
+        session.execute(
+            text(
+                f"""
+                UPDATE recommendations
+                SET status='superseded', version=version+1,
+                    updated_at=:now, updated_by=:actor_id
+                WHERE id = ANY(:ids)
+                  AND status IN ('proposed','pending_confirmation')
+                  AND archived_at IS NULL
+                RETURNING {FIELDS}
+                """  # noqa: S608 -- FIELDS is a module constant; values bound
+            ),
+            {"now": now, "actor_id": auth.user_id, "ids": supersede_ids},
         )
         .mappings()
         .all()
+        if supersede_ids
+        else []
     )
     for previous in superseded:
         previous_row = dict(previous)

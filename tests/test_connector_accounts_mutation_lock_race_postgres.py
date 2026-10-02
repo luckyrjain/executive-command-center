@@ -534,6 +534,100 @@ def test_mutation_waiting_on_row_lock_with_unchanged_grant_still_proceeds(
     assert response.status_code == case.ok_status, response.text
 
 
+# --- bulk team-suggestion actions: a grant revoked while the request waits ------
+#
+# `POST /team-suggestions/{confirm,dismiss}` select the candidate rows with
+# a read-visibility filter in the `FOR UPDATE` statement itself. A revoke
+# locks the row but only updates `resource_grants`, so once the lock frees
+# Postgres does not re-check that statement's filter: the row is still
+# returned. Each row's read access is therefore re-checked after the lock,
+# so a row B lost read access to while waiting is neither written nor
+# reported in `skipped_unauthorized` (which must only ever name rows B can
+# read). The row belongs to C and is `shared_explicitly` with B.
+
+_SUGGESTION = "Race Team"
+_SUGGESTION_TABLES = ("repositories", "engineering_work_items")
+
+
+def _prepare_suggestion(
+    world: RaceWorld, monkeypatch: pytest.MonkeyPatch, table: str, actions: list[str]
+) -> tuple[UUID, UUID]:
+    monkeypatch.setenv(_FLAG, "false")
+    get_settings.cache_clear()
+    with engine.begin() as connection:
+        row_id = _seed_projection(
+            connection,
+            world,
+            datetime.now(UTC),
+            table,
+            owner=world.c,
+            visibility="shared_explicitly",
+        )
+        connection.execute(
+            text(f"UPDATE {table} SET suggested_team_name = :name WHERE id = :id"),  # noqa: S608
+            {"name": _SUGGESTION, "id": row_id},
+        )
+        grant_id = _insert_grant(connection, world, table, row_id, actions)
+    return row_id, grant_id
+
+
+def _dismiss(world: RaceWorld, table: str, row_id: UUID, *, revoke: UUID | None) -> Any:
+    response, _before = race(
+        world,
+        table=table,
+        row_id=row_id,
+        send=lambda client: client.post(
+            "/api/v1/engineering/team-suggestions/dismiss",
+            headers=headers(world.b_token),
+            json={"suggested_team_name": _SUGGESTION},
+        ),
+        transfer=False,
+        mutate=_revoke(revoke) if revoke is not None else None,
+    )
+    return response
+
+
+@pytest.mark.parametrize("actions", [["read"], ["read", "write"]])
+@pytest.mark.parametrize("table", _SUGGESTION_TABLES)
+def test_team_suggestion_action_waiting_on_row_lock_rechecks_a_revoked_grant(
+    world: RaceWorld,
+    monkeypatch: pytest.MonkeyPatch,
+    table: str,
+    actions: list[str],
+) -> None:
+    row_id, grant_id = _prepare_suggestion(world, monkeypatch, table, actions)
+    before = row_snapshot(table, row_id)
+
+    response = _dismiss(world, table, row_id, revoke=grant_id)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert str(row_id) not in body["updated"]
+    assert str(row_id) not in body["skipped_unauthorized"]
+    assert row_snapshot(table, row_id) == before
+
+
+@pytest.mark.parametrize(
+    ("actions", "outcome"), [(["read"], "skipped_unauthorized"), (["read", "write"], "updated")]
+)
+@pytest.mark.parametrize("table", _SUGGESTION_TABLES)
+def test_team_suggestion_action_waiting_on_row_lock_with_unchanged_grant_still_proceeds(
+    world: RaceWorld,
+    monkeypatch: pytest.MonkeyPatch,
+    table: str,
+    actions: list[str],
+    outcome: str,
+) -> None:
+    """Control: with the grant left alone the same wait reports the row --
+    skipped on a read-only grant, dismissed on a read+write one."""
+    row_id, _grant_id = _prepare_suggestion(world, monkeypatch, table, actions)
+
+    response = _dismiss(world, table, row_id, revoke=None)
+
+    assert response.status_code == 200, response.text
+    assert response.json()[outcome] == [str(row_id)]
+
+
 # --- auto-backfill -------------------------------------------------------------
 
 

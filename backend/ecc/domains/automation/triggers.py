@@ -147,19 +147,6 @@ def list_triggers(
     return [_row_to_trigger(dict(row)) for row in rows]
 
 
-def workflow_family_exists(session: Session, workspace_id: UUID, workflow_id: str) -> bool:
-    return (
-        session.execute(
-            text(
-                "SELECT 1 FROM workflow_definitions WHERE workspace_id = :workspace_id "
-                "AND workflow_id = :workflow_id LIMIT 1"
-            ),
-            {"workspace_id": workspace_id, "workflow_id": workflow_id},
-        ).first()
-        is not None
-    )
-
-
 def create_trigger(
     session: Session,
     workspace_id: UUID,
