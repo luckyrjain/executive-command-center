@@ -269,6 +269,8 @@ class LocalCreateNoteAdapter:
     output_schema: type[BaseModel] = CreateNoteOutput
     reversible = True
     high_impact_categories: frozenset[str] = frozenset()
+    action_type = "note.create"
+    data_class = "sensitive"
 
     def simulate(self, action_input: BaseModel) -> BaseModel:
         """Must not touch `notes` at all (Decision 4) -- a preview `id`
@@ -413,6 +415,8 @@ class LocalSendTestNotificationAdapter:
     output_schema: type[BaseModel] = SendTestNotificationOutput
     reversible = False
     high_impact_categories: frozenset[str] = frozenset({"person-directed"})
+    action_type = "notification.send"
+    data_class = "sensitive"
 
     def simulate(self, action_input: BaseModel) -> BaseModel:
         assert isinstance(action_input, SendTestNotificationInput)
@@ -496,6 +500,8 @@ class FakeExternalActionAdapter:
     output_schema: type[BaseModel] = FakeExternalActionOutput
     reversible = True
     high_impact_categories: frozenset[str] = frozenset({"public"})
+    action_type = "fake.external"
+    data_class = "internal"
 
     def simulate(self, action_input: BaseModel) -> BaseModel:
         assert isinstance(action_input, FakeExternalActionInput)

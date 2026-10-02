@@ -41,10 +41,11 @@ def load_cached(
     digest: str,
 ) -> RecommendationResponse | None:
     """Thin wrapper, not a straight delegation -- every one of this
-    module's own callers (`recommendation_mutations.py`'s `_start`, and
-    `_transition`/`confirm_recommendation`, which read it only after their
-    locked authorization checks) calls this after `lock_idempotency`, with
-    no `session.begin()` of its own anywhere in between: the
+    module's own callers (`recommendation_mutations.py`'s
+    `create_recommendation`, `_transition` and `confirm_recommendation`,
+    each of which reads it only after its own authorization checks) calls
+    this after `lock_idempotency`, with no `session.begin()` of its own
+    anywhere in between: the
     `pg_advisory_xact_lock` and this read share one continuous implicit
     transaction that only ends at the
     caller's own explicit `session.commit()` after the real mutation

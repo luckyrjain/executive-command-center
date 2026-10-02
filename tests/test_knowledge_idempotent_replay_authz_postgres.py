@@ -17,10 +17,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from hashlib import sha256
 from json import dumps
-from typing import Any
+from typing import Any, Self
 from uuid import UUID, uuid4
 
 import pytest
@@ -30,6 +30,7 @@ from sqlalchemy import Connection, text
 
 from ecc.config import get_settings
 from ecc.database import engine
+from ecc.domains.knowledge import resolution
 from ecc.main import app
 
 pytestmark = pytest.mark.skipif(
@@ -629,3 +630,49 @@ def test_idempotent_replay_after_demotion_to_viewer_is_refused(world: RaceWorld,
     assert refused.status_code == 403, refused.text
     assert refused.json()["error"]["code"] == "INSUFFICIENT_ROLE"
     assert _side_effect_counts(world.ws) == counts_before
+
+
+def _clock_at(moment: datetime) -> type[datetime]:
+    """A `datetime` whose `now()` reads `moment`, for the module under test."""
+
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> Self:
+            return cls.fromtimestamp(moment.timestamp(), tz)
+
+    return _Clock
+
+
+def test_defer_replay_after_deferred_until_has_passed_gets_the_cached_response(
+    world: RaceWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`deferred_until` must be in the future, but that check sits below the
+    cache: a same-key replay sent once the requested time has passed still
+    gets the cached 200, not 422 DEFER_UNTIL_MUST_BE_FUTURE. A fresh key with
+    the same body, on the same moved clock, does get the 422."""
+    case = CASES["candidate_defer"]
+    ids = _seed(world, case, Access(world.b, "private"))
+    deferred_until = datetime.now(UTC) + timedelta(minutes=5)
+    body = {"deferred_until": deferred_until.isoformat()}
+    path = case.path(ids)
+    request_headers = headers(world.b_token)
+    client = TestClient(app)
+    client.cookies.set("ecc_session", world.b_token)
+    try:
+        first = client.post(path, headers=request_headers, json=body)
+        assert first.status_code == 200, first.text
+
+        # The endpoint's clock moves past the requested time.
+        monkeypatch.setattr(resolution, "datetime", _clock_at(deferred_until + timedelta(hours=1)))
+        counts_before = _side_effect_counts(world.ws)
+        replay = client.post(path, headers=request_headers, json=body)
+        counts_after_replay = _side_effect_counts(world.ws)
+        fresh = client.post(path, headers=headers(world.b_token), json=body)
+    finally:
+        client.close()
+
+    assert replay.status_code == 200, replay.text
+    assert _without_request_id(replay.json()) == _without_request_id(first.json())
+    assert counts_after_replay == counts_before
+    assert fresh.status_code == 422, fresh.text
+    assert fresh.json()["error"]["code"] == "DEFER_UNTIL_MUST_BE_FUTURE"

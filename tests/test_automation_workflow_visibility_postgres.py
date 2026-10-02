@@ -48,6 +48,7 @@ from ecc.domains.automation import approvals as automation_approvals
 from ecc.domains.automation import policy as automation_policy
 from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
+from ecc.domains.automation.adapter_contract import ACTION_TYPES
 from ecc.main import app
 
 settings = get_settings()
@@ -221,8 +222,8 @@ def _publish_workflow(w: World, workflow_id: str) -> automation_workflows.Workfl
             w.ws,
             w.b,
             workflow_id=workflow_id,
-            action_types=[],
-            data_classes=[],
+            action_types=sorted(ACTION_TYPES),
+            data_classes=["sensitive"],
             value_limit=Decimal("1000000"),
             count_limit=1000,
             rate_limit=None,
@@ -289,8 +290,8 @@ def _post_policy(token: str, workflow_id: str, key: str | None = None) -> tuple[
         "/api/v1/automations/policies",
         json={
             "workflow_id": workflow_id,
-            "action_types": [],
-            "data_classes": [],
+            "action_types": ["note.create"],
+            "data_classes": ["internal"],
             "value_limit": "100",
             "count_limit": 5,
             "approval_mode": "bounded_recurring",

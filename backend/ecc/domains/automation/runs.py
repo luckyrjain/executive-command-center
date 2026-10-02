@@ -202,9 +202,18 @@ class CompensationStepResponse(BaseModel):
     error_class: str | None
 
 
+class ScopeBlockResponse(BaseModel):
+    step_index: int
+    reason: str
+
+
 class RunDetailResponse(RunResponse):
     steps: list[RunStepResponse]
     compensation_steps: list[CompensationStepResponse]
+    # Set while the run is `needs_review` because its policy's scope did not
+    # authorize a step (`automation.step_blocked`); such a block writes no
+    # step row, so this is the only way the reason reaches the run view.
+    scope_block: ScopeBlockResponse | None = None
 
 
 class RunListResponse(BaseModel):
@@ -286,12 +295,18 @@ def _to_detail_response(
     steps: list[WorkflowRunStep],
     compensation_steps: list[worker_module.CompensationStep],
     action_ref_by_index: dict[int, str],
+    scope_block: tuple[int, str] | None = None,
 ) -> RunDetailResponse:
     base = _to_response(run)
     return RunDetailResponse(
         **base.model_dump(),
         steps=[_step_to_response(s, action_ref_by_index) for s in steps],
         compensation_steps=[_compensation_step_to_response(c) for c in compensation_steps],
+        scope_block=(
+            ScopeBlockResponse(step_index=scope_block[0], reason=scope_block[1])
+            if scope_block is not None
+            else None
+        ),
     )
 
 
@@ -356,7 +371,12 @@ def get_run_endpoint(run_id: UUID, auth: AuthDep, session: SessionDep) -> RunDet
     steps = worker_module.list_run_steps(session, auth.workspace_id, run_id)
     compensation_steps = worker_module.list_compensation_steps(session, auth.workspace_id, run_id)
     action_ref_by_index = _action_ref_by_step_index(session, run)
-    return _to_detail_response(run, steps, compensation_steps, action_ref_by_index)
+    scope_block = (
+        worker_module.latest_scope_block(session, auth.workspace_id, run_id)
+        if run.status == "needs_review"
+        else None
+    )
+    return _to_detail_response(run, steps, compensation_steps, action_ref_by_index, scope_block)
 
 
 @router.post("/runs", response_model=RunResponse, status_code=status.HTTP_201_CREATED)
@@ -374,6 +394,59 @@ def create_run_endpoint(
     with session.begin():
         authz.lock_membership_for_write(session, auth, role_action="write")
         lock_idempotency(session, auth, idempotency_key)
+
+        # Running a workflow needs read (404) then write (403) on its active
+        # version, the same checks publish/disable make; without them a
+        # member could run another member's private workflow by id. Locked
+        # first (FOR SHARE: blocks an ownership transfer or disable, not
+        # other runs), so the checks see the committed row. Ahead of the
+        # cache, so a same-key replay is re-authorized. With no active
+        # version, a caller who can read no version of the workflow gets
+        # the same 404 as for an id that never existed (otherwise 404 vs
+        # enqueue_run's 409 would reveal a private workflow exists); one
+        # who can read a version keeps enqueue_run's WORKFLOW_NOT_ACTIVE.
+        active_sql = text(
+            "SELECT id FROM workflow_versions "
+            "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id "
+            "AND status = 'active' FOR SHARE"
+        )
+        active_params = {"workspace_id": auth.workspace_id, "workflow_id": payload.workflow_id}
+        active_version_id = session.execute(active_sql, active_params).scalar_one_or_none()
+        if active_version_id is None:
+            # A publish that commits while this SELECT waits on the row it
+            # retires hides both rows from this statement (the new one was
+            # still a draft in its snapshot); a fresh statement sees it.
+            active_version_id = session.execute(active_sql, active_params).scalar_one_or_none()
+        if active_version_id is None:
+            if not authz.list_visible_resources(
+                session,
+                auth,
+                resource_type="workflow_versions",
+                columns="id",
+                order_by="id",
+                extra_clauses=["workflow_id = :workflow_id"],
+                extra_params={"workflow_id": payload.workflow_id},
+                limit_clause="LIMIT 1",
+            ):
+                raise HTTPException(status_code=404, detail="WORKFLOW_NOT_FOUND")
+        else:
+            if not authz.authorize(
+                session,
+                auth,
+                resource_type="workflow_versions",
+                resource_id=active_version_id,
+                action="read",
+            ):
+                raise HTTPException(status_code=404, detail="WORKFLOW_NOT_FOUND")
+            if not authz.authorize(
+                session,
+                auth,
+                resource_type="workflow_versions",
+                resource_id=active_version_id,
+                action="write",
+            ):
+                raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
         cached = load_cached(
             session,
             auth,
@@ -384,6 +457,13 @@ def create_run_endpoint(
         )
         if cached is not None:
             return cached
+        if active_version_id is None:
+            # Answered here, not by enqueue_run: a version published since
+            # the SELECT above was never locked or authorized.
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "WORKFLOW_NOT_ACTIVE", "workflow_id": payload.workflow_id},
+            )
 
         # Decision 7's "Manual" trigger: a user-initiated run, subject to
         # the identical policy/approval evaluation as any other trigger

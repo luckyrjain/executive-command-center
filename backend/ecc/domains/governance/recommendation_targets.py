@@ -24,6 +24,18 @@ from ecc.domains.planning.tasks import (
 from ecc.platform import audit_outbox, authz
 from ecc.platform.connector_security import PersonalRowScope
 
+# The authz resource type (= table) each recommendation `target_type`
+# names, matching every direct mutation endpoint's own convention. Spelled
+# out rather than derived by pluralizing, so a new target type must be
+# added here explicitly; `tests/test_governance_recommendation_target_resource_types.py`
+# keeps it in step with `RecommendationCreate.target_type` and authz's own
+# table allowlist.
+TARGET_RESOURCE_TYPES: dict[str, str] = {
+    "task": "tasks",
+    "commitment": "commitments",
+    "risk": "risks",
+}
+
 # Commitment status values a recommendation may target -- "confirmed" is
 # deliberately absent: it's `CommitmentCreate`'s own create-time-only value
 # (see that model's `status` field), never a real transition target, and
@@ -389,10 +401,8 @@ def execute_target(
     # confirmed against another member's private task/commitment/risk
     # could silently mutate manual_priority/pinned/importance/probability/
     # impact on a resource the confirming user's own direct PATCH would
-    # 404 for. `resource_type` is the plural of `target_type`, matching
-    # every direct mutation endpoint's own convention (`"tasks"`/
-    # `"commitments"`/`"risks"`).
-    resource_type = f"{target_type}s"
+    # 404 for.
+    resource_type = TARGET_RESOURCE_TYPES[target_type]
     # Lock before authorizing: an ownership transfer that commits while
     # this request waits on the row lock must be seen by the checks below
     # (READ COMMITTED: each later statement reads the committed row), not

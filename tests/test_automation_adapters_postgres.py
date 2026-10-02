@@ -75,6 +75,7 @@ from ecc.domains.automation import local_adapters
 from ecc.domains.automation import policy as automation_policy
 from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
+from ecc.domains.automation.adapter_contract import ACTION_TYPES
 
 settings = get_settings()
 pytestmark = pytest.mark.skipif(
@@ -194,8 +195,8 @@ def _create_policy(
             workspace_id,
             user_id,
             workflow_id=workflow_id,
-            action_types=[],
-            data_classes=[],
+            action_types=sorted(ACTION_TYPES),
+            data_classes=["sensitive"],
             value_limit=Decimal("1000000"),
             count_limit=count_limit,
             rate_limit=None,

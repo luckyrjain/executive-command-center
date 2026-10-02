@@ -9,6 +9,10 @@ success. The team entity is now re-checked ahead of the cache, and a cached
 response is served only if the caller still has `write` on every row it
 reported `updated` (and `read` on every row it reported skipped).
 
+Single-item team assignment (`POST /repositories/{id}/team`,
+`/work-items/{id}/team`) re-checks the team entity ahead of the cache the
+same way.
+
 Sync: the endpoint's read/write pre-checks run in an earlier, rolled-back
 transaction, and phase 1 used to serve the cache before re-running them on
 the locked account row. A change that committed between the two (here,
@@ -341,6 +345,48 @@ def test_team_suggestion_confirm_replay_after_losing_the_team_entity_is_refused_
         _execute("UPDATE pkos_nodes SET visibility = 'private' WHERE id = :id", {"id": team_id})
         counts_before = _side_effect_counts(world.ws)
         refused = client.post(_SUGGESTIONS + "confirm", headers=request_headers, json=body)
+    finally:
+        client.close()
+
+    assert refused.status_code == 404, refused.text
+    assert refused.json()["error"]["code"] == "TEAM_ENTITY_NOT_FOUND"
+    assert _side_effect_counts(world.ws) == counts_before
+
+
+_TEAM_ROUTES = {
+    "repositories": "/api/v1/engineering/repositories/{id}/team",
+    "engineering_work_items": "/api/v1/engineering/work-items/{id}/team",
+}
+
+
+@pytest.mark.parametrize("table", list(_TEAM_ROUTES))
+def test_team_assignment_replay_after_losing_the_team_entity_is_refused_404(
+    world: RaceWorld, table: str
+) -> None:
+    """Single-item assignment checks the team entity ahead of the cache,
+    like the bulk confirm above: B assigns its own row to A's team and the
+    replay is served; once A's team is private to A, the same-key replay
+    gets the fresh 404, not the cached assignment."""
+    team_id = _seed_team(world)
+    repo_id, item_id = _seed_suggested_rows(
+        world, owner=world.b, visibility="private", team_name=f"assign-{uuid4()}"
+    )
+    row_id = repo_id if table == "repositories" else item_id
+    path = _TEAM_ROUTES[table].format(id=row_id)
+    body = {"expected_version": 1, "team_entity_id": str(team_id)}
+    request_headers = headers(world.b_token)
+    client = TestClient(app)
+    client.cookies.set("ecc_session", world.b_token)
+    try:
+        first = client.post(path, headers=request_headers, json=body)
+        assert first.status_code == 200, first.text
+        replay = client.post(path, headers=request_headers, json=body)
+        assert replay.status_code == 200, replay.text
+        assert _without_request_id(replay.json()) == _without_request_id(first.json())
+        # A's team becomes private: B can no longer see it.
+        _execute("UPDATE pkos_nodes SET visibility = 'private' WHERE id = :id", {"id": team_id})
+        counts_before = _side_effect_counts(world.ws)
+        refused = client.post(path, headers=request_headers, json=body)
     finally:
         client.close()
 

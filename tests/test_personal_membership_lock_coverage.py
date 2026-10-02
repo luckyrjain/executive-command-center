@@ -15,13 +15,13 @@ from membership_lock_race_support import DOMAINS, unlocked_transactions
 # `authz.lock_membership_for_write`.
 _ALLOWLIST: Counter[tuple[str, str]] = Counter(
     {
-        # The idempotency-cache read before the model call (writes nothing)
-        # and the three bookkeeping transactions (feature-disabled, failed
-        # run, and after the locked insight insert) that store only the
-        # caller's own cached response in `idempotency_records` -- no
-        # personal data, no audit. The insight insert itself locks, after
-        # the model call, never across it.
-        ("ai_insights.py", "generate_insight_endpoint"): 4,
+        # The three bookkeeping transactions (feature-disabled, failed run,
+        # and after the locked insight insert) that store only the caller's
+        # own cached response in `idempotency_records` -- no personal data,
+        # no audit. The idempotency-cache read locks (a replay is
+        # re-authorized), and so does the insight insert, after the model
+        # call, never across it.
+        ("ai_insights.py", "generate_insight_endpoint"): 3,
         # Read-only `consent_id` -> `domain_key` lookup; the write is
         # `_disable_domain`'s own locked transaction.
         ("domains.py", "revoke_consent_endpoint"): 1,

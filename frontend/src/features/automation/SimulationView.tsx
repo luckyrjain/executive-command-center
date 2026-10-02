@@ -9,6 +9,7 @@ const GATE_LABEL: Record<DispatchGate, string> = {
   requires_approval: 'Requires approval before dispatch',
   policy_blocked: 'Blocked by policy',
   adapter_not_registered: 'Adapter not registered',
+  input_invalid: "Input invalid -- the step's input does not match the action",
   not_applicable: 'Not applicable (routing step, no adapter)',
 }
 
@@ -56,6 +57,9 @@ export default function SimulationView({ versionId }: { versionId: string }) {
                 <span>{GATE_LABEL[step.dispatch_gate]}</span>
                 {step.policy_block_reason ? <span>{step.policy_block_reason.replaceAll('_', ' ')}</span> : null}
                 {typeof step.reversible === 'boolean' ? <span>{step.reversible ? 'reversible' : 'irreversible'}</span> : null}
+                {step.action_type ? <span>action type {step.action_type}</span> : null}
+                {step.data_class ? <span>data class {step.data_class}</span> : null}
+                {step.dispatch_value && Number(step.dispatch_value) > 0 ? <span>value {step.dispatch_value}</span> : null}
               </div>
               {step.high_impact_categories.length ? (
                 <ul aria-label={`High-impact categories for ${step.step_id}`}>

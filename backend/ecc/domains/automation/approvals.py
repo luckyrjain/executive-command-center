@@ -67,15 +67,14 @@ threshold ("zero real side effects of any kind ... mechanically guaranteed")
 told an operator was impossible. (a) satisfied "nothing executes unattended"
 but not "this mode never executes," and the documents promise the second.
 
-**`policy-limit-exceeding` is evaluated using `count_limit` only.**
-`value_limit` has no adapter-declared monetary field to compare against in
-this activation (`docs/superpowers/specs/...design.md` Decision 5's own
-table: "No connector in this activation has monetary side effects" --
-identical reasoning to why `value_limit` itself has no system-wide
-default), so there is nothing to sum against it -- see `policy.py`'s own
-"which policy scope fields are actually enforced" docstring section for the
-honest, per-field status of `action_types`/`data_classes`/`value_limit`,
-none of which any dispatching code compares an adapter against. `rate_limit`
+**`policy-limit-exceeding` is evaluated using `count_limit` and
+`value_limit`, both per run** (scope-enforcement design, Decision 4).
+`value_limit` is compared against the run's summed `dispatch_value` plus
+this step's; every adapter registered today has value 0, so in practice
+only a test-only financial adapter trips it. A tripped limit is recorded on
+the approval row as `policy-limit-exceeding`, so an approver sees why.
+Policy *scope* (`action_types`/`data_classes`) is not an approval matter:
+`evaluate_policy_scope` blocks an out-of-scope step outright. `rate_limit`
 (runs per workflow per hour) is an *enqueue-time* concern per
 `APPROVAL-POLICY.md`'s own table ("the next run past the limit rejected at
 enqueue with `rate_limited`"), not a per-step dispatch-time concern, and it
@@ -137,6 +136,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
@@ -154,6 +154,7 @@ from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash
 from ecc.platform.request_models import EmptyBody as _EmptyBody
 
 from . import run_visibility
+from .adapter_contract import DATA_CLASSES, data_class_rank
 from .adapters import ActionAdapter
 from .policy import AutomationPolicy
 
@@ -244,42 +245,86 @@ def approval_lifecycle_status(
     return approval.status
 
 
+ScopeReason = Literal["action_type_not_authorized", "data_class_not_authorized"]
+
+
+def evaluate_policy_scope(adapter: ActionAdapter, policy: AutomationPolicy) -> ScopeReason | None:
+    """Whether `policy` authorizes this *kind* of adapter at all (scope-
+    enforcement design, Decision 5) -- the one helper the dispatch gate,
+    retry-resume, compensation, publish and `/simulate` all share, so they
+    cannot drift. Pure. `None` means in scope.
+
+    A legacy policy (`scope_enforced = false`, created before migration
+    0086) is never checked: its scope fields were stored but never
+    enforced, and it ages out within 90 days. For an enforced policy the
+    adapter's `action_type` must be listed, and its `data_class` must rank
+    at or below the highest class the policy lists (an ordinal ceiling: a
+    `{sensitive}` policy authorizes `public`/`internal`/`sensitive`
+    adapters). An empty list authorizes nothing (defence in depth; the
+    CHECK and `create_policy` already refuse one).
+    """
+    if not policy.scope_enforced:
+        return None
+    if adapter.action_type not in policy.action_types:
+        return "action_type_not_authorized"
+    ranks = [data_class_rank(c) for c in policy.data_classes if c in DATA_CLASSES]
+    if not ranks or data_class_rank(adapter.data_class) > max(ranks):
+        return "data_class_not_authorized"
+    return None
+
+
 def evaluate_approval_requirement(
     adapter: ActionAdapter,
     policy: AutomationPolicy,
     *,
     action_step_count_so_far: int,
-) -> bool:
+    run_value_so_far: Decimal,
+    step_value: Decimal,
+) -> frozenset[str] | None:
     """Whether the step about to be dispatched against `adapter`, under
     `policy`, needs a fresh, digest-bound human approval before `worker.
     run_step` may call `adapter.execute()`. Pure -- see module docstring.
 
-    `action_step_count_so_far` is the number of `workflow_run_steps` rows
-    (any status) this run has already written *before* the step under
-    evaluation -- i.e. how many action steps this run has already
-    attempted. Required, not optional, so a caller cannot forget to
-    compute it and accidentally fall through to `0` (which would silently
-    under-count and never trigger `policy-limit-exceeding`) -- fail closed
-    on a missing count the same way this function fails closed on every
-    other ambiguity.
+    Returns `None` when no approval is needed, otherwise the effective
+    high-impact category set to record on the approval row: the adapter's
+    own `high_impact_categories`, plus `policy-limit-exceeding` when a
+    policy limit tripped. The set may be **empty** (a bounded adapter
+    under `per_run`/`preview_only`) and still mean "approval required" --
+    callers must test `is None`, never truthiness.
+
+    `policy-limit-exceeding` trips when this run has already attempted
+    `count_limit` or more action steps (`action_step_count_so_far`: the
+    run's `workflow_run_steps` rows of any status written before this step),
+    or when `run_value_so_far + step_value` exceeds `value_limit`
+    (`run_value_so_far`: the run's summed `dispatch_value`, NULL as 0, any
+    status; `step_value`: this step's `dispatch_value`). Both window per
+    run. All three are required keywords, so a caller cannot forget one
+    and fall through to 0 -- fail closed on a missing count or value.
     """
-    if adapter.high_impact_categories:
-        return True
+    limit_tripped = (
+        action_step_count_so_far >= policy.count_limit
+        or run_value_so_far + step_value > policy.value_limit
+    )
+    categories = frozenset(adapter.high_impact_categories) | (
+        frozenset({"policy-limit-exceeding"}) if limit_tripped else frozenset()
+    )
+    if categories:
+        return categories
     if policy.approval_mode in ("preview_only", "per_run"):
         # `preview_only` answers this question identically to `per_run` on
         # purpose -- it is *also* blocked from real dispatch afterwards, by
         # `worker._evaluate_dispatch_gate`, never here (module docstring's
-        # own "`preview_only` requires approval for every step" section: this
-        # function returning `True` is what gives an operator a real
-        # approval flow to rehearse under the mode).
-        return True
+        # own "`preview_only` requires approval for every step" section:
+        # requiring approval here is what gives an operator a real approval
+        # flow to rehearse under the mode).
+        return frozenset()
     if policy.approval_mode != "bounded_recurring":
         # Unreachable under the current schema (CHECK constraint / Literal
         # both restrict approval_mode to the three known values) -- fail
         # closed rather than silently permitting dispatch under a mode
         # this function does not recognize.
-        return True
-    return action_step_count_so_far >= policy.count_limit
+        return frozenset()
+    return None
 
 
 def _row_to_approval(row: dict[str, Any]) -> ApprovalRequest:

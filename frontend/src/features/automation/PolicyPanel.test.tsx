@@ -5,7 +5,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import PolicyPanel from './PolicyPanel'
-import type { Policy } from './types'
+import type { AdapterListResponse, Policy } from './types'
 
 const activePolicy: Policy = {
   id: 'policy-1',
@@ -23,10 +23,32 @@ const activePolicy: Policy = {
   version: 1,
   created_at: '2026-07-01T00:00:00Z',
   updated_at: '2026-07-01T00:00:00Z',
+  scope_enforced: true,
+}
+
+const adapters: AdapterListResponse = {
+  adapters: [
+    { adapter_id: 'local.create_note', action_type: 'note.create', data_class: 'sensitive', reversible: true, high_impact_categories: [], has_dispatch_value: false },
+    { adapter_id: 'github.add_issue_comment', action_type: 'comment.create', data_class: 'sensitive', reversible: true, high_impact_categories: ['public'], has_dispatch_value: false },
+    { adapter_id: 'gitlab.add_note', action_type: 'comment.create', data_class: 'sensitive', reversible: true, high_impact_categories: ['public'], has_dispatch_value: false },
+  ],
+  action_types: ['comment.create', 'note.create'],
+  data_classes: ['public', 'internal', 'sensitive', 'restricted'],
 }
 
 function response(body: unknown, status = 200) {
   return Promise.resolve(new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }))
+}
+
+/** Answers the adapters vocabulary request itself and passes every other
+ * call to `inner`, so tests keep their ordered policy-endpoint mocks and
+ * their call-count assertions. */
+function withAdapters(inner: ReturnType<typeof vi.fn>) {
+  const routed = vi.fn((url: string, init?: RequestInit) =>
+    String(url).includes('/api/v1/automations/adapters') ? response(adapters) : inner(url, init),
+  )
+  vi.stubGlobal('fetch', routed)
+  return inner
 }
 
 function renderPanel() {
@@ -42,7 +64,7 @@ afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 
 describe('PolicyPanel', () => {
   it('renders the policy scope a human needs to trust a workflow', async () => {
-    vi.stubGlobal('fetch', vi.fn(() => response({ policies: [activePolicy] })))
+    withAdapters(vi.fn(() => response({ policies: [activePolicy] })))
     renderPanel()
 
     await waitFor(() => expect(screen.getByText('weekly-digest')).toBeTruthy())
@@ -52,14 +74,14 @@ describe('PolicyPanel', () => {
   })
 
   it('shows the empty state when no policies exist', async () => {
-    vi.stubGlobal('fetch', vi.fn(() => response({ policies: [] })))
+    withAdapters(vi.fn(() => response({ policies: [] })))
     renderPanel()
     await waitFor(() => expect(screen.getByText('No policies recorded yet.')).toBeTruthy())
   })
 
   it('does not offer a revoke action for an already-revoked policy', async () => {
     const revoked = { ...activePolicy, status: 'revoked' as const, revoked_at: '2026-07-15T00:00:00Z' }
-    vi.stubGlobal('fetch', vi.fn(() => response({ policies: [revoked] })))
+    withAdapters(vi.fn(() => response({ policies: [revoked] })))
     renderPanel()
 
     await waitFor(() => expect(screen.getByText('weekly-digest')).toBeTruthy())
@@ -71,7 +93,7 @@ describe('PolicyPanel', () => {
       .mockImplementationOnce(() => response({ policies: [activePolicy] }))
       .mockImplementationOnce(() => response({ ...activePolicy, status: 'revoked', revoked_at: '2026-07-20T00:00:00Z' }))
       .mockImplementationOnce(() => response({ policies: [{ ...activePolicy, status: 'revoked', revoked_at: '2026-07-20T00:00:00Z' }] }))
-    vi.stubGlobal('fetch', fetch)
+    withAdapters(fetch)
     renderPanel()
 
     await waitFor(() => expect(screen.getByRole('button', { name: 'Revoke policy for weekly-digest' })).toBeTruthy())
@@ -85,7 +107,7 @@ describe('PolicyPanel', () => {
     const fetch = vi.fn()
       .mockImplementationOnce(() => response({ policies: [activePolicy] }))
       .mockImplementationOnce(() => response({ error: { code: 'POLICY_EXPIRED', message: 'Policy Expired', details: { expires_at: '2026-07-01T00:00:00Z' } } }, 409))
-    vi.stubGlobal('fetch', fetch)
+    withAdapters(fetch)
     renderPanel()
 
     await waitFor(() => expect(screen.getByRole('button', { name: 'Revoke policy for weekly-digest' })).toBeTruthy())
@@ -95,14 +117,15 @@ describe('PolicyPanel', () => {
   })
 
   it('takes every control\'s accessible name from its own visible label text (WCAG 2.5.3 Label in Name)', async () => {
-    vi.stubGlobal('fetch', vi.fn(() => response({ policies: [] })))
+    withAdapters(vi.fn(() => response({ policies: [] })))
     renderPanel()
     await waitFor(() => expect(screen.getByText('No policies recorded yet.')).toBeTruthy())
 
     // The old accessible names ("Filter policies by workflow ID", "Policy
     // value limit", …) did not contain the visible label text a speech-input
     // user reads off the screen.
-    for (const visible of ['Filter by workflow ID', 'Workflow ID', 'Action types (comma separated)', 'Data classes (comma separated)']) {
+    await waitFor(() => expect(screen.getByLabelText('note.create')).toBeTruthy())
+    for (const visible of ['Filter by workflow ID', 'Workflow ID', 'note.create', 'Highest data class allowed']) {
       expect(screen.getByLabelText(visible).hasAttribute('aria-label')).toBe(false)
     }
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
@@ -114,7 +137,7 @@ describe('PolicyPanel', () => {
   it('maps a failed policy-list fetch through errorMessage(), never the raw backend message', async () => {
     // retry: 1 on the list query overrides the client default, so the mock
     // keeps failing and the wait outlasts React Query's ~1s backoff.
-    vi.stubGlobal('fetch', vi.fn(() => response({ error: { code: 'WORKFLOW_NOT_FOUND', message: 'Workflow Not Found' } }, 404)))
+    withAdapters(vi.fn(() => response({ error: { code: 'WORKFLOW_NOT_FOUND', message: 'Workflow Not Found' } }, 404)))
     renderPanel()
 
     const alert = await screen.findByRole('alert', {}, { timeout: 3000 })
@@ -125,7 +148,7 @@ describe('PolicyPanel', () => {
   })
 
   it('maps an unreachable server on the policy list to a readable sentence', async () => {
-    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('fetch failed'))))
+    withAdapters(vi.fn(() => Promise.reject(new TypeError('fetch failed'))))
     renderPanel()
 
     const alert = await screen.findByRole('alert', {}, { timeout: 3000 })
@@ -137,11 +160,13 @@ describe('PolicyPanel', () => {
       .mockImplementationOnce(() => response({ policies: [] }))
       .mockImplementationOnce(() => response({ ...activePolicy, id: 'policy-2', count_limit: 25 }, 201))
       .mockImplementationOnce(() => response({ policies: [{ ...activePolicy, id: 'policy-2', count_limit: 25 }] }))
-    vi.stubGlobal('fetch', fetch)
+    withAdapters(fetch)
     renderPanel()
 
     await waitFor(() => expect(screen.getByText('No policies recorded yet.')).toBeTruthy())
     fireEvent.change(screen.getByLabelText('Workflow ID'), { target: { value: 'weekly-digest' } })
+    fireEvent.click(await screen.findByLabelText('note.create'))
+    fireEvent.change(screen.getByLabelText('Highest data class allowed'), { target: { value: 'internal' } })
     // Scope step's Continue is the one dominant forward action in its row.
     expect(screen.getByRole('button', { name: 'Continue' }).className).toBe('btn-primary')
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
@@ -157,17 +182,85 @@ describe('PolicyPanel', () => {
     const body = JSON.parse(String(fetch.mock.calls[1][1]?.body))
     expect(body.count_limit).toBe(25)
     expect(body.workflow_id).toBe('weekly-digest')
+    expect(body.action_types).toEqual(['note.create'])
+    expect(body.data_classes).toEqual(['internal'])
+  })
+
+  it('offers the closed action types and data classes, naming the adapters each type covers', async () => {
+    withAdapters(vi.fn(() => response({ policies: [] })))
+    renderPanel()
+
+    const comment = await screen.findByLabelText('comment.create')
+    expect(comment.getAttribute('type')).toBe('checkbox')
+    expect(screen.getByText('github.add_issue_comment, gitlab.add_note')).toBeTruthy()
+    const ceiling = screen.getByLabelText('Highest data class allowed') as HTMLSelectElement
+    expect(Array.from(ceiling.options).map((o) => o.value)).toEqual(['', 'public', 'internal', 'sensitive', 'restricted'])
+  })
+
+  it('refuses to submit without an action type, returning to Scope and focusing the first choice', async () => {
+    withAdapters(vi.fn(() => response({ policies: [] })))
+    renderPanel()
+
+    fireEvent.change(await screen.findByLabelText('Workflow ID'), { target: { value: 'weekly-digest' } })
+    await screen.findByLabelText('comment.create')
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Create policy' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toMatch(/at least one action type/i)
+    const first = await screen.findByLabelText('comment.create')
+    expect(document.activeElement).toBe(first)
+  })
+
+  it('refuses to submit without a data-class ceiling', async () => {
+    withAdapters(vi.fn(() => response({ policies: [] })))
+    renderPanel()
+
+    fireEvent.change(await screen.findByLabelText('Workflow ID'), { target: { value: 'weekly-digest' } })
+    fireEvent.click(await screen.findByLabelText('note.create'))
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Create policy' }))
+
+    expect((await screen.findByRole('alert')).textContent).toMatch(/highest data class/i)
+    expect(document.activeElement).toBe(screen.getByLabelText('Highest data class allowed'))
+  })
+
+  it('marks a legacy policy whose scope is not enforced', async () => {
+    withAdapters(vi.fn(() => response({ policies: [{ ...activePolicy, scope_enforced: false }] })))
+    renderPanel()
+    expect(await screen.findByText(/Legacy scope: not enforced, expires/)).toBeTruthy()
+  })
+
+  it('shows a readable message for a refused scope, never the raw code', async () => {
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ policies: [] }))
+      .mockImplementationOnce(() => response({ error: { code: 'POLICY_SCOPE_UNKNOWN_VALUE', message: 'x', details: { field: 'action_types', values: ['bogus'], allowed: [] } } }, 422))
+    withAdapters(fetch)
+    renderPanel()
+
+    fireEvent.change(await screen.findByLabelText('Workflow ID'), { target: { value: 'weekly-digest' } })
+    fireEvent.click(await screen.findByLabelText('note.create'))
+    fireEvent.change(screen.getByLabelText('Highest data class allowed'), { target: { value: 'internal' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Create policy' }))
+
+    expect(await screen.findByText('Unknown action type: bogus.')).toBeTruthy()
   })
 
   it('explains a 403 on create as a workflow the caller can see but not change', async () => {
     const fetch = vi.fn()
       .mockImplementationOnce(() => response({ policies: [] }))
       .mockImplementationOnce(() => response({ error: { code: 'INSUFFICIENT_ROLE', message: 'Insufficient Role' } }, 403))
-    vi.stubGlobal('fetch', fetch)
+    withAdapters(fetch)
     renderPanel()
 
     await waitFor(() => expect(screen.getByText('No policies recorded yet.')).toBeTruthy())
     fireEvent.change(screen.getByLabelText('Workflow ID'), { target: { value: 'weekly-digest' } })
+    fireEvent.click(await screen.findByLabelText('note.create'))
+    fireEvent.change(screen.getByLabelText('Highest data class allowed'), { target: { value: 'internal' } })
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     fireEvent.click(screen.getByRole('button', { name: 'Create policy' }))
@@ -178,7 +271,7 @@ describe('PolicyPanel', () => {
   })
 
   it('on failed final submit, navigates back to Scope (where the missing Workflow ID lives) and focuses it', async () => {
-    vi.stubGlobal('fetch', vi.fn(() => response({ policies: [] })))
+    withAdapters(vi.fn(() => response({ policies: [] })))
     renderPanel()
 
     // Reach Review without ever filling Workflow ID.

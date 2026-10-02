@@ -36,6 +36,7 @@ from ecc.database import SessionFactory, engine
 from ecc.domains.automation import policy as automation_policy
 from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
+from ecc.domains.automation.adapter_contract import ACTION_TYPES
 from ecc.domains.automation.adapters import AdapterRegistry
 from ecc.main import app
 
@@ -67,6 +68,8 @@ class _EchoAdapter:
     output_schema = _Output
     reversible = True
     high_impact_categories: frozenset[str] = frozenset()
+    action_type = "fake.external"
+    data_class = "internal"
 
     def __init__(self) -> None:
         self.execute_calls = 0
@@ -225,8 +228,8 @@ def _publish_workflow(
             workspace_id,
             user_id,
             workflow_id=workflow_id,
-            action_types=[],
-            data_classes=[],
+            action_types=sorted(ACTION_TYPES),
+            data_classes=["sensitive"],
             value_limit=Decimal("1000000"),
             count_limit=1000,
             rate_limit=rate_limit,
@@ -312,7 +315,7 @@ def test_create_run_endpoint_rejects_caller_supplied_policy_id(
     assert runs == []
 
 
-def test_create_run_endpoint_workflow_not_active_is_409(
+def test_create_run_endpoint_unknown_workflow_is_404(
     runs_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
     client, _workspace_id, _user_id, token = runs_test_context
@@ -321,8 +324,8 @@ def test_create_run_endpoint_workflow_not_active_is_409(
         json={"workflow_id": f"test.never-existed.{uuid4().hex}"},
         headers=_headers(token, key="create-run-inactive"),
     )
-    assert response.status_code == 409
-    assert response.json()["error"]["code"] == "WORKFLOW_NOT_ACTIVE"
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "WORKFLOW_NOT_FOUND"
 
 
 def test_create_run_endpoint_rate_limited_is_409(

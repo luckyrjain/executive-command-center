@@ -2287,6 +2287,48 @@ def _locked_connector_denial(
     return None
 
 
+def _connector_read_refused_unlocked(
+    session: Session,
+    auth: AuthContext,
+    account_id: UUID,
+    route: ConnectorAccessDeniedRoute,
+) -> bool:
+    """Fast-fail, *not* authoritative: the personal-connector owner layer
+    (same metric) and authz read, on the row as currently committed and
+    without locking it. Run first thing in a mutation's write transaction
+    so a caller who cannot see the connector -- or a nonexistent id -- gets
+    its `404 CONNECTOR_NOT_FOUND` without taking the idempotency or row
+    lock, and so without queueing behind (and timing) a sync that holds the
+    row. It runs right after the membership lock (ADR-0014: that lock comes
+    first in every engineering write transaction), which is workspace-wide
+    and shared: it waits only on a pending member removal (and so,
+    transitively, on the writers that removal waits for), never on this row.
+    `True` means refuse with that 404.
+
+    `_locked_connector_denial` still decides on the locked row: anything may
+    change between this read and the lock, which only this check sees."""
+    if personal_data_isolation_enabled():
+        row = (
+            session.execute(
+                text(
+                    "SELECT provider, owner_id FROM connector_accounts "
+                    "WHERE workspace_id = :workspace_id AND id = :id"
+                ),
+                {"workspace_id": auth.workspace_id, "id": account_id},
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is not None and _is_non_owner_personal_connector(
+            auth, row["provider"], row["owner_id"]
+        ):
+            record_connector_access_denied(row["provider"], route)
+            return True
+    return not authz.authorize(
+        session, auth, resource_type="connector_accounts", resource_id=account_id, action="read"
+    )
+
+
 @router.post(
     "/connectors/{account_id}/sync",
     response_model=SyncRunResponse,
@@ -2443,9 +2485,10 @@ def disable_connector_endpoint(
     idempotency_key: IdempotencyHeader,
 ) -> ConnectorAccountResponse:
     # No pre-transaction authz here (unlike `sync_connector_endpoint`, whose
-    # pre-checks also gate an `Idempotency-Key` replay that is served before
-    # its row lock): the personal-owner layer and authz run below, on the
-    # locked row, ahead of the idempotency cache and every write.
+    # fast-fail pre-checks run in a separate, rolled-back transaction): the
+    # personal-owner layer and authz run below, on the locked row, ahead of
+    # the idempotency cache and every write. Only an unlocked read fast-fail
+    # runs before the idempotency and row locks.
     req_hash = request_hash(_EmptyBody(), f"disable:{account_id}")
     now = datetime.now(UTC)
     # Round 23 review: `adapter.disconnect(...)` used to be called from
@@ -2464,6 +2507,11 @@ def disable_connector_endpoint(
     pending_revoke: tuple[ConnectorAdapter, ConnectorAccountContext] | None = None
     with session.begin():
         authz.lock_membership_for_write(session, auth)
+        # Fast-fail before the idempotency and row locks (see
+        # `_connector_read_refused_unlocked`); the authoritative check is
+        # `_locked_connector_denial` below.
+        if _connector_read_refused_unlocked(session, auth, account_id, "disable"):
+            raise HTTPException(status_code=404, detail="CONNECTOR_NOT_FOUND")
         lock_idempotency(session, auth, idempotency_key)
 
         # `get_connector_account` moved ahead of `load_cached` (Loop 2
@@ -3366,11 +3414,13 @@ def _assign_team[ResponseT: _TeamAssignedResponse](
 ) -> ResponseT:
     """The guard+write+audit path behind both `assign_repository_team_
     endpoint` and `assign_work_item_team_endpoint` -- byte-for-byte
-    identical control flow between the two (row lock then authz on the
-    locked row, idempotency lock/cache/store, `_validate_team_entity`,
+    identical control flow between the two (membership lock, unlocked
+    read fast-fail, idempotency lock, row lock then authz on the locked
+    row, `_validate_team_entity`, idempotency cache,
     `expected_version`-vs-`team_assignment_version` optimistic-concurrency
-    check, audit/outbox write) discovered as real duplication, not just
-    superficially similar code, before extraction. `table`/`returning_
+    check, write, audit/outbox, idempotency store) discovered as real
+    duplication, not just superficially similar code, before extraction.
+    `table`/`returning_
     fields`/`response_model` are genuinely different per caller (different
     columns, different Pydantic response shape) and stay as explicit
     parameters rather than being derived from `entity_kind`, since e.g.
@@ -3386,6 +3436,17 @@ def _assign_team[ResponseT: _TeamAssignedResponse](
     now = datetime.now(UTC)
     with session.begin():
         authz.lock_membership_for_write(session, auth)
+        # Fast-fail, not authoritative: a caller who cannot see the row (or
+        # a nonexistent id) gets its 404 before taking the idempotency or
+        # row lock, so never queues behind -- or times -- a writer holding
+        # the row. (The membership lock above is workspace-wide and shared;
+        # it waits only on a pending member removal -- and so, transitively,
+        # on the writers that removal waits for -- never on this row.) The
+        # read/write checks after the row lock below still decide.
+        if not authz.authorize(
+            session, auth, resource_type=table, resource_id=entity_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail=not_found_detail)
         lock_idempotency(session, auth, idempotency_key)
 
         # Lock before authorizing: an ownership transfer that commits while
@@ -3414,13 +3475,18 @@ def _assign_team[ResponseT: _TeamAssignedResponse](
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
+        # The team entity too, ahead of the cache (as the bulk team-
+        # suggestion confirm does): a caller who has since lost `read` on
+        # the team -- or whose team was archived -- must not replay a cached
+        # assignment to it (ADR-0014: a replay is authorized like a fresh
+        # request).
+        _validate_team_entity(session, auth, payload.team_entity_id)
+
         cached = load_cached(
             session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
         )
         if cached is not None:
             return cast(ResponseT, response_model.model_validate(cached))
-
-        _validate_team_entity(session, auth, payload.team_entity_id)
 
         if current[0] != payload.expected_version:
             raise HTTPException(status_code=409, detail="VERSION_CONFLICT")

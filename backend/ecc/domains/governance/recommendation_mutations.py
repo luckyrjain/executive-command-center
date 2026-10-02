@@ -33,6 +33,7 @@ from ecc.domains.governance.recommendation_storage import (
     save_cached,
 )
 from ecc.domains.governance.recommendation_targets import (
+    TARGET_RESOURCE_TYPES,
     execute_target,
     target_version,
     validate_action,
@@ -52,16 +53,6 @@ IdempotencyHeader = Annotated[
     str,
     Header(alias="Idempotency-Key", min_length=1, max_length=255),
 ]
-
-
-def _start(
-    session: Session,
-    auth: AuthContext,
-    idempotency_key: str,
-    digest: str,
-) -> RecommendationResponse | None:
-    lock_idempotency(session, auth, idempotency_key)
-    return load_cached(session, auth, idempotency_key, digest)
 
 
 def synthetic_request(request_id: UUID, correlation_id: UUID) -> Request:
@@ -125,7 +116,7 @@ def create_recommendation(
     """
     digest = request_hash(payload, "generate")
     # The role gate runs under the shared membership lock, taken before
-    # `_start`'s idempotency lock (lock order: membership -> idempotency ->
+    # the idempotency lock (lock order: membership -> idempotency ->
     # rows), so a removal or demotion either committed before it (403) or
     # waits for this transaction (ADR-0014).
     try:
@@ -142,7 +133,26 @@ def create_recommendation(
         raise
     validate_action(payload.target_type, payload.proposed_action)
     is_create = payload.proposed_action.get("operation") == "create"
-    cached = _start(session, auth, idempotency_key, digest)
+    lock_idempotency(session, auth, idempotency_key)
+    if not is_create:
+        # A non-create operation names an existing task/commitment/risk.
+        # Authorize reading it before anything below touches it: without
+        # this, `target_version`'s 404/409 split and the `superseded`
+        # UPDATE answered for (and mutated recommendations on) rows the
+        # caller cannot see. A target the caller cannot read gets the
+        # same 404 as a nonexistent id. The idempotency cache is read only
+        # after this check, so a replay is refused to a caller who has
+        # since lost sight of the target.
+        assert payload.target_id is not None
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type=TARGET_RESOURCE_TYPES[payload.target_type],
+            resource_id=payload.target_id,
+            action="read",
+        ):
+            raise HTTPException(status_code=404, detail="TARGET_NOT_FOUND")
+    cached = load_cached(session, auth, idempotency_key, digest)
     if cached is not None:
         return cached
     if write_guard is not None:
@@ -180,6 +190,27 @@ def create_recommendation(
         if current_version != payload.expected_version:
             raise HTTPException(status_code=409, detail="TARGET_VERSION_CONFLICT")
     now = datetime.now(UTC)
+    # Superseding is a write to each pending recommendation, attributed to
+    # the caller, so only the ones the caller could read and write through
+    # the single-recommendation endpoints are superseded. Another member's
+    # private (or read-only shared) pending recommendation on the same
+    # target stays live: it is theirs to resolve.
+    read_sql, read_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="recommendations",
+        action="read",
+        table_alias="recommendations",
+        param_prefix="read_",
+    )
+    write_sql, write_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="recommendations",
+        action="write",
+        table_alias="recommendations",
+        param_prefix="write_",
+    )
     superseded = (
         session.execute(
             text(
@@ -192,8 +223,10 @@ def create_recommendation(
                   AND target_id=:target_id
                   AND status IN ('proposed','pending_confirmation')
                   AND archived_at IS NULL
+                  AND {read_sql}
+                  AND {write_sql}
                 RETURNING {FIELDS}
-                """
+                """  # noqa: S608 -- authz visibility fragments; values bound
             ),
             {
                 "now": now,
@@ -201,6 +234,8 @@ def create_recommendation(
                 "workspace_id": auth.workspace_id,
                 "target_type": payload.target_type,
                 "target_id": payload.target_id,
+                **read_params,
+                **write_params,
             },
         )
         .mappings()
