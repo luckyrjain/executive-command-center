@@ -775,21 +775,14 @@ def approve_endpoint(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session,
-            auth,
-            idempotency_key,
-            req_hash,
-            domain="approval_request",
-            response_model=ApprovalResponse,
-        )
-        if cached is not None:
-            return cached
 
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. Ahead of the
+        # idempotency cache too: it is read only after these checks pass, so
+        # a caller who has since lost access (removed, suspended, demoted, or
+        # no longer able to see the row) never has a cached success replayed.
         # (`decide_approval` re-selects this row FOR UPDATE below:
         # a no-op re-lock within this transaction.)
         locked = session.execute(
@@ -813,6 +806,20 @@ def approve_endpoint(
             action="write",
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+        # After authz, before the state checks in the helper below: a
+        # same-key replay of a successful call finds the row already
+        # transitioned and must get the cached 200, not a 409.
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="approval_request",
+            response_model=ApprovalResponse,
+        )
+        if cached is not None:
+            return cached
 
         result = decide_approval(
             session,
@@ -888,21 +895,14 @@ def reject_endpoint(
     with session.begin():
         authz.lock_membership_for_write(session, auth)
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session,
-            auth,
-            idempotency_key,
-            req_hash,
-            domain="approval_request",
-            response_model=ApprovalResponse,
-        )
-        if cached is not None:
-            return cached
 
         # Lock before authorizing: an ownership transfer that commits while
         # this request waits on the row lock must be seen by the checks below
         # (READ COMMITTED: each later statement reads the committed row), not
-        # by checks that ran against the pre-transfer row.
+        # by checks that ran against the pre-transfer row. Ahead of the
+        # idempotency cache too: it is read only after these checks pass, so
+        # a caller who has since lost access (removed, suspended, demoted, or
+        # no longer able to see the row) never has a cached success replayed.
         # (`decide_approval` re-selects this row FOR UPDATE below:
         # a no-op re-lock within this transaction.)
         locked = session.execute(
@@ -926,6 +926,20 @@ def reject_endpoint(
             action="write",
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
+        # After authz, before the state checks in the helper below: a
+        # same-key replay of a successful call finds the row already
+        # transitioned and must get the cached 200, not a 409.
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="approval_request",
+            response_model=ApprovalResponse,
+        )
+        if cached is not None:
+            return cached
 
         result = decide_approval(
             session,
