@@ -158,6 +158,29 @@ describe('WorkflowList', () => {
     expect(await screen.findByText(/latest v3 \(draft\)/)).toBeTruthy()
   })
 
+  it.each([
+    ['WORKFLOW_NOT_FOUND', 404, 'Workflow Not Found', 'That workflow ID is taken by a workflow you cannot see. Choose a different ID.'],
+    ['INSUFFICIENT_ROLE', 403, 'Insufficient Role', 'You do not have permission to add a version to that workflow.'],
+  ])('maps a create refused with %s to a readable sentence', async (code, status, raw, expected) => {
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ workflows: [] }))
+      .mockImplementationOnce(() => response({ error: { code, message: raw } }, status))
+      .mockImplementation(() => response({ workflows: [] }))
+    vi.stubGlobal('fetch', fetch)
+    renderList()
+
+    await waitFor(() => expect(screen.getByText('No workflows yet. Draft one below.')).toBeTruthy())
+    fireEvent.change(screen.getByLabelText('Workflow ID'), { target: { value: 'weekly-digest' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    fireEvent.change(screen.getByLabelText('Step ID for step 1'), { target: { value: 's1' } })
+    fireEvent.change(screen.getByLabelText('Action reference for step 1'), { target: { value: 'local.create_note' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Create draft' }))
+
+    expect(await screen.findByText(expected)).toBeTruthy()
+    expect(screen.queryByText(raw)).toBeNull()
+  })
+
   it('rejects invalid JSON in a step input mapping before submitting', async () => {
     vi.stubGlobal('fetch', vi.fn(() => response({ workflows: [] })))
     renderList()
