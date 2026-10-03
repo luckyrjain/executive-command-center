@@ -74,10 +74,12 @@ function errorMessage(error: Error): string {
  * stored summary was withheld from this reader because a row it was built
  * from is no longer visible to them (the pack is usually also stale), so the
  * remedy is a refresh -- not "AI is off", which is what every other code
- * still reads as. */
+ * still reads as. Worded for any role: a viewer can read the pack but not
+ * refresh it, so the copy describes what a refresh does rather than
+ * telling the reader to run one. */
 function enrichmentUnavailableCopy(code: string | null): string {
   if (code === 'evidence_unavailable') {
-    return 'The AI summary is hidden because some of its sources have changed. Use Refresh pack for a new summary; showing deterministic results only.'
+    return 'The AI summary is hidden because some of its sources have changed. Refreshing the pack builds a new one; showing deterministic results only.'
   }
   return 'AI-assisted suggestions are disabled; showing deterministic results only.'
 }

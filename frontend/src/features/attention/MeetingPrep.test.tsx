@@ -113,7 +113,7 @@ describe('MeetingPrep', () => {
     expect(screen.getByText('Review Q3 numbers')).toBeTruthy()
   })
 
-  it('explains a withheld summary on a fresh pack too, pointing at the always-visible Refresh pack action', async () => {
+  it('explains a withheld summary on a fresh pack too, without the stale banner', async () => {
     vi.stubGlobal('fetch', vi.fn(() => response({
       ...pack,
       enrichment: { available: false, summary: null, error_code: 'evidence_unavailable' },
@@ -123,7 +123,7 @@ describe('MeetingPrep', () => {
     fireEvent.change(screen.getByLabelText('Meeting ID'), { target: { value: 'meeting-1' } })
     fireEvent.click(screen.getByRole('button', { name: 'Load meeting prep' }))
 
-    await waitFor(() => expect(screen.getByText(/Use Refresh pack for a new summary/)).toBeTruthy())
+    await waitFor(() => expect(screen.getByText(/Refreshing the pack builds a new one/)).toBeTruthy())
     expect(screen.queryByRole('button', { name: 'Refresh now' })).toBeNull()
     expect(screen.getByRole('button', { name: 'Refresh pack' })).toBeTruthy()
   })
