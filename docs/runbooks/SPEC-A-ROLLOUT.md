@@ -247,7 +247,7 @@ Exit 0 means nothing was found; exit 1 means rows were found (checks A–E, CSV 
   COMMIT;
   ```
 
-- [ ] **FX7 deployed (closes FX1 #308 M1).** A row narrowed after its pack was generated (by a grant narrowing, a delegation, or the backfill making a row private) is dropped from every read by members who can no longer read it, and the pack's stored AI summary is withheld from them. Confirm the FX7 build is live before R5. The stored pack content still holds the row until refresh, so database access to `meeting_packs` stays restricted as before.
+- [ ] **FX7 (#396) deployed (closes FX1 #308 M1).** A row narrowed after its pack was generated (by a grant narrowing, a delegation, or the backfill making a row private) is dropped from every read by members who can no longer read it, and the pack's stored AI summary is withheld from them. Confirm the FX7 build is live before R5. The stored pack content still holds the row until refresh, so database access to `meeting_packs` stays restricted as before.
 
 ### Order
 
