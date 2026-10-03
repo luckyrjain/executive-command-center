@@ -192,7 +192,7 @@ describe('MeetingPrep', () => {
     fireEvent.click(screen.getByRole('button', { name: button }))
 
     const alert = await screen.findByRole('alert')
-    expect(alert.textContent).toBe('You can view this meeting\'s preparation but not generate or refresh its pack -- ask the meeting\'s owner for write access (or a workspace admin, if your workspace role is read-only).')
+    expect(alert.textContent).toBe('You can view this meeting but not generate or refresh its preparation pack -- ask the meeting\'s owner for write access (or a workspace admin, if your workspace role is read-only).')
     expect(screen.queryByText('Insufficient Role')).toBeNull()
     expect(screen.getByText('Review Q3 numbers')).toBeTruthy()
   })
