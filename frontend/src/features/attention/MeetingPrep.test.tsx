@@ -178,6 +178,25 @@ describe('MeetingPrep', () => {
     expect(timingText).not.toMatch(/9:00\s?AM/i)
   })
 
+  it.each(['Generate pack', 'Refresh pack'])('explains %s refused for the reader\'s access instead of showing the raw code', async (button) => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => (
+      init?.method === 'POST'
+        ? response({ error: { code: 'INSUFFICIENT_ROLE', message: 'Insufficient Role' } }, 403)
+        : response(pack)
+    )))
+    renderPrep()
+
+    fireEvent.change(screen.getByLabelText('Meeting ID'), { target: { value: 'meeting-1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Load meeting prep' }))
+    await waitFor(() => expect(screen.getByText('Review Q3 numbers')).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: button }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toBe('You can view this meeting but not generate or refresh its preparation pack -- ask the meeting\'s owner for write access (or a workspace admin, if your workspace role is read-only).')
+    expect(screen.queryByText('Insufficient Role')).toBeNull()
+    expect(screen.getByText('Review Q3 numbers')).toBeTruthy()
+  })
+
   it('shows a distinct not-found state guiding the operator to generate a pack', async () => {
     // The query passes retry: 1, overriding the QueryClient's own retry:
     // false default, and the mock fails on the retried attempt too --

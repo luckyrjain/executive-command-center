@@ -67,6 +67,10 @@ function errorMessage(error: Error): string {
     MEETING_PACK_NOT_FOUND: 'No preparation pack exists yet for this meeting. Generate one below.',
     MEETING_PACK_EXISTS: 'A preparation pack already exists. Use Refresh to update it.',
     STALE_MEETING_PACK: 'The existing pack is stale. Use Refresh to regenerate it.',
+    // On this page only Generate/Refresh raise this: the caller can read the
+    // meeting but lacks write on it (or a write-capable workspace role).
+    // Reads 404 instead.
+    INSUFFICIENT_ROLE: 'You can view this meeting but not generate or refresh its preparation pack -- ask the meeting\'s owner for write access (or a workspace admin, if your workspace role is read-only).',
   })
 }
 
