@@ -6,10 +6,10 @@ deterministic fetch/compose logic `create_prep`/`refresh_prep` already run
 -- so the AI runtime's view of "what evidence may be summarized" is always
 identical to what the deterministic pack itself contains, never a second,
 independently-computed source of truth that could silently diverge from
-it. Recomputes rather than reading a persisted `meeting_packs` row: this
-tool is dispatched from *inside* `create_prep`/`refresh_prep`, before that
-request's new row exists yet, so there is nothing to read from `meeting_
-packs` at call time regardless. `generate_pack`/`get_meeting_row`/
+it. Inside a create/refresh's enrichment run it reads the content that
+request pinned (`pinned_pack_content`) -- the exact snapshot about to be
+stored -- since the new `meeting_packs` row does not exist yet; called
+outside such a run it recomputes with `generate_pack`. `generate_pack`/`get_meeting_row`/
 `require_meeting_read` are public (no leading underscore) in
 `meeting_prep.py` specifically because this file needs them as a declared
 cross-module dependency -- a private name here would be exactly the
@@ -47,7 +47,12 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext
 from ecc.domains.ai_runtime.tools import ToolNotFound, ToolResult
 
-from .meeting_prep import generate_pack, get_meeting_row, require_meeting_read
+from .meeting_prep import (
+    generate_pack,
+    get_meeting_row,
+    pinned_pack_content,
+    require_meeting_read,
+)
 
 
 def get_prep_pack_tool(
@@ -82,12 +87,18 @@ def get_prep_pack_tool(
     # `ai_runs` row. Giving it the caller's private rows would copy them
     # into both (FX1). A per-member AI view would need its own run type
     # stored private to that member, not this tool.
-    try:
-        generated = generate_pack(session, auth, meeting_id, meeting_row)
-    except HTTPException:
-        return ToolNotFound(tool="meeting.get_prep_pack")
-
-    content = generated.content
+    #
+    # Inside a create/refresh's own enrichment run, summarize the exact
+    # content that request is storing (FX7): a live regeneration could
+    # include a row that never reached the stored snapshot, and the pack's
+    # read-time visibility re-check only withholds the summary when a
+    # *stored* row is dropped.
+    content = pinned_pack_content(auth, meeting_id)
+    if content is None:
+        try:
+            content = generate_pack(session, auth, meeting_id, meeting_row).content
+        except HTTPException:
+            return ToolNotFound(tool="meeting.get_prep_pack")
     output: dict[str, Any] = {
         "objective": content.objective,
         "participants": [

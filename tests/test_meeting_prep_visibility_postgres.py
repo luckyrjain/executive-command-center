@@ -1023,3 +1023,330 @@ def test_callers_participants_keep_link_order(world: _World) -> None:
     assert [p["entity_name"] for p in created["participants"]] == expected
     got = _get(world.a, world.meeting_id)
     assert [p["entity_name"] for p in got["participants"]] == expected
+
+
+# --- rows narrowed after the pack was generated (FX1 M1) ---------------------------
+
+_NARROWABLE = (
+    "timeline_entries",
+    "commitments",
+    "notes",
+    "decision_notes",
+    "risks",
+    "waiting_links",
+)
+
+
+def _narrow(world: _World, table: str, row_id: UUID, *, owner_id: UUID) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                f"UPDATE {table} SET visibility = 'private', owner_id = :owner_id "  # noqa: S608
+                "WHERE workspace_id = :workspace_id AND id = :id"
+            ),
+            {"owner_id": owner_id, "workspace_id": world.workspace_id, "id": row_id},
+        )
+
+
+def _narrow_all(world: _World, ids: dict[str, UUID], *, owner_id: UUID) -> None:
+    for key in _NARROWABLE:
+        _narrow(world, "notes" if key == "decision_notes" else key, ids[key], owner_id=owner_id)
+
+
+def _set_stored_enrichment(meeting_id: UUID, summary: str) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE meeting_packs SET content = jsonb_set(content, '{enrichment}', "
+                "CAST(:enrichment AS jsonb)) WHERE meeting_id = :m AND status IN ('fresh', 'stale')"
+            ),
+            {
+                "m": meeting_id,
+                "enrichment": json.dumps(
+                    {"available": True, "summary": summary, "error_code": None}
+                ),
+            },
+        )
+
+
+def test_rows_narrowed_after_generation_leave_every_other_readers_view(world: _World) -> None:
+    """A stored row narrowed to A's private after the pack was generated
+    flips the pack stale; until refreshed, only readers who can still read
+    the row (A) get it. The stored snapshot itself is left as generated."""
+    _link(world, world.b, world.entity_id)
+    ids = _seed(world, "WS-ROW", owner_id=world.a.user_id, visibility="workspace")
+    _seed(world, "WS-KEPT", owner_id=world.a.user_id, visibility="workspace")
+    _prep(world.b, world.meeting_id)
+
+    _narrow_all(world, ids, owner_id=world.a.user_id)
+
+    for member in (world.bystander, world.b):
+        view = _get(member, world.meeting_id)
+        assert view["status"] == "stale"
+        for section in _SECTIONS:
+            assert _tags_in(view, section, ("WS-ROW", "WS-KEPT")) == {"WS-KEPT"}, section
+    a_view = _get(world.a, world.meeting_id)
+    for section in _SECTIONS:
+        assert _tags_in(a_view, section, ("WS-ROW", "WS-KEPT")) == {"WS-ROW", "WS-KEPT"}, section
+    stored = json.dumps(_stored(world.meeting_id))  # the snapshot is left as generated
+    assert "WS-ROW" in stored
+    assert "WS-KEPT" in stored
+
+
+def test_rows_deleted_or_restricted_after_generation_are_dropped(world: _World) -> None:
+    _link(world, world.b, world.entity_id)
+    ids = _seed(world, "WS-ROW", owner_id=world.a.user_id, visibility="workspace")
+    _prep(world.b, world.meeting_id)
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE notes SET restricted = true WHERE id = ANY(:ids)"),
+            {"ids": [ids["notes"], ids["decision_notes"]]},
+        )
+        connection.execute(text("DELETE FROM risks WHERE id = :id"), {"id": ids["risks"]})
+
+    for member in (world.a, world.b, world.bystander):
+        view = _get(member, world.meeting_id)
+        for section in ("notes", "decisions", "risks"):
+            assert "WS-ROW" not in _section_text(view, section), (member, section)
+        for section in ("timeline", "commitments", "dependencies"):
+            assert "WS-ROW" in _section_text(view, section), (member, section)
+
+
+def test_participant_node_narrowed_after_generation_drops_it_and_its_rows(world: _World) -> None:
+    _link(world, world.b, world.entity_id)
+    _seed(world, "WS-ROW", owner_id=world.a.user_id, visibility="workspace")
+    _prep(world.b, world.meeting_id)
+    _narrow(world, "pkos_nodes", world.entity_id, owner_id=world.a.user_id)
+
+    for member in (world.bystander, world.b):
+        view = _get(member, world.meeting_id)
+        assert view["participants"] == []
+        assert "Partner Person" not in json.dumps(view)
+        for section in ("timeline", "commitments", "dependencies"):
+            assert "WS-ROW" not in _section_text(view, section)
+        # Meeting-scoped notes and workspace-wide risks are not about the node.
+        for section in ("notes", "decisions", "risks"):
+            assert "WS-ROW" in _section_text(view, section)
+    a_view = _get(world.a, world.meeting_id)
+    assert {p["entity_name"] for p in a_view["participants"]} == {"Partner Person"}
+    for section in _SECTIONS:
+        assert "WS-ROW" in _section_text(a_view, section)
+
+
+@pytest.mark.parametrize("world", ["true"], indirect=True, ids=["flag_on"])
+def test_evidence_gap_narrowed_after_generation_is_dropped(world: _World) -> None:
+    _link(world, world.b, world.entity_id)
+    gap = _insert_evidence(world, owner_id=world.a.user_id, visibility="workspace", state="missing")
+    _prep(world.b, world.meeting_id)
+    _narrow(world, "pkos_evidence", gap, owner_id=world.a.user_id)
+
+    assert _gap_ids(_get(world.bystander, world.meeting_id)) == set()
+    assert _gap_ids(_get(world.b, world.meeting_id)) == set()
+    assert _gap_ids(_get(world.a, world.meeting_id)) == {gap}
+
+
+def test_stored_summary_is_withheld_once_a_row_is_dropped(world: _World) -> None:
+    _link(world, world.b, world.entity_id)
+    ids = _seed(world, "WS-ROW", owner_id=world.a.user_id, visibility="workspace")
+    _prep(world.b, world.meeting_id)
+    _set_stored_enrichment(world.meeting_id, "SUMMARY-QUOTING-WS-ROW")
+
+    # Control: nothing dropped, the stored summary is served.
+    assert _get(world.bystander, world.meeting_id)["enrichment"]["available"] is True
+
+    _narrow(world, "risks", ids["risks"], owner_id=world.a.user_id)
+    for member in (world.bystander, world.b):
+        enrichment = _get(member, world.meeting_id)["enrichment"]
+        assert enrichment == {
+            "available": False,
+            "summary": None,
+            "error_code": "evidence_unavailable",
+        }
+    # A can still read every stored row, so A keeps the summary.
+    assert _get(world.a, world.meeting_id)["enrichment"]["summary"] == "SUMMARY-QUOTING-WS-ROW"
+
+
+@pytest.mark.parametrize("refresh", [False, True], ids=["create", "refresh"])
+def test_idempotent_replay_drops_rows_narrowed_since_the_first_call(
+    world: _World, refresh: bool
+) -> None:
+    _link(world, world.b, world.entity_id)
+    ids = _seed(world, "WS-ROW", owner_id=world.a.user_id, visibility="workspace")
+    if refresh:
+        _prep(world.a, world.meeting_id)
+    key = str(uuid4())
+    path = f"/api/v1/meetings/{world.meeting_id}/prep" + ("/refresh" if refresh else "")
+    first = world.b.client.post(path, headers=_headers(world.b.token, key))
+    assert first.status_code == 201, first.text
+    _assert_view(first.json(), {"WS-ROW"})
+
+    _narrow_all(world, ids, owner_id=world.a.user_id)
+    replay = world.b.client.post(path, headers=_headers(world.b.token, key))
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["id"] == first.json()["id"]
+    _assert_view(replay.json(), set())
+
+
+def test_row_narrowed_to_an_explicit_share_reaches_only_its_grantee(world: _World) -> None:
+    _link(world, world.b, world.entity_id)
+    ids = _seed(world, "WS-ROW", owner_id=world.bystander.user_id, visibility="workspace")
+    _prep(world.b, world.meeting_id)
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        for key in _NARROWABLE:
+            table = "notes" if key == "decision_notes" else key
+            connection.execute(
+                text(
+                    f"UPDATE {table} SET visibility = 'shared_explicitly' "  # noqa: S608
+                    "WHERE workspace_id = :workspace_id AND id = :id"
+                ),
+                {"workspace_id": world.workspace_id, "id": ids[key]},
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO resource_grants (
+                        id, workspace_id, grantee_account_id, resource_type,
+                        resource_id, actions, granted_by, created_at
+                    ) VALUES (
+                        :id, :workspace_id, :grantee, :resource_type,
+                        :resource_id, ARRAY['read'], :granted_by, :now
+                    )
+                    """
+                ),
+                {
+                    "id": uuid4(),
+                    "workspace_id": world.workspace_id,
+                    "grantee": world.a.account_id,
+                    "resource_type": table,
+                    "resource_id": ids[key],
+                    "granted_by": world.bystander.user_id,
+                    "now": now,
+                },
+            )
+
+    _assert_view(_get(world.b, world.meeting_id), set())
+    _assert_view(_get(world.a, world.meeting_id), {"WS-ROW"})
+
+
+@pytest.mark.parametrize("refresh", [False, True], ids=["create", "refresh"])
+def test_enrichment_summarizes_exactly_the_stored_snapshot(
+    world: _World, monkeypatch: pytest.MonkeyPatch, refresh: bool
+) -> None:
+    """A workspace row written while the enrichment run is in flight never
+    reaches the model: the run summarizes the content its create/refresh
+    stores, so the read-time re-check (which only sees stored rows) covers
+    everything the summary can quote."""
+    import ecc.domains.attention.meeting_prep_tools as tools_mod
+
+    _link(world, world.b, world.entity_id)
+    _seed(world, "WS-KEPT", owner_id=world.a.user_id, visibility="workspace")
+    if refresh:
+        _prep(world.a, world.meeting_id)
+    late: dict[str, UUID] = {}
+    real_pinned = tools_mod.pinned_pack_content
+
+    def racing_pinned(*args: Any, **kwargs: Any) -> Any:
+        if not late:
+            late.update(_seed(world, "LATE-ROW", owner_id=world.a.user_id, visibility="workspace"))
+        return real_pinned(*args, **kwargs)
+
+    monkeypatch.setattr(tools_mod, "pinned_pack_content", racing_pinned)
+    prompts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        prompts.append(request.content.decode())
+        body = json.dumps(
+            {
+                "model": "m",
+                "created_at": "now",
+                "response": json.dumps(
+                    {"summary_text": "Partner review.", "cited_evidence_ids": []}
+                ),
+                "done": True,
+                "eval_count": 12,
+                "prompt_eval_count": 40,
+            }
+        )
+        return httpx.Response(
+            200, content=(body + "\n").encode(), headers={"content-type": "application/x-ndjson"}
+        )
+
+    adapter = OllamaAdapter(transport=httpx.MockTransport(handler))
+    monkeypatch.setenv("ECC_MEETING_PREP_AI_ENRICHMENT_ENABLED", "true")
+    get_settings.cache_clear()
+    app.dependency_overrides[get_ollama_adapter] = lambda: adapter
+    try:
+        created = _prep(world.b, world.meeting_id, refresh=refresh)
+    finally:
+        app.dependency_overrides.pop(get_ollama_adapter, None)
+
+    assert late, "the race hook never ran"
+    assert created["enrichment"]["available"] is True, created["enrichment"]
+    prompt_text = "".join(prompts)
+    assert "WS-KEPT" in prompt_text
+    assert "LATE-ROW" not in prompt_text
+    assert "LATE-ROW" not in json.dumps(_stored(world.meeting_id))
+
+
+def _summary_adapter(summary: str) -> OllamaAdapter:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.dumps(
+            {
+                "model": "m",
+                "created_at": "now",
+                "response": json.dumps({"summary_text": summary, "cited_evidence_ids": []}),
+                "done": True,
+                "eval_count": 12,
+                "prompt_eval_count": 40,
+            }
+        )
+        return httpx.Response(
+            200, content=(body + "\n").encode(), headers={"content-type": "application/x-ndjson"}
+        )
+
+    return OllamaAdapter(transport=httpx.MockTransport(handler))
+
+
+@pytest.mark.parametrize("refresh", [False, True], ids=["create", "refresh"])
+def test_replay_withholds_summary_when_a_stored_row_outside_the_cached_view_narrows(
+    world: _World, monkeypatch: pytest.MonkeyPatch, refresh: bool
+) -> None:
+    """The cached replay body is the caller's capped merged view: B's own
+    newer private notes push the stored workspace note out of it. Narrowing
+    that stored note must still withhold the summary on replay, as on GET."""
+    _link(world, world.b, world.entity_id)
+    ws = _seed(world, "WS-ROW", owner_id=world.a.user_id, visibility="workspace")
+    for i in range(10):  # 20 newer notes: B's merged notes section is full
+        _seed(world, f"B-PRIVATE-{i}", owner_id=world.b.user_id, visibility="private")
+    if refresh:
+        _prep(world.a, world.meeting_id)
+
+    monkeypatch.setenv("ECC_MEETING_PREP_AI_ENRICHMENT_ENABLED", "true")
+    get_settings.cache_clear()
+    adapter = _summary_adapter("Quotes WS-ROW note.")
+    app.dependency_overrides[get_ollama_adapter] = lambda: adapter
+    key = str(uuid4())
+    path = f"/api/v1/meetings/{world.meeting_id}/prep" + ("/refresh" if refresh else "")
+    try:
+        first = world.b.client.post(path, headers=_headers(world.b.token, key))
+    finally:
+        app.dependency_overrides.pop(get_ollama_adapter, None)
+    assert first.status_code == 201, first.text
+    assert first.json()["enrichment"]["available"] is True
+    assert "WS-ROW" not in _section_text(first.json(), "notes")
+    assert "WS-ROW" in json.dumps(_stored(world.meeting_id)["notes"])
+
+    # Control: nothing narrowed yet, the replay keeps the summary.
+    again = world.b.client.post(path, headers=_headers(world.b.token, key))
+    assert again.json()["enrichment"]["available"] is True
+
+    _narrow(world, "notes", ws["notes"], owner_id=world.a.user_id)
+    assert _get(world.b, world.meeting_id)["enrichment"]["available"] is False
+    replay = world.b.client.post(path, headers=_headers(world.b.token, key))
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["enrichment"] == {
+        "available": False,
+        "summary": None,
+        "error_code": "evidence_unavailable",
+    }
