@@ -96,6 +96,49 @@ describe('MeetingPrep', () => {
     expect(screen.getByText('Send the report', { exact: false })).toBeTruthy()
   })
 
+  it('explains a summary withheld for changed sources instead of calling AI disabled', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({
+      ...pack,
+      status: 'stale',
+      enrichment: { available: false, summary: null, error_code: 'evidence_unavailable' },
+    })))
+    renderPrep()
+
+    fireEvent.change(screen.getByLabelText('Meeting ID'), { target: { value: 'meeting-1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Load meeting prep' }))
+
+    await waitFor(() => expect(screen.getByText(/The AI summary is hidden because some of its sources have changed/)).toBeTruthy())
+    expect(screen.queryByText(/AI-assisted suggestions are disabled/)).toBeNull()
+    expect(screen.getByRole('button', { name: 'Refresh now' })).toBeTruthy()
+    expect(screen.getByText('Review Q3 numbers')).toBeTruthy()
+  })
+
+  it('explains a withheld summary on a fresh pack too, pointing at the always-visible Refresh pack action', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({
+      ...pack,
+      enrichment: { available: false, summary: null, error_code: 'evidence_unavailable' },
+    })))
+    renderPrep()
+
+    fireEvent.change(screen.getByLabelText('Meeting ID'), { target: { value: 'meeting-1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Load meeting prep' }))
+
+    await waitFor(() => expect(screen.getByText(/Use Refresh pack for a new summary/)).toBeTruthy())
+    expect(screen.queryByRole('button', { name: 'Refresh now' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Refresh pack' })).toBeTruthy()
+  })
+
+  it.each([null, 'model_unavailable'])('keeps the AI-disabled copy for any other unavailable reason (%s)', async (code) => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ ...pack, enrichment: { available: false, summary: null, error_code: code } })))
+    renderPrep()
+
+    fireEvent.change(screen.getByLabelText('Meeting ID'), { target: { value: 'meeting-1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Load meeting prep' }))
+
+    await waitFor(() => expect(screen.getByText(/AI-assisted suggestions are disabled/)).toBeTruthy())
+    expect(screen.queryByText(/The AI summary is hidden/)).toBeNull()
+  })
+
   it('shows the stale state with a visible refresh action while keeping the pack readable', async () => {
     vi.stubGlobal('fetch', vi.fn(() => response({ ...pack, status: 'stale' })))
     renderPrep()
