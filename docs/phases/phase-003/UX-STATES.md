@@ -2,7 +2,7 @@
 id: PHASE-003-UX-STATES
 title: Phase 3 Attention UX States
 status: Approved for Implementation
-version: 0.2.0
+version: 0.3.0
 owner: Lucky Jain
 ---
 
@@ -22,7 +22,7 @@ Provide timeline and accessible list views. Show capacity used, focus time, unsc
 
 ## Meeting preparation
 
-Separate facts, open questions and suggestions. Show citations inline and evidence gaps without alarming language. Stale packs remain readable with a refresh action and change summary.
+Separate facts, open questions and suggestions. Show citations inline and evidence gaps without alarming language. Stale packs remain readable with a refresh action and change summary. When the AI summary is withheld because some of its sources changed (`evidence_unavailable`), say so and point to refresh, rather than reporting AI as disabled.
 
 ## Required states
 

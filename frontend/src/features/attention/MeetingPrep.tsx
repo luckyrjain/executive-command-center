@@ -70,6 +70,20 @@ function errorMessage(error: Error): string {
   })
 }
 
+/** Why a pack carries no AI summary. `evidence_unavailable` means the
+ * stored summary was withheld from this reader because a row it was built
+ * from is no longer visible to them (the pack is usually also stale), so the
+ * remedy is a refresh -- not "AI is off", which is what every other code
+ * still reads as. Worded for any role: a viewer can read the pack but not
+ * refresh it, so the copy describes what a refresh does rather than
+ * telling the reader to run one. */
+function enrichmentUnavailableCopy(code: string | null): string {
+  if (code === 'evidence_unavailable') {
+    return 'The AI summary is hidden because some of its sources have changed. Refreshing the pack builds a new one; showing deterministic results only.'
+  }
+  return 'AI-assisted suggestions are disabled; showing deterministic results only.'
+}
+
 export default function MeetingPrep() {
   const queryClient = useQueryClient()
   const [meetingId, setMeetingId] = useState('')
@@ -140,7 +154,7 @@ export default function MeetingPrep() {
           ) : null}
           {!pack.enrichment.available ? (
             <div className="inline-status degraded-panel" role="status">
-              AI-assisted suggestions are disabled; showing deterministic results only.
+              {enrichmentUnavailableCopy(pack.enrichment.error_code)}
             </div>
           ) : null}
 
