@@ -35,6 +35,8 @@ they read as decisions, not oversights):
   caller's response adds, per request and never stored, the private or
   explicitly-shared rows that caller may read (``_caller_view``). Not
   flag-gated: such rows exist without ``ECC_PERSONAL_DATA_ISOLATION``.
+  Every response also drops stored rows the caller can no longer read
+  (narrowed or deleted since generation -- ``_without_unreadable_rows``).
 - AI enrichment (Phase 4-consuming wiring, this change): a bounded,
   fail-open ``meeting.prep_summary`` run (``ai_runtime/runtime.py``),
   gated on ``config.py``'s ``meeting_prep_ai_enrichment_enabled`` (still
@@ -52,6 +54,7 @@ they read as decisions, not oversights):
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -380,7 +383,10 @@ class PackContentSnapshot(BaseModel):
     computed at generation time, persisted verbatim into
     ``meeting_packs.content`` and returned as-is by every subsequent GET
     (finding #6): a real snapshot, not a re-derivation of live data on
-    every read. Only ``POST .../prep/refresh`` produces a new one.
+    every read. Only ``POST .../prep/refresh`` produces a new one. The one
+    read-time change is visibility: rows the reader can no longer read are
+    dropped from the response (``_without_unreadable_rows``), never from
+    the stored body.
 
     ``enrichment`` included here (not computed separately at response-
     render time, as it was before this change): AI enrichment is exactly
@@ -1093,10 +1099,31 @@ def _resolve_ollama_adapter(request: Request) -> OllamaAdapter:
     return override() if override is not None else get_ollama_adapter()
 
 
+# The pack a create/refresh is about to store, pinned for the duration of
+# its enrichment run so `meeting.get_prep_pack` summarizes exactly that
+# content rather than regenerating it from live rows (FX7). Regenerating
+# let the summary quote a row that changed during the run and never
+# reached the stored snapshot, which `_without_unreadable_rows` (it only
+# sees snapshot rows) could then not withhold once that row was narrowed.
+_PINNED_PACK: ContextVar[tuple[UUID, UUID, PackContent] | None] = ContextVar(
+    "meeting_prep_pinned_pack", default=None
+)
+
+
+def pinned_pack_content(auth: AuthContext, meeting_id: UUID) -> PackContent | None:
+    """The content ``_compute_enrichment`` pinned for this meeting, if the
+    current call is that enrichment run; else ``None``."""
+    pinned = _PINNED_PACK.get()
+    if pinned is None or pinned[0] != auth.workspace_id or pinned[1] != meeting_id:
+        return None
+    return pinned[2]
+
+
 def _compute_enrichment(
     session: Session,
     auth: AuthContext,
     meeting_id: UUID,
+    content: PackContent,
     *,
     ollama_adapter: OllamaAdapter | None = None,
 ) -> EnrichmentOut:
@@ -1133,14 +1160,18 @@ def _compute_enrichment(
     if not get_settings().meeting_prep_ai_enrichment_enabled:
         return EnrichmentOut(available=False, summary=None, error_code="feature_disabled")
 
-    run = execute_run(
-        "meeting.prep_summary",
-        "sensitive",
-        {"meeting_id": str(meeting_id)},
-        session=session,
-        auth=auth,
-        ollama_adapter=ollama_adapter,
-    )
+    token = _PINNED_PACK.set((auth.workspace_id, meeting_id, content))
+    try:
+        run = execute_run(
+            "meeting.prep_summary",
+            "sensitive",
+            {"meeting_id": str(meeting_id)},
+            session=session,
+            auth=auth,
+            ollama_adapter=ollama_adapter,
+        )
+    finally:
+        _PINNED_PACK.reset(token)
     if run.status != "completed" or run.output is None:
         return EnrichmentOut(available=False, summary=None, error_code=run.error_code)
     return EnrichmentOut(available=True, summary=run.output["summary_text"], error_code=None)
@@ -1216,6 +1247,154 @@ def _merge_rows[T: _HasId](
     return sorted(merged, key=key, reverse=reverse)[:limit]
 
 
+def _without_unreadable_rows[V: (PackContentSnapshot, MeetingPack)](
+    session: Session,
+    auth: AuthContext,
+    view: V,
+    *,
+    filters: _ReadFilters | None = None,
+) -> V:
+    """``view`` (a stored snapshot, or a cached create/refresh response)
+    minus every row the caller can no longer read, checked against the live
+    rows (FX1 M1). A row narrowed (or deleted, or a note marked
+    ``restricted``) after the pack was generated leaves the pack's
+    fingerprint, so the pack goes ``stale`` -- but a stale pack is still
+    served until someone refreshes it, and it must not keep serving that
+    row to readers who lost it. Rows keyed to a participant node (timeline,
+    commitments, dependencies, evidence gaps) also need that node to be
+    readable, mirroring how the snapshot was built. Only visibility is
+    re-checked: a row whose status, archive state or text changed stays
+    exactly as stored (finding #6's frozen snapshot).
+
+    Anything dropped also withholds the stored AI summary, which may quote
+    the dropped rows. Returns ``view`` itself when nothing is dropped."""
+    notes = [*view.decisions, *view.notes]
+    node_ids = {p.entity_id for p in view.participants} | {t.entity_id for t in view.timeline}
+    if (
+        not (node_ids or notes or view.commitments or view.risks or view.dependencies)
+        and not view.evidence_gaps
+    ):
+        return view
+    filters = filters or _ReadFilters(session, auth)
+    nodes_sql, nodes_params = filters.fragment("pkos_nodes", "n")
+    timeline_sql, timeline_params = filters.fragment("timeline_entries", "t")
+    commitments_sql, commitments_params = filters.fragment("commitments", "c")
+    notes_sql, notes_params = filters.fragment("notes", "nt")
+    risks_sql, risks_params = filters.fragment("risks", "r")
+    dependencies_sql, dependencies_params = filters.fragment("waiting_links", "w")
+    evidence_sql, evidence_params = authz.evidence_visibility_filter_sql(
+        session, auth, table_alias="e"
+    )
+    rows = session.execute(
+        text(
+            f"""
+            WITH readable_nodes AS (
+                SELECT n.id FROM pkos_nodes n
+                WHERE n.workspace_id = :workspace_id AND n.id = ANY(:node_ids)
+                  AND ({nodes_sql})
+            )
+            SELECT 'participants' AS section, id FROM readable_nodes
+            UNION ALL
+            SELECT 'timeline', t.id FROM timeline_entries t
+            WHERE t.workspace_id = :workspace_id AND t.id = ANY(:timeline_ids)
+              AND t.entity_id IN (SELECT id FROM readable_nodes) AND ({timeline_sql})
+            UNION ALL
+            SELECT 'commitments', c.id FROM commitments c
+            WHERE c.workspace_id = :workspace_id AND c.id = ANY(:commitment_ids)
+              AND c.counterparty_person_id IN (SELECT id FROM readable_nodes)
+              AND ({commitments_sql})
+            UNION ALL
+            SELECT 'notes', nt.id FROM notes nt
+            WHERE nt.workspace_id = :workspace_id AND nt.id = ANY(:note_ids)
+              AND nt.restricted = false AND ({notes_sql})
+            UNION ALL
+            SELECT 'risks', r.id FROM risks r
+            WHERE r.workspace_id = :workspace_id AND r.id = ANY(:risk_ids) AND ({risks_sql})
+            UNION ALL
+            SELECT 'dependencies', w.id FROM waiting_links w
+            WHERE w.workspace_id = :workspace_id AND w.id = ANY(:dependency_ids)
+              AND w.counterparty_entity_id IN (SELECT id FROM readable_nodes)
+              AND ({dependencies_sql})
+            UNION ALL
+            SELECT 'evidence_gaps', e.id FROM pkos_evidence e
+            WHERE e.workspace_id = :workspace_id AND e.id = ANY(:evidence_ids)
+              AND e.node_id IN (SELECT id FROM readable_nodes) AND ({evidence_sql})
+            """  # noqa: S608 -- authz visibility fragments; values bound
+        ),
+        {
+            "workspace_id": auth.workspace_id,
+            "node_ids": list(node_ids),
+            "timeline_ids": [t.id for t in view.timeline],
+            "commitment_ids": [c.id for c in view.commitments],
+            "note_ids": [n.id for n in notes],
+            "risk_ids": [r.id for r in view.risks],
+            "dependency_ids": [d.id for d in view.dependencies],
+            "evidence_ids": [e.id for e in view.evidence_gaps],
+            **nodes_params,
+            **timeline_params,
+            **commitments_params,
+            **notes_params,
+            **risks_params,
+            **dependencies_params,
+            **evidence_params,
+        },
+    ).all()
+    readable: dict[str, set[UUID]] = {}
+    for section, row_id in rows:
+        readable.setdefault(section, set()).add(row_id)
+
+    def _keep[T](items: list[T], section: str, key: Callable[[T], UUID]) -> list[T]:
+        allowed = readable.get(section, set())
+        return [item for item in items if key(item) in allowed]
+
+    update: dict[str, Any] = {
+        "participants": _keep(view.participants, "participants", lambda p: p.entity_id),
+        "timeline": _keep(view.timeline, "timeline", lambda t: t.id),
+        "commitments": _keep(view.commitments, "commitments", lambda c: c.id),
+        "decisions": _keep(view.decisions, "notes", lambda n: n.id),
+        "notes": _keep(view.notes, "notes", lambda n: n.id),
+        "risks": _keep(view.risks, "risks", lambda r: r.id),
+        "dependencies": _keep(view.dependencies, "dependencies", lambda d: d.id),
+        "evidence_gaps": _keep(view.evidence_gaps, "evidence_gaps", lambda e: e.id),
+    }
+    if all(len(kept) == len(getattr(view, name)) for name, kept in update.items()):
+        return view
+    if view.enrichment.available:
+        update["enrichment"] = EnrichmentOut(
+            available=False, summary=None, error_code="evidence_unavailable"
+        )
+    return view.model_copy(update=update)
+
+
+def _replayed_pack(session: Session, auth: AuthContext, cached: dict[str, Any]) -> MeetingPack:
+    """A cached create/refresh response, re-checked like a GET. The cached
+    body is the caller's merged view, capped per section, so a stored row
+    the summary was built from can be missing from it; the stored summary
+    is therefore also withheld when anything drops from the pack's full
+    stored content (or that row is gone)."""
+    filters = _ReadFilters(session, auth)
+    view = _without_unreadable_rows(
+        session, auth, MeetingPack.model_validate(cached), filters=filters
+    )
+    if not view.enrichment.available:
+        return view
+    content = session.execute(
+        text("SELECT content FROM meeting_packs WHERE workspace_id = :workspace_id AND id = :id"),
+        {"workspace_id": auth.workspace_id, "id": view.id},
+    ).scalar_one_or_none()
+    if content is not None:
+        stored = PackContentSnapshot.model_validate(content)
+        if _without_unreadable_rows(session, auth, stored, filters=filters) is stored:
+            return view
+    return view.model_copy(
+        update={
+            "enrichment": EnrichmentOut(
+                available=False, summary=None, error_code="evidence_unavailable"
+            )
+        }
+    )
+
+
 def _caller_view(
     session: Session,
     auth: AuthContext,
@@ -1230,8 +1409,13 @@ def _caller_view(
     Computed per request and returned, never persisted and never part of
     the fingerprint -- so one member's private rows neither reach another
     member nor flip the shared pack's stale flag. With no such rows (every
-    workspace-only pack) the snapshot is returned unchanged."""
+    workspace-only pack) the snapshot is returned unchanged.
+
+    The snapshot's own rows are first re-checked against the live rows
+    (``_without_unreadable_rows``), so a row narrowed after generation
+    stops reaching readers who lost it even before the pack is refreshed."""
     filters = filters or _ReadFilters(session, auth)
+    snapshot = _without_unreadable_rows(session, auth, snapshot, filters=filters)
     participant_rows = _fetch_participant_rows(session, auth, meeting_id, filters=filters)
     shared_ids = [p.entity_id for p, shared in participant_rows if shared]
     private_participants = [p for p, shared in participant_rows if not shared]
@@ -1791,7 +1975,7 @@ def create_prep(
             # would otherwise trip with a 409.
             cached = load_cached(session, auth, idempotency_key, req_hash, domain="meeting_prep")
             if cached is not None:
-                return MeetingPack.model_validate(cached)
+                return _replayed_pack(session, auth, cached)
 
             existing = _current_pack_row(session, auth, meeting_id)
             if existing is not None:
@@ -1812,7 +1996,7 @@ def create_prep(
             # the existing-pack check a successful create's replay would trip.
             cached = load_cached(session, auth, idempotency_key, req_hash, domain="meeting_prep")
             if cached is not None:
-                return MeetingPack.model_validate(cached)
+                return _replayed_pack(session, auth, cached)
 
             existing = _current_pack_row(session, auth, meeting_id)
             if existing is not None:
@@ -1823,7 +2007,11 @@ def create_prep(
             generated = generate_pack(session, auth, meeting_id, meeting_row)
 
         enrichment = _compute_enrichment(
-            session, auth, meeting_id, ollama_adapter=_resolve_ollama_adapter(request)
+            session,
+            auth,
+            meeting_id,
+            generated.content,
+            ollama_adapter=_resolve_ollama_adapter(request),
         )
 
         # Enrichment ran outside any transaction, so the authorization above
@@ -2044,7 +2232,7 @@ def refresh_prep(
                     session, auth, idempotency_key, req_hash, domain="meeting_prep"
                 )
                 if cached is not None:
-                    return MeetingPack.model_validate(cached)
+                    return _replayed_pack(session, auth, cached)
 
                 old = _current_pack_row(session, auth, meeting_id, for_update=True)
                 if old is None:
@@ -2067,7 +2255,7 @@ def refresh_prep(
             # Same placement as the fast path above.
             cached = load_cached(session, auth, idempotency_key, req_hash, domain="meeting_prep")
             if cached is not None:
-                return MeetingPack.model_validate(cached)
+                return _replayed_pack(session, auth, cached)
 
             old = _current_pack_row(session, auth, meeting_id, for_update=True)
             if old is None:
@@ -2076,7 +2264,11 @@ def refresh_prep(
             generated = generate_pack(session, auth, meeting_id, meeting_row)
 
         enrichment = _compute_enrichment(
-            session, auth, meeting_id, ollama_adapter=_resolve_ollama_adapter(request)
+            session,
+            auth,
+            meeting_id,
+            generated.content,
+            ollama_adapter=_resolve_ollama_adapter(request),
         )
 
         try:

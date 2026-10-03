@@ -224,7 +224,9 @@ def _set_enrichment(monkeypatch: pytest.MonkeyPatch, *, enabled: bool) -> list[U
     calls: list[UUID] = []
     if enabled:
 
-        def enrich(_session: Any, _auth: Any, meeting_id: UUID, **_kwargs: Any) -> EnrichmentOut:
+        def enrich(
+            _session: Any, _auth: Any, meeting_id: UUID, *_args: Any, **_kwargs: Any
+        ) -> EnrichmentOut:
             calls.append(meeting_id)
             return EnrichmentOut(available=False, summary=None, error_code="model_unavailable")
 
