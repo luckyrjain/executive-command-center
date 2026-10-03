@@ -502,6 +502,50 @@ def test_policy_create_does_not_deadlock_with_draft_create(world: World) -> None
     assert result["status"] == 201, result["body"]
 
 
+def test_policy_create_sees_a_visibility_change_committed_while_it_waits(world: World) -> None:
+    """Policy create locks the workflow's governing version `FOR SHARE`
+    before authorizing. A transaction that has the version locked and makes
+    it private holds the create back; once it commits, the create sees the
+    private version and answers 404 without binding a policy."""
+    workflow_id = f"vis.createrace.{uuid4().hex[:8]}"
+    draft = _draft_workflow(world, workflow_id)
+    result: dict[str, Any] = {}
+
+    def fire() -> None:
+        try:
+            result["status"], result["body"] = _post_policy(world.c_token, workflow_id)
+        except BaseException as exc:  # surfaced on the main thread below
+            result["error"] = exc
+
+    holder = engine.connect()
+    holder_tx = holder.begin()
+    thread = threading.Thread(target=fire)
+    try:
+        holder_pid = int(holder.execute(text("SELECT pg_backend_pid()")).scalar_one())
+        holder.execute(
+            text("UPDATE workflow_versions SET visibility = 'private' WHERE id = :id"),
+            {"id": draft.id},
+        )
+        thread.start()
+        deadline = time.monotonic() + 15
+        while not _blocked_by(holder_pid):
+            assert time.monotonic() < deadline, "policy create never queued on the version row"
+            time.sleep(0.05)
+        holder_tx.commit()
+    finally:
+        if holder_tx.is_active:
+            holder_tx.rollback()
+        holder.close()
+        thread.join(timeout=15)
+
+    assert not thread.is_alive()
+    if "error" in result:
+        raise result["error"]
+    assert result["status"] == 404, result["body"]
+    assert result["body"]["error"]["code"] == "WORKFLOW_NOT_FOUND"
+    assert _policy_count(world.ws, workflow_id, world.c) == 0
+
+
 # ---------------------------------------------------------------------------
 # Run reads and mutations
 # ---------------------------------------------------------------------------
