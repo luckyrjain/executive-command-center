@@ -162,7 +162,8 @@ def _seed_family(
     return workflow_id, version_id
 
 
-def _seed_policy(w: RaceWorld, *, owner: UUID, visibility: str) -> UUID:
+def _seed_policy(w: RaceWorld, *, owner: UUID, visibility: str) -> tuple[str, UUID]:
+    """A policy of a new workspace-visible draft family; returns both."""
     workflow_id, _ = _seed_family(w, owner=owner, visibility="workspace", status="draft")
     policy_id = uuid4()
     with engine.begin() as conn:
@@ -183,7 +184,7 @@ def _seed_policy(w: RaceWorld, *, owner: UUID, visibility: str) -> UUID:
                 "vis": visibility,
             },
         )
-    return policy_id
+    return workflow_id, policy_id
 
 
 def _grant_read(w: RaceWorld, *, grantee: UUID, resource_type: str, resource_id: UUID) -> None:
@@ -357,7 +358,7 @@ def test_owner_may_append_to_own_private_family(world: RaceWorld) -> None:
 
 
 def test_invisible_policy_ref_is_indistinguishable_from_unknown(world: RaceWorld) -> None:
-    private_policy = _seed_policy(world, owner=world.b, visibility="private")
+    _, private_policy = _seed_policy(world, owner=world.b, visibility="private")
     c_token = _session_token(world, world.c)
     rows_before = _family_rows(world)
     with _client(c_token) as client:
@@ -370,10 +371,10 @@ def test_invisible_policy_ref_is_indistinguishable_from_unknown(world: RaceWorld
 
 
 def test_visible_policy_ref_is_accepted(world: RaceWorld) -> None:
-    policy = _seed_policy(world, owner=world.b, visibility="workspace")
+    workflow_id, policy = _seed_policy(world, owner=world.b, visibility="workspace")
     c_token = _session_token(world, world.c)
     with _client(c_token) as client:
-        response = _create(client, c_token, f"new-{uuid4().hex[:12]}", policy_ref=policy)
+        response = _create(client, c_token, workflow_id, policy_ref=policy)
 
     assert response.status_code == 201, response.text
     assert response.json()["policy_ref"] == str(policy)
@@ -461,10 +462,9 @@ def test_create_replay_is_reauthorized_against_the_family(world: RaceWorld) -> N
 
 
 def test_create_replay_is_reauthorized_against_the_policy(world: RaceWorld) -> None:
-    policy = _seed_policy(world, owner=world.b, visibility="workspace")
+    workflow_id, policy = _seed_policy(world, owner=world.b, visibility="workspace")
     c_token = _session_token(world, world.c)
     request_headers = headers(c_token)
-    workflow_id = f"new-{uuid4().hex[:12]}"
     with _client(c_token) as client:
         first = _create(
             client, c_token, workflow_id, policy_ref=policy, request_headers=request_headers
@@ -544,15 +544,13 @@ def test_active_version_made_private_while_publish_waits_is_refused(world: RaceW
 
 
 def test_policy_made_private_while_create_waits_is_refused(world: RaceWorld) -> None:
-    policy = _seed_policy(world, owner=world.a, visibility="workspace")
+    workflow_id, policy = _seed_policy(world, owner=world.a, visibility="workspace")
     rows_before = _family_rows(world)
     response, _ = race(
         world,
         table="automation_policies",
         row_id=policy,
-        send=lambda client: _create(
-            client, world.b_token, f"new-{uuid4().hex[:12]}", policy_ref=policy
-        ),
+        send=lambda client: _create(client, world.b_token, workflow_id, policy_ref=policy),
         transfer=True,
         mutate=_make_private("automation_policies", policy),
     )

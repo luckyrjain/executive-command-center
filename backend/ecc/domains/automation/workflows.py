@@ -53,7 +53,14 @@ from .adapter_contract import ACTION_TYPES, DATA_CLASSES, dispatch_value, has_di
 from .adapters import ActionAdapter, AdapterRegistry
 from .adapters import registry as _production_adapter_registry
 from .approvals import evaluate_approval_requirement, evaluate_policy_scope
-from .policy import AutomationPolicy, get_policy, is_policy_usable, policy_status, policy_visible
+from .policy import (
+    AutomationPolicy,
+    get_policy,
+    get_policy_for_workflow,
+    is_policy_usable,
+    policy_status,
+    policy_visible,
+)
 
 # Task 7a: safe to import `.adapters`/`.policy`/`.approvals` here -- confirmed
 # directly, none of those three modules imports `workflows.py` or `worker.py`
@@ -212,6 +219,20 @@ class WorkflowVersionActionOutsidePolicyScope:
     workflow_id: str
     version: int
     violations: tuple[dict[str, str], ...]
+
+
+@dataclass(frozen=True)
+class WorkflowVersionPolicyWorkflowMismatch:
+    """`activate_workflow_version` refused to publish a version whose
+    `policy_ref` names a policy of another workflow -- a draft written
+    before `POST /automations/workflows` checked this, or by a direct
+    caller. Publishing it would run this workflow under authority someone
+    granted a different one (`API-SCHEMAS.md`'s confused-deputy rule); the
+    dispatch gate would block it anyway (`policy.get_policy_for_workflow`),
+    so refusing here only surfaces that before a run exists."""
+
+    workflow_id: str
+    version: int
 
 
 def action_refs_outside_policy_scope(
@@ -758,6 +779,7 @@ def activate_workflow_version(
     | WorkflowVersionUnregisteredAdapter
     | WorkflowVersionHighImpactCompensationAdapter
     | WorkflowVersionActionOutsidePolicyScope
+    | WorkflowVersionPolicyWorkflowMismatch
 ):
     """Publish a draft version (design doc Decision 2's activation
     mechanism): retires whichever version is currently `active` for this
@@ -830,6 +852,20 @@ def activate_workflow_version(
             status=target_row["status"],
         )
 
+    # Not registry-dependent: the policy must govern this workflow whoever
+    # publishes. A `policy_ref` that resolves to nothing is left to the
+    # dispatch gate, as before.
+    named_policy = (
+        get_policy(session, workspace_id, target_row["policy_ref"])
+        if target_row["policy_ref"] is not None
+        else None
+    )
+    if named_policy is not None and named_policy.workflow_id != target_row["workflow_id"]:
+        return WorkflowVersionPolicyWorkflowMismatch(
+            workflow_id=target_row["workflow_id"],
+            version=target_row["version"],
+        )
+
     if adapter_registry is not None:
         violations = unregistered_action_refs(target_row["graph"], adapter_registry)
         if violations:
@@ -856,12 +892,9 @@ def activate_workflow_version(
         # stays authoritative -- when there is no policy_ref, or the policy
         # is legacy, revoked or expired: those already block at dispatch
         # with their own reasons, and failing publish for them would be new
-        # behaviour outside the scope-enforcement design.
-        scope_policy = (
-            get_policy(session, workspace_id, target_row["policy_ref"])
-            if target_row["policy_ref"] is not None
-            else None
-        )
+        # behaviour outside the scope-enforcement design. `named_policy`
+        # already matches this workflow (checked above).
+        scope_policy = named_policy
         if (
             scope_policy is not None
             and scope_policy.scope_enforced
@@ -1156,6 +1189,27 @@ def _authorize_policy_ref(session: Session, auth: AuthContext, policy_ref: UUID)
         raise HTTPException(status_code=404, detail="POLICY_NOT_FOUND")
 
 
+def _require_policy_of_family(
+    session: Session, auth: AuthContext, policy_ref: UUID, workflow_id: str
+) -> None:
+    """A `policy_ref` must name a policy of the draft's own workflow
+    family, else `422 POLICY_WORKFLOW_MISMATCH`. Runs after
+    `_authorize_policy_ref`, so only a policy the caller can already see
+    reaches it and the 422 discloses nothing new. Without it, a member
+    could point their own workflow at a policy someone created for another
+    one and run under its authority (`API-SCHEMAS.md`'s confused-deputy
+    rule)."""
+    policy = get_policy(session, auth.workspace_id, policy_ref)
+    if policy is not None and policy.workflow_id != workflow_id:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "POLICY_WORKFLOW_MISMATCH",
+                "message": "policy_ref must name a policy of this workflow.",
+            },
+        )
+
+
 def _authorize_retiring_active_version(
     session: Session, auth: AuthContext, version_id: UUID
 ) -> None:
@@ -1290,8 +1344,9 @@ def create_workflow_endpoint(
     surface (`API-SCHEMAS.md` lists no separate "add version" route).
 
     Appending to an existing family requires read and write on its latest
-    and active versions, and a `policy_ref` must be readable
-    (`_lock_and_authorize_family`/`_authorize_policy_ref`). Both
+    and active versions, and a `policy_ref` must be readable and govern
+    this same `workflow_id` (`_lock_and_authorize_family`/
+    `_authorize_policy_ref`/`_require_policy_of_family`). All
     run before the idempotency cache, so a same-key replay is
     re-authorized (ADR-0014).
     """
@@ -1313,6 +1368,7 @@ def create_workflow_endpoint(
         _lock_and_authorize_family(session, auth, payload.workflow_id)
         if payload.policy_ref is not None:
             _authorize_policy_ref(session, auth, payload.policy_ref)
+            _require_policy_of_family(session, auth, payload.policy_ref, payload.workflow_id)
         cached = load_cached(
             session,
             auth,
@@ -1517,6 +1573,17 @@ def publish_workflow_endpoint(
                     "workflow_id": result.workflow_id,
                     "version": result.version,
                     "violations": [dict(v) for v in result.violations],
+                },
+            )
+
+        if isinstance(result, WorkflowVersionPolicyWorkflowMismatch):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "POLICY_WORKFLOW_MISMATCH",
+                    "message": "policy_ref must name a policy of this workflow.",
+                    "workflow_id": result.workflow_id,
+                    "version": result.version,
                 },
             )
 
@@ -1789,7 +1856,9 @@ def _simulate_steps(
     steps: list[dict[str, Any]] = version.graph.get("steps", [])
     policy_row: AutomationPolicy | None = None
     if version.policy_ref is not None:
-        policy_row = get_policy(session, version.workspace_id, version.policy_ref)
+        policy_row = get_policy_for_workflow(
+            session, version.workspace_id, version.policy_ref, version.workflow_id
+        )
 
     results: list[SimulateStepResult] = []
     action_step_count_so_far = 0

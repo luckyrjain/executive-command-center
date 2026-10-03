@@ -161,6 +161,7 @@ describe('WorkflowList', () => {
   it.each([
     ['WORKFLOW_NOT_FOUND', 404, 'Workflow Not Found', 'That workflow ID is taken by a workflow you cannot see. Choose a different ID.'],
     ['INSUFFICIENT_ROLE', 403, 'Insufficient Role', 'You do not have permission to add a version to that workflow.'],
+    ['POLICY_WORKFLOW_MISMATCH', 422, 'Policy Workflow Mismatch', 'That policy belongs to a different workflow. Attach a policy created for this workflow.'],
   ])('maps a create refused with %s to a readable sentence', async (code, status, raw, expected) => {
     const fetch = vi.fn()
       .mockImplementationOnce(() => response({ workflows: [] }))

@@ -174,7 +174,7 @@ runs next (also unchanged -- it is what tells this call whether a prior
 attempt already dispatched, succeeded, failed, or left an ambiguous
 `unknown`-shaped gap for *this exact step*). Only once that check confirms
 there is **no row at all yet** does `_evaluate_dispatch_gate` run: it
-resolves the run's policy (`policy.get_policy` via `run.policy_id`;
+resolves the run's policy (`policy.get_policy_for_workflow` via `run.policy_id`;
 `policy.is_policy_usable`), and, if the policy is usable, evaluates
 `approvals.evaluate_approval_requirement` against the resolved adapter. A
 step this gate does not clear returns `StepBlockedByPolicy` or
@@ -213,8 +213,9 @@ corrected" section below.
 `_evaluate_dispatch_gate`'s two blocking outcomes:
 
 1. **No usable policy (`StepBlockedByPolicy`).** `run.policy_id is None`,
-   or it names a row `policy.get_policy` cannot find, or `policy.
-   is_policy_usable` reports `False` (revoked or expired) -- all three
+   or it names a row `policy.get_policy_for_workflow` cannot find (missing,
+   or a policy of another workflow), or `policy.is_policy_usable` reports
+   `False` (revoked or expired) -- all three
    block the step, fail-closed ("no policy means no authority," this
    task's own instruction: an unset `policy_id` is not an implicit
    all-bounded default). `process_claimed_run` maps this to `run.status =
@@ -532,8 +533,8 @@ its own fix, in a different place:
    called, so a policy revoked (or expired, or deleted) at any point after
    the last ordinary step's own `_evaluate_dispatch_gate` still authorized a
    real, un-reauthorized side effect. `_dispatch_compensation_step` now calls
-   `_compensation_policy_usable` (the identical `get_policy`/`is_policy_
-   usable` question the gate asks, deliberately re-read from the database
+   `_compensation_policy_usable` (the identical `get_policy_for_workflow`/
+   `is_policy_usable` question the gate asks, deliberately re-read from the database
    rather than cached) before resolving either adapter, and on failure marks
    the step *and* its ledger row `'failed'` with
    `error_class='PolicyUnusableDuringCompensation'` without invoking
@@ -1566,7 +1567,9 @@ def enqueue_run(
     # means no authority" gate (`_evaluate_dispatch_gate`), so no side effect
     # can follow from letting the row be created.
     if active.policy_ref is not None:
-        policy_row = policy_module.get_policy(session, workspace_id, active.policy_ref)
+        policy_row = policy_module.get_policy_for_workflow(
+            session, workspace_id, active.policy_ref, workflow_id
+        )
         if policy_row is not None:
             limit = _configured_runs_per_hour(policy_row)
             if limit is not None:
@@ -2030,9 +2033,10 @@ def _resolve_usable_policy(
 
     Fail-closed in all three unusable shapes, exactly as the module
     docstring's "No usable policy" section describes: `run.policy_id is
-    None` (no authority was ever attached), `policy.get_policy` finds no
-    such row, or `policy.is_policy_usable` reports `False` (revoked or
-    expired -- `policy.policy_status` distinguishes which, and that
+    None` (no authority was ever attached), `policy.get_policy_for_
+    workflow` finds no such row for this run's workflow, or `policy.
+    is_policy_usable` reports `False` (revoked or expired --
+    `policy.policy_status` distinguishes which, and that
     distinction is carried through to `StepBlockedByPolicy.reason`).
     Returns the resolved, currently-usable `AutomationPolicy` otherwise,
     so a caller that needs it for approval evaluation does not have to
@@ -2052,7 +2056,9 @@ def _resolve_usable_policy(
     """
     if run.policy_id is None:
         return StepBlockedByPolicy(step_index, "no_policy")
-    policy_row = policy_module.get_policy(session, run.workspace_id, run.policy_id)
+    policy_row = policy_module.get_policy_for_workflow(
+        session, run.workspace_id, run.policy_id, run.workflow_id
+    )
     if policy_row is None:
         return StepBlockedByPolicy(step_index, "no_policy")
     if not policy_module.is_policy_usable(policy_row):
@@ -2805,7 +2811,7 @@ def _compensation_policy_usable(session: Session, run: WorkflowRun) -> bool:
     effect immediately for any not-yet-started step" is only true if the
     revocation is observed by whatever is about to start a step, and a
     compensation step is by definition not-yet-started at this point. Reads
-    with `policy.get_policy` (no `FOR UPDATE`) -- this is a point-in-time
+    with `policy.get_policy_for_workflow` (no `FOR UPDATE`) -- this is a point-in-time
     authorization read, not a mutation that needs to serialize against a
     concurrent `revoke_policy`; under READ COMMITTED it sees every
     revocation committed before this statement, which is exactly the
@@ -2816,7 +2822,9 @@ def _compensation_policy_usable(session: Session, run: WorkflowRun) -> bool:
     """
     if run.policy_id is None:
         return False
-    policy_row = policy_module.get_policy(session, run.workspace_id, run.policy_id)
+    policy_row = policy_module.get_policy_for_workflow(
+        session, run.workspace_id, run.policy_id, run.workflow_id
+    )
     if policy_row is None:
         return False
     return policy_module.is_policy_usable(policy_row)
@@ -3107,7 +3115,9 @@ def _dispatch_compensation_step(
         and compensation_adapter is not None
     ):
         scope_policy = (
-            policy_module.get_policy(session, run.workspace_id, run.policy_id)
+            policy_module.get_policy_for_workflow(
+                session, run.workspace_id, run.policy_id, run.workflow_id
+            )
             if run.policy_id is not None
             else None
         )
