@@ -1398,3 +1398,21 @@ def test_prep_summary_run_is_private_to_its_actor(
     for member in (world.a, world.bystander):
         response = member.client.get(f"/api/v1/ai/runs/{run_id}")
         assert response.status_code == 404, response.text
+
+
+@pytest.mark.parametrize("world", ["false"], indirect=True, ids=["flag_off"])
+def test_flag_off_evidence_gap_on_a_participant_narrowed_later_is_dropped(world: _World) -> None:
+    """Flag off, evidence rows are not visibility-filtered, so a stored gap
+    is dropped only through its participant node: once that node is
+    narrowed to A's private, B and the bystander lose the gap while A
+    (who can read the node) keeps it."""
+    _link(world, world.b, world.entity_id)
+    gap = _insert_evidence(world, owner_id=world.a.user_id, visibility="workspace", state="missing")
+    _prep(world.b, world.meeting_id)
+    assert _gap_ids(_stored(world.meeting_id)) == {gap}
+
+    _narrow(world, "pkos_nodes", world.entity_id, owner_id=world.a.user_id)
+
+    for member in (world.b, world.bystander):
+        assert _gap_ids(_get(member, world.meeting_id)) == set()
+    assert _gap_ids(_get(world.a, world.meeting_id)) == {gap}
