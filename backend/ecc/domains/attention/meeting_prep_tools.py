@@ -81,12 +81,13 @@ def get_prep_pack_tool(
     # member's own view (`meeting_prep._caller_view`): this tool's only
     # consumer is the `meeting.prep_summary` run (its sole `eligible_tools`
     # entry; `POST /ai/runs` accepts only `attention.explain_item`), and
-    # every such run's output is shared -- `meeting_prep._compute_
-    # enrichment` stores the summary in the pack every meeting reader gets,
-    # and the run itself (summary, cited ids) is a `workspace`-visible
-    # `ai_runs` row. Giving it the caller's private rows would copy them
-    # into both (FX1). A per-member AI view would need its own run type
-    # stored private to that member, not this tool.
+    # every such run's summary is shared -- `meeting_prep._compute_
+    # enrichment` stores the summary in the pack every meeting reader gets.
+    # Giving it the caller's private rows would copy them into that shared
+    # pack (FX1). The run row itself is private to its actor
+    # (`runtime.ACTOR_PRIVATE_TASK_TYPES`), but its summary still reaches
+    # every reader through the pack. A per-member AI view would need its own
+    # run type, not this tool.
     #
     # Inside a create/refresh's own enrichment run, summarize the exact
     # content that request is storing (FX7): a live regeneration could
