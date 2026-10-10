@@ -2,9 +2,9 @@
 id: PHASE-010-API-SCHEMAS
 title: Phase 10 Gmail API Schemas
 status: Approved for Implementation
-version: 1.7.0
+version: 1.8.0
 owner: Lucky Jain
-updated: 2026-10-01
+updated: 2026-10-10
 depends_on:
   - PHASE-010
   - PHASE-006-API-SCHEMAS
@@ -326,7 +326,8 @@ deployed.
 | Recommendations, AI runs, evidence (list, detail, resolve, delete) | Flag: email recommendations, `email.*` AI runs and their steps, and Gmail evidence are visible only to the mailbox owner (`404` to others) |
 | Knowledge readers (entity tool, retrieval, meeting prep evidence) and evidence citations (claims, relationships, risk reviews, commitments) | Flag: other members' private evidence is excluded; citing evidence the caller cannot read is rejected |
 | Global search | Unflagged: every result type is filtered by the caller's visibility |
-| Meeting prep (`/api/v1/meetings/{id}/prep`) | Unflagged: the stored pack holds only workspace-visible sources, plus a per-caller live overlay (`docs/phases/phase-003/MEETING-PREP-CONTRACT.md`) |
+| Meeting prep (`/api/v1/meetings/{id}/prep`) | Unflagged: the stored pack holds only workspace-visible sources, plus a per-caller live overlay; reads drop stored rows the caller can no longer read and then withhold the stored AI summary (`enrichment.error_code = evidence_unavailable`) (`docs/phases/phase-003/MEETING-PREP-CONTRACT.md`) |
+| `GET /api/v1/ai/runs/{id}`, `POST .../cancel` (`meeting.prep_summary` runs) | Unflagged (FX10): a prep-summary AI run and its steps are private to the member who generated the pack (`404 AI_RUN_NOT_FOUND` to others, absent a grant or transfer) |
 | Member removal, role change | Unflagged: can return a retryable `409 MEMBERSHIP_CHANGE_BUSY` (ADR-0014) while a sync holds the membership lock during a token refresh |
 
 Unchanged on purpose: person entities and their aliases stay workspace
@@ -359,3 +360,4 @@ is now closed out.
 | 1.5.0 | 2026-08-11 | Later addition: documented `GET /api/v1/personal/gmail/oauth/complete`, the real Google-facing redirect target that closes the "browser stranded on raw backend JSON" gap `/oauth/callback`'s own section already disclosed | Lucky Jain |
 | 1.6.0 | 2026-09-28 | Security Remediation FX5: documented the sync endpoint's `403 MEMBERSHIP_INACTIVE` and `403 EMAIL_CONSENT_NOT_ACTIVE` skips (run closed `failed`, cursor not advanced, no outcome/audit writes), replacing the previous `201` failed/partial/succeeded outcomes | Lucky Jain |
 | 1.7.0 | 2026-10-01 | Security Remediation Spec A (T19; review fix: only the four refusals write `enrollment_refused`, not `CONNECTOR_ACCOUNT_PERSIST_FAILED` / `GMAIL_ACCOUNT_ALREADY_CONNECTED`): documented the callback refusals (`GMAIL_ACCOUNT_IDENTITY_MISMATCH`, `CONNECTOR_OWNED_BY_ANOTHER_MEMBER`, `MEMBERSHIP_INACTIVE`, `INSUFFICIENT_ROLE`, `CONNECTOR_ACCOUNT_PERSIST_FAILED`), engineering reactivation `404`/`403`, the non-owner Gmail `sync`/`disable` `404` (was `409` for `disable`), and a Spec A summary table across sharing, removal, recommendations, readers, search and meeting prep | Lucky Jain |
+| 1.8.0 | 2026-10-10 | Spec A table: meeting-prep reads drop rows the caller can no longer read and withhold the summary (FX7); `meeting.prep_summary` AI runs are private to their actor (FX10) | Lucky Jain |

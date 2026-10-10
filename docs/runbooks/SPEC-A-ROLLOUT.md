@@ -2,10 +2,10 @@
 id: SPEC-A-ROLLOUT
 title: Security Remediation Spec A Rollout Runbook
 status: Active
-version: 1.5.0
+version: 1.6.0
 owner: Lucky Jain
 created: 2026-10-01
-updated: 2026-10-03
+updated: 2026-10-10
 depends_on:
   - PHASE-10-GMAIL-RECOVERY
   - SPEC-A-ALERTS
@@ -154,7 +154,7 @@ Exit 0 means nothing was found; exit 1 means rows were found (checks A–E, CSV 
 
 - [ ] R4 gate met; migrations 0083/0084 applied (R1); alert rules live.
 - [ ] **Database backup.** Take a full backup immediately before R5 (`make backup`, `docs/operations/PHASE-0-BACKUP-RESTORE.md`), verify it (`make verify-restore BACKUP=<file>`), and record its name in the change record. The backfill log and the snapshot tables below make the R5 changes reversible row by row; the backup covers anything they do not (the grants the backfill revokes, a mistaken manual statement).
-- [ ] **`<fx1_deploy_time>`** in every statement below is the moment the FX1 build (PR #308) went live, written with an explicit UTC offset, for example `'2026-09-29T14:00:00+00:00'`. The block also sets `SET LOCAL TimeZone = 'UTC'`, so the recorded `cleanup_ts` prints in UTC; a literal without an offset would otherwise be read in the session's time zone.
+- [ ] **`<fx1_deploy_time>`** in every statement below is the moment the FX1 build (PR #308) went live, written with an explicit UTC offset, for example `'2026-09-29T14:00:00+00:00'`. **`<fx10_deploy_time>`** (the AI-run statements only) is the moment the FX10 build (#399, prep-summary runs private to their actor) went live, written the same way; every `meeting.prep_summary` run since then is already private. Run these statements only once the FX10 build is live (see the deploy check below). The block also sets `SET LOCAL TimeZone = 'UTC'`, so the recorded `cleanup_ts` prints in UTC; a literal without an offset would otherwise be read in the session's time zone.
 - [ ] **Snapshot before the FX1 clean-up.** The two statements below change rows that no log records, so first copy what they will change into snapshot tables (ids, owners, visibility, status only; no content). The snapshot block below, the pack archive (if you archive rather than refresh) and the AI-run narrowing form **one transaction** in one `psql` session: the block opens it with `BEGIN` and the narrowing ends it with `COMMIT`. If you refresh packs through the API instead, do that after the `COMMIT`; the snapshot still lists which packs to refresh.
 
   ```sql
@@ -166,11 +166,11 @@ Exit 0 means nothing was found; exit 1 means rows were found (checks A–E, CSV 
   -- grant locks its resource row (authz_grants._load_resource_for_update), so
   -- no new grant on these rows can commit until this transaction ends.
   SELECT id FROM ai_runs
-  WHERE task_type = 'meeting.prep_summary' AND created_at < '<fx1_deploy_time>'
+  WHERE task_type = 'meeting.prep_summary' AND created_at < '<fx10_deploy_time>'
   ORDER BY id FOR UPDATE;
   SELECT st.id FROM ai_run_steps st JOIN ai_runs r
     ON r.id = st.run_id AND r.workspace_id = st.workspace_id
-  WHERE r.task_type = 'meeting.prep_summary' AND r.created_at < '<fx1_deploy_time>'
+  WHERE r.task_type = 'meeting.prep_summary' AND r.created_at < '<fx10_deploy_time>'
   ORDER BY st.id FOR UPDATE OF st;
   CREATE TABLE spec_a_r5_meeting_packs_snapshot AS
     SELECT id, workspace_id, meeting_id, status, version, updated_at, updated_by
@@ -179,7 +179,7 @@ Exit 0 means nothing was found; exit 1 means rows were found (checks A–E, CSV 
   CREATE TABLE spec_a_r5_ai_runs_snapshot AS
     SELECT id, workspace_id, owner_id, visibility
     FROM ai_runs
-    WHERE task_type = 'meeting.prep_summary' AND created_at < '<fx1_deploy_time>';
+    WHERE task_type = 'meeting.prep_summary' AND created_at < '<fx10_deploy_time>';
   CREATE TABLE spec_a_r5_ai_run_steps_snapshot AS
     SELECT s.id, s.workspace_id, s.owner_id, s.visibility
     FROM ai_run_steps s JOIN spec_a_r5_ai_runs_snapshot r
@@ -192,7 +192,7 @@ Exit 0 means nothing was found; exit 1 means rows were found (checks A–E, CSV 
   SELECT now() AS cleanup_ts;  -- record this value: every grant revoked below gets exactly it
   ```
 
-  Keep the snapshot tables until R7 closes, then drop them. Restrict access to them like the backfill log.
+  Keep the snapshot tables (and the `_rolling` ones, if that block below runs) until R7 closes, then drop them. Restrict access to them like the backfill log.
 - [ ] **FX1 packs.** Archive or refresh every active meeting pack generated before the FX1 deploy (PR #308). Such packs may still hold other members' private rows and private text in their AI enrichment. Since FX7 every read drops the rows the reader cannot read and then withholds the summary, but the stored content keeps them until the pack is refreshed or archived. They are the rows in `spec_a_r5_meeting_packs_snapshot`. Either refresh each one (`POST /api/v1/meetings/<meeting_id>/prep/refresh` as a member who can read the meeting), or archive them all; members then regenerate with `POST .../prep`:
 
   ```sql
@@ -202,7 +202,7 @@ Exit 0 means nothing was found; exit 1 means rows were found (checks A–E, CSV 
   ```
 
   Superseded packs (`refreshed`, `archived`) are kept as history but no endpoint serves them. Undoing an archive (setting `status` back from the snapshot) is possible only for a meeting that has no newer active pack, because a meeting may have at most one `fresh`/`stale` pack; it would also re-serve the old content, so do it only as part of a full rollback.
-- [ ] **FX1 AI runs: narrow them to their actor.** Every `meeting.prep_summary` `ai_runs` row (with its `ai_run_steps`) created before the FX1 deploy is served by `GET /api/v1/ai/runs/{id}` to any workspace member, and refreshing a pack does not touch it. Make them private to the member who ran them, and revoke grants on them, in the same transaction as the snapshot above:
+- [ ] **Prep-summary AI runs: narrow them to their actor.** Every `meeting.prep_summary` `ai_runs` row (with its `ai_run_steps`) created before the FX10 deploy is served by `GET /api/v1/ai/runs/{id}` to any workspace member, and refreshing a pack does not touch it. Runs from before FX1 may quote other members' private rows; later ones may quote a row narrowed since (by this backfill, a grant or a delegation). Runs created since FX10 are written private to their actor. Make them private to the member who ran them, and revoke grants on them, in the same transaction as the snapshot above:
 
   ```sql
   UPDATE ai_runs r SET owner_id = r.actor_id, visibility = 'private'
@@ -247,8 +247,54 @@ Exit 0 means nothing was found; exit 1 means rows were found (checks A–E, CSV 
   COMMIT;
   ```
 
-- [ ] **FX7 (#396) deployed (closes FX1 #308 M1).** A row narrowed after its pack was generated (by a grant narrowing, a delegation, or the backfill making a row private) is dropped from every read by members who can no longer read it, and the pack's stored AI summary is withheld from them. Confirm the FX7 build is live before R5. The stored pack content still holds the row until refresh, so database access to `meeting_packs` stays restricted as before.
-- [ ] **Prep-summary AI runs after the backfill (only if `ECC_MEETING_PREP_AI_ENRICHMENT_ENABLED` is on).** FX7 hides a stale pack's summary on every pack read, but the `meeting.prep_summary` `ai_runs` row behind it stays workspace-visible: a run created after the FX1 deploy can quote a workspace row that the backfill then makes private, and `GET /api/v1/ai/runs/{id}` keeps serving it. After the backfill completes, repeat the snapshot block and the narrowing block above with `<fx1_deploy_time>` replaced by the backfill's completion time (explicit UTC offset), every `spec_a_r5_` table name suffixed `_post_backfill`, and the pack snapshot and archive statements left out. Record the second `cleanup_ts`. With enrichment off (the default) no such runs exist; record "not applicable".
+  After the narrowing block's `COMMIT`, confirm no prep-summary run is still `workspace`-visible. Every one the block saw is now private, so any left was missed: written after `<fx10_deploy_time>` by a pre-FX10 API process still running (a rolling deploy), or started before it and committed after the block took its locks. No time bound is used for that reason. (A run its owner has since shared reads `shared_explicitly`, not `workspace`, so it is not counted.)
+
+  ```sql
+  SELECT count(*) FROM ai_runs
+  WHERE task_type = 'meeting.prep_summary' AND visibility = 'workspace';
+  ```
+
+  If the count is not 0, narrow those runs with this block in the same way, once no pre-FX10 process is left. Its snapshot tables are separate (`_rolling`), so the first snapshot and its rollback stay intact; record its `cleanup_ts_rolling` too. Keep and restrict the `_rolling` tables like the first set. Such runs were written workspace-visible from the start, so none has a grant to revoke.
+
+  ```sql
+  \set ON_ERROR_STOP on
+  BEGIN;
+  SET LOCAL TimeZone = 'UTC';
+  SET LOCAL lock_timeout = '5s';
+  CREATE TABLE spec_a_r5_ai_runs_snapshot_rolling AS
+    SELECT id, workspace_id, owner_id, visibility FROM ai_runs
+    WHERE task_type = 'meeting.prep_summary' AND visibility = 'workspace'
+    ORDER BY id FOR UPDATE;
+  SELECT st.id FROM ai_run_steps st JOIN spec_a_r5_ai_runs_snapshot_rolling r
+    ON r.id = st.run_id AND r.workspace_id = st.workspace_id
+  ORDER BY st.id FOR UPDATE OF st;
+  CREATE TABLE spec_a_r5_ai_run_steps_snapshot_rolling AS
+    SELECT s.id, s.workspace_id, s.owner_id, s.visibility
+    FROM ai_run_steps s JOIN spec_a_r5_ai_runs_snapshot_rolling r
+      ON r.id = s.run_id AND r.workspace_id = s.workspace_id;
+  UPDATE ai_runs r SET owner_id = r.actor_id, visibility = 'private'
+  FROM spec_a_r5_ai_runs_snapshot_rolling s
+  WHERE r.id = s.id AND r.workspace_id = s.workspace_id;
+  UPDATE ai_run_steps st SET owner_id = r.owner_id, visibility = 'private'
+  FROM spec_a_r5_ai_run_steps_snapshot_rolling s, ai_runs r
+  WHERE st.id = s.id AND st.workspace_id = s.workspace_id
+    AND r.id = st.run_id AND r.workspace_id = st.workspace_id;
+  SELECT now() AS cleanup_ts_rolling;
+  COMMIT;
+  ```
+
+  To reverse it (full rollback only, and only if this block ran), right after the rollback above:
+
+  ```sql
+  BEGIN;
+  UPDATE ai_runs r SET owner_id = s.owner_id, visibility = s.visibility
+  FROM spec_a_r5_ai_runs_snapshot_rolling s WHERE r.id = s.id AND r.workspace_id = s.workspace_id;
+  UPDATE ai_run_steps st SET owner_id = s.owner_id, visibility = s.visibility
+  FROM spec_a_r5_ai_run_steps_snapshot_rolling s WHERE st.id = s.id AND st.workspace_id = s.workspace_id;
+  COMMIT;
+  ```
+
+- [ ] **FX7 (#396) deployed (closes FX1 #308 M1).** A row narrowed after its pack was generated (by a grant narrowing, a delegation, or the backfill making a row private) is dropped from every read by members who can no longer read it, and the pack's stored AI summary is withheld from them. Confirm the FX7 build, and the FX10 build (prep-summary AI runs private to their actor), are live before R5. The stored pack content still holds the row until refresh, so database access to `meeting_packs` stays restricted as before.
 
 ### Order
 
@@ -284,7 +330,7 @@ Revoked grants are not restored (the SQL that lists them is in SETUP.md). Rows c
 
 What the restore does **not** undo:
 
-- **Rows the application wrote `private` while the flag was on.** New Gmail connectors, runs, cursors, email recommendations, AI runs, Gmail evidence and confirmed email-derived tasks, commitments and risks were written private from the start. They are not in the backfill log, so they stay private after flag off and restore. With the flag off, the share block no longer protects them: an admin can grant or transfer them. If they must become workspace-visible again, that is a separate, deliberate SQL change; if they must stay protected, keep the flag on instead of rolling back.
+- **Rows the application wrote `private` while the flag was on.** New Gmail connectors, runs, cursors, email recommendations, AI runs, Gmail evidence and confirmed email-derived tasks, commitments and risks were written private from the start. They are not in the backfill log, so they stay private after flag off and restore. With the flag off, the share block no longer protects them: an admin can grant or transfer them. If they must become workspace-visible again, that is a separate, deliberate SQL change; if they must stay protected, keep the flag on instead of rolling back. `meeting.prep_summary` AI runs and their steps are private to their actor with or without the flag (FX10), so a flag rollback leaves them private too.
 - **Member removals done while the flag was on.** Their side effects stay: the removed members' Gmail connectors stay disconnected (and their Google grants revoked where that was safe), and re-owned Gmail-only person nodes and aliases keep their new owner. Their retained Gmail-derived rows stay private to the removed member.
 - **The FX1 clean-up.** Archived packs and narrowed AI runs stay as they are unless you restore them from the R5 snapshot tables (above).
 
@@ -327,7 +373,7 @@ Alert rules, how to read each counter, and first actions are in [`../observabili
 - **0083 has no `lock_timeout`.** See R1 for the maintenance window and the `PGOPTIONS` workaround.
 - **Unsalted `override_reason` digest (minor).** The backfill log's `previous_state` stores member-written attention `override_reason` text as an unsalted SHA-256 digest, never the text. A short, guessable reason could be confirmed by hashing candidates. The log is ops-only (no API, not an authz resource). Restrict read access to it, and purge it after R7 once no restore is needed.
 - **Under `global` scope, extra Google grants stay.** Replaced or duplicate grants are not revoked while a live row uses the account, and a rejection whose Google email is unknown is never revoked (accepted, T08 #306 Q1). Users can remove them at Google. D2 may allow `none`.
-- **Narrowed rows in stored meeting packs.** Since FX7 (closing FX1 #308 M1) reads drop them, but the stored `meeting_packs.content` keeps them until refresh. The related `meeting.prep_summary` `ai_runs` row is not narrowed by FX7 and still serves the old summary through `GET /api/v1/ai/runs/{run_id}`; R5 narrows those that exist at the backfill, and a later narrowing (grant, delegation) leaves its runs exposed (open follow-up).
+- **Narrowed rows in stored meeting packs.** Since FX7 (closing FX1 #308 M1) reads drop them, but the stored `meeting_packs.content` keeps them until refresh. The related `meeting.prep_summary` `ai_runs` row is private to the member who ran it (FX10; R5 narrows the earlier ones), so only that member can still read the old summary through `GET /api/v1/ai/runs/{run_id}`, even after a source row is narrowed away from them.
 - **The consent cascade does not purge `email.detect_action` `ai_runs`/`ai_run_steps`.** They stay private to the owner. Decide under DS2 (FX5 #309 Q1).
 - **Member-removal count for recommendations.** At about 2M owned email recommendations, the count can exceed the 5 s timeout (6.9 s measured). It is a table-wide scan; a partial index is a follow-up.
 - **Rows that stay readable.** Gmail evidence whose mailbox owner is ambiguous stays as written (reported every run), and the accepted DS3 residuals are listed in [`PRIVACY-CONSENT-CONTRACT.md`](../phases/phase-010/PRIVACY-CONSENT-CONTRACT.md#personal-data-isolation-security-remediation-spec-a).
@@ -353,6 +399,7 @@ Also open and not a sign-off: the owner-sharing question. FX3 also refuses owner
 
 | Version | Date | Summary | Author |
 |---|---|---|---|
+| 1.6.0 | 2026-10-10 | FX10: `meeting.prep_summary` AI runs are written private to their actor; the R5 AI-run narrowing covers every run before the FX10 deploy (`<fx10_deploy_time>`), replacing the post-backfill repeat; limitation updated | Lucky Jain |
 | 1.5.0 | 2026-10-03 | FX7 closes FX1 #308 M1: meeting-pack reads drop rows narrowed after generation and withhold the stored summary; the R5 known-gap step becomes a deploy check; limitation notes the stored content and the prep-summary AI run; with enrichment on, R5 narrows prep-summary AI runs a second time after the backfill | Lucky Jain |
 | 1.4.0 | 2026-10-01 | Counters are pre-initialised at 0 (#355) and the alert rules are plain `increase()` (alert file 1.4.0): R6 verification expects 0 then 1 and an alert that stays firing for a day; the R7 false-positive text and Monitoring note drop the new-series term and keep the first-scrape gap | Lucky Jain |
 | 1.3.0 | 2026-10-01 | PR review: R7 treats revoke errors as real by default and needs an empty search across every revoke-error log line before calling one a false positive; the canary criterion confirms a user-side removal before recording it benign; R5 SQL uses UTC (`SET LOCAL TimeZone`, explicit offset in `<fx1_deploy_time>`) | Lucky Jain |

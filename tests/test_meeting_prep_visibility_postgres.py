@@ -1350,3 +1350,51 @@ def test_replay_withholds_summary_when_a_stored_row_outside_the_cached_view_narr
         "summary": None,
         "error_code": "evidence_unavailable",
     }
+
+
+@pytest.mark.parametrize("refresh", [False, True], ids=["create", "refresh"])
+def test_prep_summary_run_is_private_to_its_actor(
+    world: _World, monkeypatch: pytest.MonkeyPatch, refresh: bool
+) -> None:
+    """The run behind a pack's summary (and its steps, which carry the tool
+    output's full row text) is private to the member who generated it, so a
+    row narrowed after the run never stays readable to every member
+    through `GET /ai/runs/{id}` -- the pack's own read-time check withholds
+    the summary there, the run row cannot."""
+    _link(world, world.b, world.entity_id)
+    _seed(world, "WS-ROW", owner_id=world.a.user_id, visibility="workspace")
+    if refresh:
+        _prep(world.a, world.meeting_id)
+
+    monkeypatch.setenv("ECC_MEETING_PREP_AI_ENRICHMENT_ENABLED", "true")
+    get_settings.cache_clear()
+    adapter = _summary_adapter("Partner review.")
+    app.dependency_overrides[get_ollama_adapter] = lambda: adapter
+    try:
+        created = _prep(world.b, world.meeting_id, refresh=refresh)
+    finally:
+        app.dependency_overrides.pop(get_ollama_adapter, None)
+    assert created["enrichment"]["available"] is True, created["enrichment"]
+
+    with engine.begin() as connection:
+        runs = connection.execute(
+            text(
+                "SELECT id, owner_id, visibility FROM ai_runs "
+                "WHERE workspace_id = :w AND task_type = 'meeting.prep_summary'"
+            ),
+            {"w": world.workspace_id},
+        ).all()
+        assert len(runs) == 1
+        run_id, owner_id, visibility = runs[0]
+        assert (owner_id, visibility) == (world.b.user_id, "private")
+        steps = connection.execute(
+            text("SELECT owner_id, visibility FROM ai_run_steps WHERE run_id = :r"),
+            {"r": run_id},
+        ).all()
+    assert steps
+    assert {tuple(step) for step in steps} == {(world.b.user_id, "private")}
+
+    assert world.b.client.get(f"/api/v1/ai/runs/{run_id}").status_code == 200
+    for member in (world.a, world.bystander):
+        response = member.client.get(f"/api/v1/ai/runs/{run_id}")
+        assert response.status_code == 404, response.text

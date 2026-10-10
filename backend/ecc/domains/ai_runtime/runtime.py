@@ -136,6 +136,17 @@ AiRunErrorCode = Literal[
 # ---------------------------------------------------------------------------
 
 
+# Task types whose run (and its steps) is private to its actor, with or
+# without ECC_PERSONAL_DATA_ISOLATION. A `meeting.prep_summary` run's
+# output is copied into a shared meeting pack, whose reads drop rows the
+# reader can no longer read and then withhold that summary (FX7); the run
+# row cannot do that, so leaving it `workspace`-visible kept serving a
+# summary (and tool output with full row text) quoting a row narrowed
+# after the run to every member through `GET /ai/runs/{id}`. Private to the
+# actor, like the R5 clean-up already makes every earlier one.
+ACTOR_PRIVATE_TASK_TYPES: frozenset[str] = frozenset({"meeting.prep_summary"})
+
+
 @dataclass(frozen=True, slots=True)
 class TaskPort:
     task_type: str
@@ -907,12 +918,13 @@ def _persist_terminal(
     # have read the actor's own mailbox (the sync-triggered caller builds
     # `auth` from the connector account's `owner_id`). Flag off, or any
     # other task type: exactly the previous rows (`workspace`; steps owned
-    # by the workspace's original user).
-    scope = (
-        personal_content_scope(auth.user_id)
-        if task_type in EMAIL_TASK_TYPES
-        else PersonalRowScope(owner_id=None, visibility="workspace")
-    )
+    # by the workspace's original user) -- except `ACTOR_PRIVATE_TASK_TYPES`.
+    if task_type in EMAIL_TASK_TYPES:
+        scope = personal_content_scope(auth.user_id)
+    elif task_type in ACTOR_PRIVATE_TASK_TYPES:
+        scope = PersonalRowScope(owner_id=auth.user_id, visibility="private")
+    else:
+        scope = PersonalRowScope(owner_id=None, visibility="workspace")
     # Deliberately not wrapped in `with session.begin():` -- unlike every
     # other domain module's single top-level route-handler transaction,
     # `execute_run` (and therefore this function) is called both from a
