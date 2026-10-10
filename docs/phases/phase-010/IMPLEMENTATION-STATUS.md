@@ -74,7 +74,7 @@ Later PRs (outside the Spec A plan) whose behaviour these docs also describe:
 | #345 | `email_action_detected` confirm re-checks the consent owner: `409 RECOMMENDATION_OWNER_CHANGED` after a concurrent ownership transfer |
 | #346 | A busy membership change is retried once, then explained to the caller |
 | #396 | Meeting-pack reads drop stored rows the caller can no longer read and withhold the stored AI summary (closes FX1 #308 M1) |
-| FX10 | `meeting.prep_summary` AI runs and their steps are written private to their actor, so a summary quoting a row narrowed later is not served to other members through `GET /api/v1/ai/runs/{id}` |
+| #399 | `meeting.prep_summary` AI runs and their steps are written private to their actor, so a summary quoting a row narrowed later is not served to other members through `GET /api/v1/ai/runs/{id}` |
 
 Contracts: `API-SCHEMAS.md` ("Security remediation (Spec A)"), `PRIVACY-CONSENT-CONTRACT.md` ("Personal-data isolation"), `docs/phases/phase-006/CONNECTOR-CONTRACT.md`, `docs/domain/EVENT-CATALOG.md`. Rollout, flags, sign-offs and known limitations: `docs/runbooks/SPEC-A-ROLLOUT.md`. Alert rules: `docs/observability/SPEC-A-ALERTS.md`. Open before rollout step R5: the G-SIGN sign-offs (only A2 is signed). FX1 #308 M1 (a row narrowed after its meeting pack was generated stayed in served packs until refreshed) is closed by FX7 (#396).
 
