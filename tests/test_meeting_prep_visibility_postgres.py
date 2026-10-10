@@ -1400,12 +1400,12 @@ def test_prep_summary_run_is_private_to_its_actor(
         assert response.status_code == 404, response.text
 
 
-@pytest.mark.parametrize("world", ["false"], indirect=True, ids=["flag_off"])
-def test_flag_off_evidence_gap_on_a_participant_narrowed_later_is_dropped(world: _World) -> None:
-    """Flag off, evidence rows are not visibility-filtered, so a stored gap
-    is dropped only through its participant node: once that node is
-    narrowed to A's private, B and the bystander lose the gap while A
-    (who can read the node) keeps it."""
+def test_evidence_gap_on_a_participant_narrowed_later_is_dropped(world: _World) -> None:
+    """The gap's own row stays workspace-visible, so it is dropped only
+    through its participant node -- with the flag off (evidence rows are not
+    visibility-filtered at all) and on: once that node is narrowed to A's
+    private, B and the bystander lose the gap while A (who can read the
+    node) keeps it."""
     _link(world, world.b, world.entity_id)
     gap = _insert_evidence(world, owner_id=world.a.user_id, visibility="workspace", state="missing")
     _prep(world.b, world.meeting_id)
