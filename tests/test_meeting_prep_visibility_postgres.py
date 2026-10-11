@@ -40,6 +40,7 @@ from ecc.domains.governance.recommendation_mutations import (
     synthetic_request,
 )
 from ecc.main import app
+from ecc.platform import authz
 
 pytestmark = pytest.mark.skipif(
     not get_settings().database_url.startswith("postgresql"),
@@ -1416,3 +1417,83 @@ def test_evidence_gap_on_a_participant_narrowed_later_is_dropped(world: _World) 
     for member in (world.b, world.bystander):
         assert _gap_ids(_get(member, world.meeting_id)) == set()
     assert _gap_ids(_get(world.a, world.meeting_id)) == {gap}
+
+
+def _owned_types(world: _World, user_id: UUID, *, isolation: bool) -> dict[str, object]:
+    with SessionFactory() as session:
+        summary = authz.owned_resource_summary(
+            session,
+            workspace_id=world.workspace_id,
+            users_id=user_id,
+            exclude_personal_data=isolation,
+        )
+    return {str(row["resource_type"]): row["count"] for row in summary}
+
+
+def test_prep_summary_runs_block_removal_only_without_isolation(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A member's own prep-summary run and its steps are retained with them
+    and do not block their removal with isolation on (like an email run);
+    with it off they block as before, and a run of any other task type
+    always blocks."""
+    _link(world, world.b, world.entity_id)
+    _seed(world, "WS-ROW", owner_id=world.a.user_id, visibility="workspace")
+    monkeypatch.setenv("ECC_MEETING_PREP_AI_ENRICHMENT_ENABLED", "true")
+    get_settings.cache_clear()
+    adapter = _summary_adapter("Partner review.")
+    app.dependency_overrides[get_ollama_adapter] = lambda: adapter
+    try:
+        created = _prep(world.b, world.meeting_id)
+    finally:
+        app.dependency_overrides.pop(get_ollama_adapter, None)
+    assert created["enrichment"]["available"] is True, created["enrichment"]
+
+    flag_on = get_settings().personal_data_isolation
+    owned = _owned_types(world, world.b.user_id, isolation=flag_on)
+    if flag_on:
+        assert "ai_runs" not in owned and "ai_run_steps" not in owned, owned
+    else:
+        assert owned.get("ai_runs") == 1 and owned.get("ai_run_steps", 0) >= 1, owned
+    # Control: a run that is not (or no longer) private keeps blocking -- it is
+    # still readable (workspace) or has live grants (shared) under a removed owner.
+    if flag_on:
+        for visibility in ("workspace", "shared_explicitly"):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE ai_runs SET visibility = :v "
+                        "WHERE workspace_id = :w AND task_type = 'meeting.prep_summary'"
+                    ),
+                    {"v": visibility, "w": world.workspace_id},
+                )
+            assert _owned_types(world, world.b.user_id, isolation=True).get("ai_runs") == 1
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE ai_runs SET visibility = 'private' "
+                    "WHERE workspace_id = :w AND task_type = 'meeting.prep_summary'"
+                ),
+                {"w": world.workspace_id},
+            )
+            connection.execute(
+                text("UPDATE ai_run_steps SET visibility = 'workspace' WHERE workspace_id = :w"),
+                {"w": world.workspace_id},
+            )
+        assert _owned_types(world, world.b.user_id, isolation=True).get("ai_run_steps", 0) >= 1
+        with engine.begin() as connection:
+            connection.execute(
+                text("UPDATE ai_run_steps SET visibility = 'private' WHERE workspace_id = :w"),
+                {"w": world.workspace_id},
+            )
+    # Control, either way: a run of another task type (and so its steps) blocks.
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE ai_runs SET task_type = 'attention.explain_item' "
+                "WHERE workspace_id = :w AND task_type = 'meeting.prep_summary'"
+            ),
+            {"w": world.workspace_id},
+        )
+    owned = _owned_types(world, world.b.user_id, isolation=flag_on)
+    assert owned.get("ai_runs") == 1 and owned.get("ai_run_steps", 0) >= 1, owned

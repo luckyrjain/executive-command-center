@@ -2,10 +2,10 @@
 id: SPEC-A-ROLLOUT
 title: Security Remediation Spec A Rollout Runbook
 status: Active
-version: 1.6.0
+version: 1.7.0
 owner: Lucky Jain
 created: 2026-10-01
-updated: 2026-10-10
+updated: 2026-10-11
 depends_on:
   - PHASE-10-GMAIL-RECOVERY
   - SPEC-A-ALERTS
@@ -373,7 +373,7 @@ Alert rules, how to read each counter, and first actions are in [`../observabili
 - **0083 has no `lock_timeout`.** See R1 for the maintenance window and the `PGOPTIONS` workaround.
 - **Unsalted `override_reason` digest (minor).** The backfill log's `previous_state` stores member-written attention `override_reason` text as an unsalted SHA-256 digest, never the text. A short, guessable reason could be confirmed by hashing candidates. The log is ops-only (no API, not an authz resource). Restrict read access to it, and purge it after R7 once no restore is needed.
 - **Under `global` scope, extra Google grants stay.** Replaced or duplicate grants are not revoked while a live row uses the account, and a rejection whose Google email is unknown is never revoked (accepted, T08 #306 Q1). Users can remove them at Google. D2 may allow `none`.
-- **Narrowed rows in stored meeting packs.** Since FX7 (closing FX1 #308 M1) reads drop them, but the stored `meeting_packs.content` keeps them until refresh. The related `meeting.prep_summary` `ai_runs` row is private to the member who ran it (FX10; R5 narrows the earlier ones), so only that member can still read the old summary through `GET /api/v1/ai/runs/{run_id}`, even after a source row is narrowed away from them.
+- **Narrowed rows in stored meeting packs.** Since FX7 (closing FX1 #308 M1) reads drop them, but the stored `meeting_packs.content` keeps them until refresh. The related `meeting.prep_summary` `ai_runs` row is private to the member who ran it (FX10; R5 narrows the earlier ones), so only that member can still read the old summary through `GET /api/v1/ai/runs/{run_id}`, even after a source row is narrowed away from them. With the flag on, that member's removal is not blocked by these runs and steps while they are `private`; they stay with them (without the flag they still block, and a run still `workspace`-visible or shared keeps blocking until narrowed or its grants are revoked). A retained run can still be shared or transferred by an owner or admin who knows its id (no API lists run ids), and a member who is re-added gets their old runs back, with summaries that may quote rows narrowed while they were away.
 - **The consent cascade does not purge `email.detect_action` `ai_runs`/`ai_run_steps`.** They stay private to the owner. Decide under DS2 (FX5 #309 Q1).
 - **Member-removal count for recommendations.** At about 2M owned email recommendations, the count can exceed the 5 s timeout (6.9 s measured). It is a table-wide scan; a partial index is a follow-up.
 - **Rows that stay readable.** Gmail evidence whose mailbox owner is ambiguous stays as written (reported every run), and the accepted DS3 residuals are listed in [`PRIVACY-CONSENT-CONTRACT.md`](../phases/phase-010/PRIVACY-CONSENT-CONTRACT.md#personal-data-isolation-security-remediation-spec-a).
@@ -399,6 +399,7 @@ Also open and not a sign-off: the owner-sharing question. FX3 also refuses owner
 
 | Version | Date | Summary | Author |
 |---|---|---|---|
+| 1.7.0 | 2026-10-11 | With the flag on, a member's prep-summary AI runs and steps no longer block their removal (retained, private to them) | Lucky Jain |
 | 1.6.0 | 2026-10-10 | FX10: `meeting.prep_summary` AI runs are written private to their actor; the R5 AI-run narrowing covers every run before the FX10 deploy (`<fx10_deploy_time>`), replacing the post-backfill repeat; limitation updated | Lucky Jain |
 | 1.5.0 | 2026-10-03 | FX7 closes FX1 #308 M1: meeting-pack reads drop rows narrowed after generation and withhold the stored summary; the R5 known-gap step becomes a deploy check; limitation notes the stored content and the prep-summary AI run; with enrichment on, R5 narrows prep-summary AI runs a second time after the backfill | Lucky Jain |
 | 1.4.0 | 2026-10-01 | Counters are pre-initialised at 0 (#355) and the alert rules are plain `increase()` (alert file 1.4.0): R6 verification expects 0 then 1 and an alert that stays firing for a day; the R7 false-positive text and Monitoring note drop the new-series term and keep the first-scrape gap | Lucky Jain |
