@@ -2,7 +2,7 @@
 id: PHASE-010-API-SCHEMAS
 title: Phase 10 Gmail API Schemas
 status: Approved for Implementation
-version: 1.9.0
+version: 1.10.0
 owner: Lucky Jain
 updated: 2026-10-11
 depends_on:
@@ -271,7 +271,10 @@ their `gmail` connector account(s), and purge their own email-derived
 records (threads, messages, `email_thread` attention items, non-
 `executed` `email_action_detected` recommendations, and their evidence --
 except an evidence row whose id collides with a different owner's own
-message, deliberately left unpurged, see `PRIVACY-CONSENT-CONTRACT.md`)
+message, deliberately left unpurged, see `PRIVACY-CONSENT-CONTRACT.md`),
+and redact in place their `email.detect_action` AI runs and steps (content
+nulled, rows kept), delete their `email-detect-action:*` idempotency records,
+and null `proposed_fields` on executed recommendations
 in the same request. Every
 other `domain_key` is unaffected -- disabling `habits`/`health`/`finance`/
 etc. still only flips `enabled`/revokes consent, data untouched, exactly
@@ -362,3 +365,4 @@ is now closed out.
 | 1.7.0 | 2026-10-01 | Security Remediation Spec A (T19; review fix: only the four refusals write `enrollment_refused`, not `CONNECTOR_ACCOUNT_PERSIST_FAILED` / `GMAIL_ACCOUNT_ALREADY_CONNECTED`): documented the callback refusals (`GMAIL_ACCOUNT_IDENTITY_MISMATCH`, `CONNECTOR_OWNED_BY_ANOTHER_MEMBER`, `MEMBERSHIP_INACTIVE`, `INSUFFICIENT_ROLE`, `CONNECTOR_ACCOUNT_PERSIST_FAILED`), engineering reactivation `404`/`403`, the non-owner Gmail `sync`/`disable` `404` (was `409` for `disable`), and a Spec A summary table across sharing, removal, recommendations, readers, search and meeting prep | Lucky Jain |
 | 1.8.0 | 2026-10-10 | Spec A table: meeting-prep reads drop rows the caller can no longer read and withhold the summary (FX7); `meeting.prep_summary` AI runs are private to their actor (FX10) | Lucky Jain |
 | 1.9.0 | 2026-10-11 | Member removal (flag on): the member's prep-summary AI runs and steps are retained private to them and no longer block removal | Lucky Jain |
+| 1.10.0 | 2026-10-11 | Consent revocation (email domain disable/revoke/delete) also redacts the owner's `email.detect_action` AI runs and steps in place, deletes their `email-detect-action:*` idempotency records and nulls `proposed_fields` on executed recommendations (DS2) | Lucky Jain |

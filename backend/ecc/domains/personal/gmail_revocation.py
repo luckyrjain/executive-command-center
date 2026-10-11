@@ -119,6 +119,15 @@ consent is only rejected if a *later* grant for the same domain actually
 superseded it. Fixed at the lookup site (`domains.py:revoke_consent_
 endpoint`), not here -- see that function's own updated comment.
 
+**What is redacted rather than deleted (DS2).** The mailbox owner's
+`email.detect_action` `ai_runs` and their `ai_run_steps` hold model output
+derived from the email, so they are nulled in place (`output`, `evidence`,
+`input_ref`, step `trace`) with the audit skeleton kept -- see the inline
+DS2 comment in `cascade_email_revocation`. The sync site's cached replay
+records (`email-detect-action:*` idempotency keys, whose response body holds
+the recommendation's email-derived text) are deleted, and an executed
+recommendation also loses `proposed_fields`.
+
 **What is deliberately NOT deleted.**
 - `pkos_nodes` (the resolved person entities themselves): `gmail_adapter.
   py:resolve_or_create_person` deduplicates at *workspace* scope, not
@@ -169,7 +178,7 @@ from ecc.auth import AuthContext
 from ecc.domains.engineering.connector_accounts import get_encrypted_credential
 from ecc.domains.engineering.connectors import ConnectorAccountContext
 from ecc.domains.engineering.crypto import decrypt_credential
-from ecc.platform.connector_security import revoke_if_safe
+from ecc.platform.connector_security import EMAIL_TASK_TYPES, revoke_if_safe
 
 from .gmail_adapter import GmailAdapter
 
@@ -300,11 +309,60 @@ def cascade_email_revocation(
     session.execute(
         text(
             "UPDATE recommendations SET rationale = :redacted, "
-            "proposed_action = '{}'::jsonb, evidence_ids = '{}' "
+            "proposed_action = '{}'::jsonb, proposed_fields = NULL, evidence_ids = '{}' "
             "WHERE workspace_id = :workspace_id AND owner_id = :owner_id "
             "AND recommendation_type = 'email_action_detected' AND status = 'executed'"
         ),
         {"redacted": _REDACTED_RATIONALE, **params},
+    )
+
+    # The sync site saves each recommendation it creates under the idempotency
+    # key `email-detect-action:<external message id>` (`gmail_action_
+    # detection.py`), as the mailbox owner. That cached response holds the
+    # recommendation's `rationale`, `proposed_fields` and `evidence_ids` --
+    # email-derived text -- for the record's whole retention. Delete them (a
+    # cache entry, nothing to keep): a re-grant that re-detects the same
+    # message then creates a fresh recommendation instead of replaying a
+    # cached 201 for one that no longer exists.
+    session.execute(
+        text(
+            "DELETE FROM idempotency_records WHERE workspace_id = :workspace_id "
+            "AND actor_id = :owner_id AND key LIKE 'email-detect-action:%'"
+        ),
+        params,
+    )
+
+    # DS2: the `email.detect_action` AI runs this mailbox produced hold model
+    # output derived from the email (`output`, `evidence`, `input_ref`, and
+    # the steps' `trace`), so withdrawing consent redacts them in place --
+    # content nulled, the audit skeleton (task type, status, model, tokens,
+    # cost, timestamps, the row ids) kept, like an executed recommendation
+    # above; deleting would also have to unwind `ai_run_steps`' and the
+    # evaluation tables' foreign keys into `ai_runs`. Scoped by `actor_id`,
+    # not `owner_id`: the run's actor is the mailbox owner (every email task
+    # reads mail only through `email.get_thread_content`, scoped to the
+    # actor's own mailbox), whereas `owner_id` can have moved with a grant or
+    # transfer made while the flag was off. Steps first, joined to their
+    # parent; both statements are no-ops for an already-redacted run.
+    email_run_params = {**params, "task_types": sorted(EMAIL_TASK_TYPES), "now": now}
+    session.execute(
+        text(
+            "UPDATE ai_run_steps st SET trace = '{}'::jsonb FROM ai_runs r "
+            "WHERE r.id = st.run_id AND r.workspace_id = st.workspace_id "
+            "AND st.workspace_id = :workspace_id AND r.actor_id = :owner_id "
+            "AND r.task_type = ANY(:task_types) AND st.trace <> '{}'::jsonb"
+        ),
+        email_run_params,
+    )
+    session.execute(
+        text(
+            "UPDATE ai_runs SET output = NULL, evidence = '[]'::jsonb, "
+            "input_ref = '{}'::jsonb, updated_at = :now "
+            "WHERE workspace_id = :workspace_id AND actor_id = :owner_id "
+            "AND task_type = ANY(:task_types) AND (output IS NOT NULL "
+            "OR evidence <> '[]'::jsonb OR input_ref <> '{}'::jsonb)"
+        ),
+        email_run_params,
     )
 
     # `pkos_evidence` gained an `owner_id` column from the same migration

@@ -2,7 +2,7 @@
 id: SPEC-A-ROLLOUT
 title: Security Remediation Spec A Rollout Runbook
 status: Active
-version: 1.7.0
+version: 1.8.0
 owner: Lucky Jain
 created: 2026-10-01
 updated: 2026-10-11
@@ -294,6 +294,12 @@ Exit 0 means nothing was found; exit 1 means rows were found (checks A–E, CSV 
   COMMIT;
   ```
 
+- [ ] **DS2 one-off: redact email AI content for members who already withdrew consent.** The consent cascade now redacts a member's `email.detect_action` AI runs and steps, deletes the sync site's cached replay records (`email-detect-action:*` idempotency keys) and nulls `proposed_fields` on their executed recommendations (DS2, decided 2026-10-11). Members who withdrew before this deploy still hold that content. Run this once after the DS2 build is live, in a quiet period. It covers every member whose `email` domain is not enabled, and it is irreversible by design (redaction), so there is no snapshot. A member who withdrew and later re-enabled email is not covered; their earlier content is redacted at their next withdrawal. Record the `members_covered` count:
+
+  ```sql
+
+  ```
+
 - [ ] **FX7 (#396) deployed (closes FX1 #308 M1).** A row narrowed after its pack was generated (by a grant narrowing, a delegation, or the backfill making a row private) is dropped from every read by members who can no longer read it, and the pack's stored AI summary is withheld from them. Confirm the FX7 build, and the FX10 build (prep-summary AI runs private to their actor), are live before R5. The stored pack content still holds the row until refresh, so database access to `meeting_packs` stays restricted as before.
 
 ### Order
@@ -374,7 +380,7 @@ Alert rules, how to read each counter, and first actions are in [`../observabili
 - **Unsalted `override_reason` digest (minor).** The backfill log's `previous_state` stores member-written attention `override_reason` text as an unsalted SHA-256 digest, never the text. A short, guessable reason could be confirmed by hashing candidates. The log is ops-only (no API, not an authz resource). Restrict read access to it, and purge it after R7 once no restore is needed.
 - **Under `global` scope, extra Google grants stay.** Replaced or duplicate grants are not revoked while a live row uses the account, and a rejection whose Google email is unknown is never revoked (accepted, T08 #306 Q1). Users can remove them at Google. D2 may allow `none`.
 - **Narrowed rows in stored meeting packs.** Since FX7 (closing FX1 #308 M1) reads drop them, but the stored `meeting_packs.content` keeps them until refresh. The related `meeting.prep_summary` `ai_runs` row is private to the member who ran it (FX10; R5 narrows the earlier ones), so only that member can still read the old summary through `GET /api/v1/ai/runs/{run_id}`, even after a source row is narrowed away from them. With the flag on, that member's removal is not blocked by these runs and steps while they are `private`; they stay with them (without the flag they still block, and a run still `workspace`-visible or shared keeps blocking until narrowed or its grants are revoked). A retained run can still be shared or transferred by an owner or admin who knows its id (no API lists run ids), and a member who is re-added gets their old runs back, with summaries that may quote rows narrowed while they were away.
-- **The consent cascade does not purge `email.detect_action` `ai_runs`/`ai_run_steps`.** They stay private to the owner. Decide under DS2 (FX5 #309 Q1).
+- **The consent cascade redacts, not deletes, `email.detect_action` `ai_runs`/`ai_run_steps`.** Withdrawing email consent nulls their `output`, `evidence`, `input_ref` and step `trace` and keeps the rows (task type, status, model, tokens, cost, timestamps), like an executed recommendation (DS2, decided 2026-10-11, FX5 #309 Q1). Runs from before this deploy are redacted by the one-off R5 prerequisite above for members who already withdrew, and otherwise the next time the member withdraws consent. Member removal does not run the cascade, so a removed member's runs stay private to them.
 - **Member-removal count for recommendations.** At about 2M owned email recommendations, the count can exceed the 5 s timeout (6.9 s measured). It is a table-wide scan; a partial index is a follow-up.
 - **Rows that stay readable.** Gmail evidence whose mailbox owner is ambiguous stays as written (reported every run), and the accepted DS3 residuals are listed in [`PRIVACY-CONSENT-CONTRACT.md`](../phases/phase-010/PRIVACY-CONSENT-CONTRACT.md#personal-data-isolation-security-remediation-spec-a).
 
@@ -385,7 +391,7 @@ G-SIGN. Record who signed, when, and where (link or change-record id). Only A2 i
 - [x] **A2** (backfill re-owns a derived row to an inactive recommendation owner, reported `owner_inactive`): keep current behaviour. Signed off by the user, 2026-09-30.
 - [ ] **DS3** (privacy): Gmail-derived content private to the mailbox owner; person entities and aliases stay workspace knowledge. Includes acknowledging the accepted residuals: admin audit snapshots (N28), dashboard `recently_changed` ids (N27), and claims citing private evidence staying visible (N29(1)).
 - [ ] **DS1** (product): no Gmail aliases; a work email that differs from the Gmail address gets 403 with guidance.
-- [ ] **DS2** (privacy + product): retain, private, a removed member's Gmail-derived data (no purge on removal), including the open cascade question on email `ai_runs`.
+- [ ] **DS2** (privacy + product): retain, private, a removed member's Gmail-derived data (no purge on removal), including the cascade question on email `ai_runs`, which is decided: the consent cascade redacts them in place (2026-10-11).
 - [ ] **Q-A1** (security): no admin break-glass for another member's Gmail; use removal.
 - [ ] **C15-a** (security): any member may reactivate a workspace engineering connector with their own credentials.
 - [ ] **C15-c** (product): per-workspace uniqueness of `(provider, external_account_id)` kept.
@@ -393,12 +399,13 @@ G-SIGN. Record who signed, when, and where (link or change-record id). Only A2 i
 - [ ] **C15-f** (privacy): S2 remediation notifies the row owner only.
 - [ ] **I5** (security): identity binding proves an email *match*, not mailbox ownership (no email verification).
 
-Also open and not a sign-off: the owner-sharing question. FX3 also refuses owners who try to share their **own** email-derived rows; confirm this, or allow owner sharing.
+Decided 2026-10-11, not a sign-off: owners may not share their **own** email-derived rows. The FX3 refusal stays; if sharing is wanted later it would be a separate, explicit per-item action.
 
 ## Changelog
 
 | Version | Date | Summary | Author |
 |---|---|---|---|
+| 1.8.0 | 2026-10-11 | DS2 decided: the consent cascade redacts `email.detect_action` AI runs and steps in place (limitation and DS2 wording updated); R5 gains a one-off redaction for members who already withdrew; the cascade also deletes the `email-detect-action:*` idempotency records and nulls `proposed_fields` on executed recommendations; the owner-sharing question is decided (keep refusing) | Lucky Jain |
 | 1.7.0 | 2026-10-11 | With the flag on, a member's prep-summary AI runs and steps no longer block their removal (retained, private to them) | Lucky Jain |
 | 1.6.0 | 2026-10-10 | FX10: `meeting.prep_summary` AI runs are written private to their actor; the R5 AI-run narrowing covers every run before the FX10 deploy (`<fx10_deploy_time>`), replacing the post-backfill repeat; limitation updated | Lucky Jain |
 | 1.5.0 | 2026-10-03 | FX7 closes FX1 #308 M1: meeting-pack reads drop rows narrowed after generation and withhold the stored summary; the R5 known-gap step becomes a deploy check; limitation notes the stored content and the prep-summary AI run; with enrichment on, R5 narrows prep-summary AI runs a second time after the backfill | Lucky Jain |
