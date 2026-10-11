@@ -40,15 +40,15 @@ All of these are checkboxes in [R5 Prerequisites](SPEC-A-ROLLOUT.md#prerequisite
 
 1. **R4 gate met.** Migrations 0083 and 0084 applied, alert rules live, every sign-off ticked.
 2. **Database backup**, verified, with its name in the change record.
-3. **Confirm the FX7 (#396) and FX10 (#399) builds are live.** This must hold before any statement below runs: it is what makes meeting-pack reads drop narrowed rows and what makes new prep-summary runs private from the start. Running the narrowing first would race with runs an older build is still writing.
-4. **Record two deploy times**, written with an explicit UTC offset:
+3. **Record two deploy times**, written with an explicit UTC offset:
    - `<fx1_deploy_time>`: when the FX1 build (#308) went live;
    - `<fx10_deploy_time>`: when the build with prep-summary AI runs private to their actor (#399) went live.
-5. **Snapshot, then clean up the meeting-prep data**, in one transaction and one `psql` session:
-   - archive or refresh every active meeting pack generated before `<fx1_deploy_time>`;
+4. **Confirm the FX7 (#396), FX10 (#399) and DS2 (#403) builds are live.** This must hold before any statement below runs: it is what makes meeting-pack reads drop narrowed rows, what makes new prep-summary runs private from the start, and what makes members who withdraw afterwards get redacted by the cascade. Running the narrowing first would race with runs an older build is still writing.
+5. **Snapshot, then clean up the meeting-prep data.** The snapshot, the SQL pack archive and the AI-run narrowing are one transaction in one `psql` session:
+   - archive every active meeting pack generated before `<fx1_deploy_time>` with the runbook's SQL, in that transaction; or refresh them through the API **after** the `COMMIT` (the snapshot still lists which packs);
    - narrow every `meeting.prep_summary` AI run created before `<fx10_deploy_time>` to its actor, and revoke grants on them.
-   After the commit, run the check for any prep-summary run still `workspace`-visible. If it is not 0, run the `_rolling` block.
-6. **DS2 one-off.** Redact email AI content (runs, steps, cached replay records, `proposed_fields`) for members who already withdrew email consent. Record the `members_covered` count. This one is irreversible by design, so it takes no snapshot.
+   After the commit, run the check for any prep-summary run still `workspace`-visible. If it is not 0, run the `_rolling` block, but only once no pre-FX10 process is left.
+6. **DS2 one-off.** Redact email AI content (runs, steps, cached replay records, `proposed_fields`) for members who already withdrew email consent. Record the `members_in_scope` count (members with an email run and email off, including ones already redacted). This one is irreversible by design, so it takes no snapshot; run it in a quiet period.
 
 Then follow [Order](SPEC-A-ROLLOUT.md#order) (flag on and restart, backfill, rebuild per workspace, refresh packs), [Verify](SPEC-A-ROLLOUT.md#verify), and know the [Rollback](SPEC-A-ROLLOUT.md#rollback-asymmetric): turning the flag off alone is not a rollback.
 
