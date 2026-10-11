@@ -874,12 +874,18 @@ def _insert_ai_run_with_content(
     return run_id, step_id
 
 
-def test_disable_domain_redacts_email_ai_runs_and_steps_keeping_the_skeleton(
-    gmail_revocation_context: dict,
+@pytest.mark.parametrize("via", ["disable", "revoke", "delete"])
+def test_consent_withdrawal_redacts_email_ai_runs_and_steps_keeping_the_skeleton(
+    gmail_revocation_context: dict, via: str
 ) -> None:
-    """DS2: withdrawing consent nulls the content of the mailbox owner's
-    `email.detect_action` runs and their steps (output, evidence, input_ref,
-    trace) but keeps the rows and their audit skeleton. Scoped by the run's
+    """DS2: withdrawing consent -- by disabling the domain, revoking the
+    consent, or deleting the domain -- nulls the content of the mailbox
+    owner's `email.detect_action` runs and their steps (output, evidence,
+    input_ref, trace) but keeps the rows and their audit skeleton. It also
+    deletes the sync site's cached replay records
+    (`email-detect-action:<message id>` idempotency keys, which hold the
+    recommendation's email-derived text) and nulls `proposed_fields` on an
+    executed recommendation. Scoped by the run's
     actor: another member's email run, and the owner's runs of other task
     types, are untouched; an email run the owner acted on but that was since
     moved to another owner is still redacted."""
@@ -925,12 +931,71 @@ def test_disable_domain_redacts_email_ai_runs_and_steps_keeping_the_skeleton(
             now=now,
         )
     _seed_full_cascade_fixture(ctx)
+    with engine.begin() as connection:
+        executed_id = _insert_recommendation(
+            connection,
+            workspace_id=workspace_id,
+            owner_id=owner_id,
+            evidence_id=None,
+            status="executed",
+            now=now,
+        )
+        connection.execute(
+            text(
+                "UPDATE recommendations SET proposed_fields = "
+                '\'{"title": "Send the signed contract"}\'::jsonb WHERE id = :id'
+            ),
+            {"id": executed_id},
+        )
+        for actor, key in (
+            (owner_id, "email-detect-action:msg-1"),
+            (owner_id, "email-detect-action:msg-2"),
+            (owner_id, "unrelated-key"),
+            (other_id, "email-detect-action:msg-1"),
+        ):
+            connection.execute(
+                text(
+                    "INSERT INTO idempotency_records (workspace_id, actor_id, key, "
+                    "request_hash, response_status, response_body, created_at, expires_at) "
+                    "VALUES (:ws, :actor, :key, :hash, 201, "
+                    '\'{"rationale": "The email says the contract is due Friday."}\'::jsonb, '
+                    ":now, :expires)"
+                ),
+                {
+                    "ws": workspace_id,
+                    "actor": actor,
+                    "key": key,
+                    "hash": sha256(f"{actor}{key}".encode()).hexdigest(),
+                    "now": now,
+                    "expires": now + timedelta(days=365),
+                },
+            )
 
-    resp = ctx["client"].post(
-        "/api/v1/personal/domains/email/disable",
-        headers=_headers(ctx["token"], str(uuid4())),
-    )
+    path = {
+        "disable": "/api/v1/personal/domains/email/disable",
+        "revoke": f"/api/v1/personal/consents/{ctx['consent_id']}/revoke",
+        "delete": "/api/v1/personal/domains/email/delete",
+    }[via]
+    resp = ctx["client"].post(path, headers=_headers(ctx["token"], str(uuid4())))
     assert resp.status_code == 200, resp.text
+
+    with engine.begin() as connection:
+        keys = {
+            (row[0], row[1])
+            for row in connection.execute(
+                text("SELECT actor_id, key FROM idempotency_records WHERE workspace_id = :ws"),
+                {"ws": workspace_id},
+            )
+        }
+        proposed_fields = connection.execute(
+            text("SELECT proposed_fields, rationale FROM recommendations WHERE id = :id"),
+            {"id": executed_id},
+        ).one()
+    assert (owner_id, "unrelated-key") in keys
+    assert (other_id, "email-detect-action:msg-1") in keys
+    assert not {k for k in keys if k[0] == owner_id and k[1].startswith("email-detect-action:")}
+    assert proposed_fields.proposed_fields is None
+    assert "contract is due" not in proposed_fields.rationale
 
     def _run(run_id: UUID) -> Any:
         with engine.begin() as connection:

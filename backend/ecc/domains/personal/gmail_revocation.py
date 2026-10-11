@@ -123,7 +123,10 @@ endpoint`), not here -- see that function's own updated comment.
 `email.detect_action` `ai_runs` and their `ai_run_steps` hold model output
 derived from the email, so they are nulled in place (`output`, `evidence`,
 `input_ref`, step `trace`) with the audit skeleton kept -- see the inline
-DS2 comment in `cascade_email_revocation`.
+DS2 comment in `cascade_email_revocation`. The sync site's cached replay
+records (`email-detect-action:*` idempotency keys, whose response body holds
+the recommendation's email-derived text) are deleted, and an executed
+recommendation also loses `proposed_fields`.
 
 **What is deliberately NOT deleted.**
 - `pkos_nodes` (the resolved person entities themselves): `gmail_adapter.
@@ -306,11 +309,27 @@ def cascade_email_revocation(
     session.execute(
         text(
             "UPDATE recommendations SET rationale = :redacted, "
-            "proposed_action = '{}'::jsonb, evidence_ids = '{}' "
+            "proposed_action = '{}'::jsonb, proposed_fields = NULL, evidence_ids = '{}' "
             "WHERE workspace_id = :workspace_id AND owner_id = :owner_id "
             "AND recommendation_type = 'email_action_detected' AND status = 'executed'"
         ),
         {"redacted": _REDACTED_RATIONALE, **params},
+    )
+
+    # The sync site saves each recommendation it creates under the idempotency
+    # key `email-detect-action:<external message id>` (`gmail_action_
+    # detection.py`), as the mailbox owner. That cached response holds the
+    # recommendation's `rationale`, `proposed_fields` and `evidence_ids` --
+    # email-derived text -- for the record's whole retention. Delete them (a
+    # cache entry, nothing to keep): a re-grant that re-detects the same
+    # message then creates a fresh recommendation instead of replaying a
+    # cached 201 for one that no longer exists.
+    session.execute(
+        text(
+            "DELETE FROM idempotency_records WHERE workspace_id = :workspace_id "
+            "AND actor_id = :owner_id AND key LIKE 'email-detect-action:%'"
+        ),
+        params,
     )
 
     # DS2: the `email.detect_action` AI runs this mailbox produced hold model
