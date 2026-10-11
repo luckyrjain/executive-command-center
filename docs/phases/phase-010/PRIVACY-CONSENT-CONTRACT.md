@@ -2,9 +2,9 @@
 id: PHASE-010-PRIVACY-CONSENT-CONTRACT
 title: Phase 10 Gmail Privacy and Consent Contract
 status: Approved for Implementation
-version: 1.6.0
+version: 1.7.0
 owner: Lucky Jain
-updated: 2026-10-01
+updated: 2026-10-11
 depends_on:
   - PHASE-010
   - PHASE-007-DOMAIN-PRIVACY-CONTRACT
@@ -86,6 +86,7 @@ has an independent, confirmed `tasks`/`commitments`/`risks` row) is
 redacted in place instead -- its own Gmail-derived `rationale`/`proposed_
 action`/`evidence_ids` nulled, matching `gmail_threads.py:forget_thread_
 endpoint`'s own "null the content, keep the audit skeleton" convention.
+The mailbox owner's `email.detect_action` AI runs and their steps, which hold model output derived from the email, are redacted in place the same way (decision DS2, 2026-10-11): `output`, `evidence`, `input_ref` and each step's `trace` are nulled or emptied, and the rows, task type, status, model, token counts, cost and timestamps are kept. They are matched by the run's actor, which is the mailbox owner.
 `pkos_nodes` (the resolved person entities) are deliberately not deleted
 -- they deduplicate at workspace, not owner, scope, so deleting one could
 destroy state a different owner or domain still depends on; only the
@@ -307,7 +308,7 @@ Before this change, any workspace member could read, sync or share another membe
 
 Workspace owners and admins get no read access to these rows through the domain endpoints (the audit log is the exception, see below). There is no admin break-glass; the route is member removal (decision Q-A1).
 
-**Not shareable.** Grants, grant previews, ownership transfers and delegations of any of these rows are refused with `400 RESOURCE_TYPE_NOT_GRANTABLE` and a `personal_data.share_refused` audit event. Sharing (granting, transferring or delegating) feedback rows on email recommendations and email attention items is also refused; giving feedback is unaffected. The refusal applies to the owner too: whether owners may share their own email-derived rows is an open product question.
+**Not shareable.** Grants, grant previews, ownership transfers and delegations of any of these rows are refused with `400 RESOURCE_TYPE_NOT_GRANTABLE` and a `personal_data.share_refused` audit event. Sharing (granting, transferring or delegating) feedback rows on email recommendations and email attention items is also refused; giving feedback is unaffected. The refusal applies to the owner too, and that is decided (2026-10-11): owners may not share their own email-derived rows. If sharing is wanted later it would be a separate, explicit per-item action, designed on its own.
 
 **Member removal retains, it does not purge** (decision DS2, default pending sign-off). With `ECC_PERSONAL_DATA_ISOLATION` on, removing a member:
 
@@ -317,7 +318,7 @@ Workspace owners and admins get no read access to these rows through the domain 
 
 With the flag off, removal keeps its pre-Spec A behaviour: the member's Gmail rows block it (`409 OWNED_RESOURCES_BLOCK_REMOVAL`) and nothing is disconnected or re-owned.
 
-The operator remediation command (`scripts/remediate_connector_ownership.py`, rollout step R4) also disconnects without purging. Only the consent revocation cascade purges. That cascade does not purge `email.detect_action` AI runs and their steps either: they stay private to the owner, pending the DS2 decision. The removed member's `email` consent stays granted (decision C15-d); with the connector disconnected, nothing syncs.
+The operator remediation command (`scripts/remediate_connector_ownership.py`, rollout step R4) also disconnects without purging. Only the consent revocation cascade purges. That cascade also redacts the member's `email.detect_action` AI runs and their steps in place (decision DS2); removal and the remediation command do not run it, so there they stay private to the owner. The removed member's `email` consent stays granted (decision C15-d); with the connector disconnected, nothing syncs.
 
 **Correspondent directory (DS3).** Person entities and their aliases created from Gmail stay **workspace knowledge**, as the entity-resolution contract requires. The entity APIs expose no owner or mailbox link; the aliases endpoint returns the evidence `source_id`, not content. Residual disclosure: members can see that a correspondent's email address exists in the workspace graph, and when few members use Gmail they can infer whose mailbox it came from. The alternatives were (b) keep all Gmail-derived content shared, or (c) also make person nodes private, which would break workspace-scoped resolution. Both were rejected. **DS3 needs privacy sign-off before R5.**
 
@@ -383,3 +384,4 @@ naming a task here would misstate when, or whether, they ship:
 | 1.4.5 | 2026-08-10 | Task 7 Loop 2 round 27 review (MEDIUM-HIGH): the generic engineering `/disable` endpoint now also rejects a reused `Idempotency-Key` with `409 IDEMPOTENCY_CONFLICT` if the account is no longer `disconnected` when replayed -- the same stale-cache-after-reconnect gap rounds 21-22 closed for the domain-level endpoints, never propagated to this sibling endpoint | Lucky Jain |
 | 1.5.0 | 2026-08-11 | Task 8: explicit user decision -- Task 8 shipped exactly plan.md's own frontend-only scope (`GmailPanel`); export/audit-event/retention-policy were never actually in that scope despite this document's own prior "Planned controls (Task 8)" heading implying otherwise. Renamed to "Deferred controls (open, not scheduled)" and reworded "Unsupported — production blocker" to state plainly that Gmail stays internal-development-only with these three items open, not blocked on a task that will close them | Lucky Jain |
 | 1.6.0 | 2026-10-01 | Security Remediation Spec A (T19; review fixes: sharing feedback rows is refused, giving feedback is not; removal disconnect/re-own only with the flag on): added "Personal-data isolation": owner-only Gmail connector and Gmail-derived content behind `ECC_PERSONAL_DATA_ISOLATION`, not shareable, removal retains (DS2) instead of purging, the DS3 correspondent-directory statement, and the accepted admin capabilities and residuals (N27 dashboard ids, N28 audit snapshots, N29(1) claims stay visible); sign-off status | Lucky Jain |
+| 1.7.0 | 2026-10-11 | DS2: the consent revocation cascade redacts the mailbox owner's `email.detect_action` AI runs and steps in place; decision recorded that owners may not share their own email-derived rows | Lucky Jain |

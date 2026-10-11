@@ -438,6 +438,8 @@ def _cleanup_workspace(workspace_id: UUID, *, emails: list[str]) -> None:
     with engine.begin() as connection:
         for table in (
             "deletion_jobs",
+            "ai_run_steps",
+            "ai_runs",
             "idempotency_records",
             "audit_events",
             "event_outbox",
@@ -815,6 +817,154 @@ def test_disable_domain_redacts_executed_recommendation_instead_of_deleting(
     # is untouched -- this cascade only redacts the recommendation's own
     # Gmail-derived narrative, not what it led to.
     assert row["target_id"] is not None
+
+
+def _insert_ai_run_with_content(
+    connection: Any,
+    *,
+    workspace_id: UUID,
+    actor_id: UUID,
+    owner_id: UUID,
+    task_type: str,
+    now: datetime,
+) -> tuple[UUID, UUID]:
+    """A completed run with content in every redactable column, and one
+    step with a non-empty trace. Returns (run_id, step_id)."""
+    run_id, step_id = uuid4(), uuid4()
+    connection.execute(
+        text(
+            """
+            INSERT INTO ai_runs (
+                id, workspace_id, actor_id, task_type, data_class, status,
+                model_id, input_ref, output, evidence, prompt_tokens, output_tokens,
+                attempts, started_at, completed_at, created_at, updated_at,
+                owner_id, visibility
+            ) VALUES (
+                :id, :ws, :actor, :task_type, 'sensitive', 'completed',
+                'm', '{"thread": "t-1"}'::jsonb, '{"summary": "quotes the email"}'::jsonb,
+                '["gmail:abc"]'::jsonb, 11, 7, 1, :now, :now, :now, :now,
+                :owner, 'private'
+            )
+            """
+        ),
+        {
+            "id": run_id,
+            "ws": workspace_id,
+            "actor": actor_id,
+            "owner": owner_id,
+            "task_type": task_type,
+            "now": now,
+        },
+    )
+    connection.execute(
+        text(
+            """
+            INSERT INTO ai_run_steps (
+                id, workspace_id, run_id, sequence, kind, status, trace, created_at,
+                owner_id, visibility
+            ) VALUES (
+                :id, :ws, :run, 1, 'tool_call', 'succeeded',
+                '{"tool": "email.get_thread_content", "outcome": "ok"}'::jsonb,
+                :now, :owner, 'private'
+            )
+            """
+        ),
+        {"id": step_id, "ws": workspace_id, "run": run_id, "owner": owner_id, "now": now},
+    )
+    return run_id, step_id
+
+
+def test_disable_domain_redacts_email_ai_runs_and_steps_keeping_the_skeleton(
+    gmail_revocation_context: dict,
+) -> None:
+    """DS2: withdrawing consent nulls the content of the mailbox owner's
+    `email.detect_action` runs and their steps (output, evidence, input_ref,
+    trace) but keeps the rows and their audit skeleton. Scoped by the run's
+    actor: another member's email run, and the owner's runs of other task
+    types, are untouched; an email run the owner acted on but that was since
+    moved to another owner is still redacted."""
+    ctx = gmail_revocation_context
+    workspace_id, owner_id, now = ctx["workspace_id"], ctx["owner_id"], ctx["now"]
+    other_id = uuid4()
+    other_email = f"other-member-{uuid4()}@example.test"
+    ctx["extra_owner_emails"].append(other_email)
+    with engine.begin() as connection:
+        create_identity(
+            connection, workspace_id=workspace_id, user_id=other_id, email=other_email, now=now
+        )
+        mine = _insert_ai_run_with_content(
+            connection,
+            workspace_id=workspace_id,
+            actor_id=owner_id,
+            owner_id=owner_id,
+            task_type="email.detect_action",
+            now=now,
+        )
+        moved = _insert_ai_run_with_content(
+            connection,
+            workspace_id=workspace_id,
+            actor_id=owner_id,
+            owner_id=other_id,
+            task_type="email.detect_action",
+            now=now,
+        )
+        others = _insert_ai_run_with_content(
+            connection,
+            workspace_id=workspace_id,
+            actor_id=other_id,
+            owner_id=other_id,
+            task_type="email.detect_action",
+            now=now,
+        )
+        not_email = _insert_ai_run_with_content(
+            connection,
+            workspace_id=workspace_id,
+            actor_id=owner_id,
+            owner_id=owner_id,
+            task_type="attention.explain_item",
+            now=now,
+        )
+    _seed_full_cascade_fixture(ctx)
+
+    resp = ctx["client"].post(
+        "/api/v1/personal/domains/email/disable",
+        headers=_headers(ctx["token"], str(uuid4())),
+    )
+    assert resp.status_code == 200, resp.text
+
+    def _run(run_id: UUID) -> Any:
+        with engine.begin() as connection:
+            return connection.execute(
+                text(
+                    "SELECT output, evidence, input_ref, status, task_type, model_id, "
+                    "prompt_tokens, output_tokens FROM ai_runs WHERE id = :id"
+                ),
+                {"id": run_id},
+            ).one()
+
+    def _trace(step_id: UUID) -> Any:
+        with engine.begin() as connection:
+            return connection.execute(
+                text("SELECT trace FROM ai_run_steps WHERE id = :id"), {"id": step_id}
+            ).scalar_one()
+
+    for run_id, step_id in (mine, moved):
+        row = _run(run_id)
+        assert row.output is None and row.evidence == [] and row.input_ref == {}
+        assert (row.status, row.task_type, row.model_id) == (
+            "completed",
+            "email.detect_action",
+            "m",
+        )
+        assert (row.prompt_tokens, row.output_tokens) == (11, 7)
+        assert _trace(step_id) == {}
+    for run_id, step_id in (others, not_email):
+        row = _run(run_id)
+        assert row.output == {"summary": "quotes the email"}
+        assert row.evidence == ["gmail:abc"] and row.input_ref == {"thread": "t-1"}
+        assert _trace(step_id) == {"tool": "email.get_thread_content", "outcome": "ok"}
+    assert _row_count("ai_runs", workspace_id) == 4
+    assert _row_count("ai_run_steps", workspace_id) == 4
 
 
 def test_disable_domain_does_not_delete_pkos_node(gmail_revocation_context: dict) -> None:
