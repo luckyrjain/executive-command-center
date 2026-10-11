@@ -2,7 +2,7 @@
 id: PHASE-010-IMPLEMENTATION-STATUS
 title: Phase 10 Implementation Status
 status: Active
-version: 0.27.0
+version: 0.28.0
 owner: Lucky Jain
 updated: 2026-10-11
 ---
@@ -29,7 +29,7 @@ Design pass, Task 1, Task 2, Task 3, Task 4, Task 5, Task 6, Task 7 and Task 8 d
 
 **Spec:** "System Design Spec A -- Connector ownership & personal-data isolation remediation", **version 5.2.1 (2026-10-01)**. It is not in this repository; it is kept in the owner's spec workspace as `ecc-spec-a/SECURITY_REMEDIATION_SPEC.md`. Version 5.2 (patch 5.2.1) records the amendments from implementation (A1-A6 and B1-B16 in its changelog). Ask the owner for the current copy before relying on a section number.
 
-**Status: code delivered except the frontend (T17) and flag removal (T20); rollout not started.** Delivered on `main`:
+**Status: code delivered except flag removal (T20); rollout not started.** Delivered on `main`:
 
 | Plan task | PR | What |
 |---|---|---|
@@ -60,6 +60,8 @@ Design pass, Task 1, Task 2, Task 3, Task 4, Task 5, Task 6, Task 7 and Task 8 d
 | FX3 | #310 | Email-derived tasks/commitments/risks treated as personal data (migration 0083) |
 | FX6 | #311 | Truthful Gmail revoke results |
 | FX2 | #312 | Backfill of email-derived rows, exact restore (migration 0084), rebuild guard |
+| T17 | #353 | Frontend: plain-language messages for the new codes, personal providers hidden from engineering views |
+| T19 | #354 | Docs, rollout runbook, alert rules |
 
 Later PRs (outside the Spec A plan) whose behaviour these docs also describe:
 
@@ -73,8 +75,13 @@ Later PRs (outside the Spec A plan) whose behaviour these docs also describe:
 | #340 | Engineering and personal-data writes serialized against removal and role change; the Gmail callback refuses a caller demoted mid-flight (`403 INSUFFICIENT_ROLE`, refusal reason `insufficient_role`) |
 | #345 | `email_action_detected` confirm re-checks the consent owner: `409 RECOMMENDATION_OWNER_CHANGED` after a concurrent ownership transfer |
 | #346 | A busy membership change is retried once, then explained to the caller |
+| #355 | Spec A counters are pre-initialised at 0 at startup |
 | #396 | Meeting-pack reads drop stored rows the caller can no longer read and withhold the stored AI summary (closes FX1 #308 M1) |
+| #397 | The meeting-prep page explains a summary withheld because its sources changed, instead of saying AI is disabled |
+| #398 | The meeting-prep page explains a generate/refresh refused for the reader's access |
 | #399 | `meeting.prep_summary` AI runs and their steps are written private to their actor, so a summary quoting a row narrowed later is not served to other members through `GET /api/v1/ai/runs/{id}` |
+| #400 | Dependency fix: patched `tinypool` and `source-map-js` pinned through pnpm overrides (critical/high advisories) |
+| #401 | Tests: flag-off evidence-gap narrowing, and the frontend/backend `PERSONAL_PROVIDERS` contract |
 | #402 | With the flag on, a member's own prep-summary AI runs and steps no longer block their removal (retained, private to them) |
 | #403 | Withdrawing email consent redacts the owner's `email.detect_action` AI runs and steps in place (DS2) |
 
