@@ -125,7 +125,11 @@ PERSONAL_ROW_PREDICATES: Final[Mapping[str, str]] = MappingProxyType(
 
 # Actor-private AI runs and their steps (`ACTOR_PRIVATE_TASK_TYPES`): with
 # the flag on they are retained with the member who ran them and do not block
-# that member's removal (like an email run). Otherwise removal needs every
+# that member's removal (like an email run) -- but only while the row really is
+# `private`: one still `workspace`-visible (e.g. written by a pre-FX10 process
+# during a rolling deploy) or shared (live grants) would stay readable under a
+# removed owner, so it keeps blocking until it is narrowed or the grants are
+# revoked. Otherwise removal needs every
 # run and step transferred one by one, no API lists them, and a transfer
 # hands the new owner a summary quoting rows they may not be able to read.
 # Consumed only by `authz.owned_resource_summary`, bound with
@@ -133,11 +137,15 @@ PERSONAL_ROW_PREDICATES: Final[Mapping[str, str]] = MappingProxyType(
 # `PERSONAL_ROW_PREDICATES`.
 ACTOR_PRIVATE_ROW_PREDICATES: Final[Mapping[str, str]] = MappingProxyType(
     {
-        "ai_runs": "ai_runs.task_type = ANY(:actor_private_task_types)",
+        "ai_runs": (
+            "ai_runs.task_type = ANY(:actor_private_task_types) AND ai_runs.visibility = 'private'"
+        ),
         "ai_run_steps": (
-            "EXISTS (SELECT 1 FROM ai_runs r WHERE r.id = ai_run_steps.run_id "
+            "ai_run_steps.visibility = 'private' "
+            "AND EXISTS (SELECT 1 FROM ai_runs r WHERE r.id = ai_run_steps.run_id "
             "AND r.workspace_id = ai_run_steps.workspace_id "
-            "AND r.task_type = ANY(:actor_private_task_types))"
+            "AND r.task_type = ANY(:actor_private_task_types) "
+            "AND r.visibility = 'private')"
         ),
     }
 )

@@ -1455,6 +1455,37 @@ def test_prep_summary_runs_block_removal_only_without_isolation(
         assert "ai_runs" not in owned and "ai_run_steps" not in owned, owned
     else:
         assert owned.get("ai_runs") == 1 and owned.get("ai_run_steps", 0) >= 1, owned
+    # Control: a run that is not (or no longer) private keeps blocking -- it is
+    # still readable (workspace) or has live grants (shared) under a removed owner.
+    if flag_on:
+        for visibility in ("workspace", "shared_explicitly"):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE ai_runs SET visibility = :v "
+                        "WHERE workspace_id = :w AND task_type = 'meeting.prep_summary'"
+                    ),
+                    {"v": visibility, "w": world.workspace_id},
+                )
+            assert _owned_types(world, world.b.user_id, isolation=True).get("ai_runs") == 1
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE ai_runs SET visibility = 'private' "
+                    "WHERE workspace_id = :w AND task_type = 'meeting.prep_summary'"
+                ),
+                {"w": world.workspace_id},
+            )
+            connection.execute(
+                text("UPDATE ai_run_steps SET visibility = 'workspace' WHERE workspace_id = :w"),
+                {"w": world.workspace_id},
+            )
+        assert _owned_types(world, world.b.user_id, isolation=True).get("ai_run_steps", 0) >= 1
+        with engine.begin() as connection:
+            connection.execute(
+                text("UPDATE ai_run_steps SET visibility = 'private' WHERE workspace_id = :w"),
+                {"w": world.workspace_id},
+            )
     # Control, either way: a run of another task type (and so its steps) blocks.
     with engine.begin() as connection:
         connection.execute(
