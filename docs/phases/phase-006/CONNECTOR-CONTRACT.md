@@ -2,9 +2,9 @@
 id: PHASE-006-CONNECTOR
 title: Engineering Connector Contract
 status: Approved for Implementation
-version: 0.16.0
+version: 0.16.1
 owner: Lucky Jain
-updated: 2026-10-01
+updated: 2026-10-11
 ---
 
 # Engineering Connector Contract
@@ -180,7 +180,7 @@ No sync/adapter code path ever writes the confirmed `team_entity_id` column itse
 
 `gmail` is the one *personal* provider (`ecc.platform.connector_security.PERSONAL_PROVIDERS`): its connector row belongs to the member whose mailbox it reads, unlike a workspace engineering connector. The rules below hold for every connector endpoint and adapter. HTTP codes are listed in `docs/phases/phase-010/API-SCHEMAS.md` ("Security remediation (Spec A)"); the rollout is `docs/runbooks/SPEC-A-ROLLOUT.md`.
 
-- **Owner-only personal connectors** (`ECC_PERSONAL_DATA_ISOLATION`). A personal connector, its `sync_runs` and its `sync_cursors` are written `visibility='private'` with the mailbox owner as owner. Rows written before the flag are brought to that state by `scripts/backfill_personal_visibility.py`. Authz then hides them from every other member, including workspace owners and admins. As a second layer, `sync` and `disable` by a non-owner return `404 CONNECTOR_NOT_FOUND` and count `ecc_connector_access_denied_total{provider,route}`. Personal connector rows cannot be granted, previewed, transferred or delegated (`400 RESOURCE_TYPE_NOT_GRANTABLE`). The engineering views (health, coverage, overview) are to exclude personal providers unconditionally, not behind the flag (frontend plan task T17, not yet merged); Gmail is managed in `GmailPanel`.
+- **Owner-only personal connectors** (`ECC_PERSONAL_DATA_ISOLATION`). A personal connector, its `sync_runs` and its `sync_cursors` are written `visibility='private'` with the mailbox owner as owner. Rows written before the flag are brought to that state by `scripts/backfill_personal_visibility.py`. Authz then hides them from every other member, including workspace owners and admins. As a second layer, `sync` and `disable` by a non-owner return `404 CONNECTOR_NOT_FOUND` and count `ecc_connector_access_denied_total{provider,route}`. Personal connector rows cannot be granted, previewed, transferred or delegated (`400 RESOURCE_TYPE_NOT_GRANTABLE`). The engineering views (health, coverage, overview) are to exclude personal providers unconditionally, not behind the flag (frontend plan task T17, #353); Gmail is managed in `GmailPanel`.
 - **One owner per mailbox** (unflagged). An OAuth reconnect that hits another member's row for the same `(workspace, provider, external_account_id)` is refused with `409 CONNECTOR_OWNED_BY_ANOTHER_MEMBER`, whatever that row's status. It is never returned, reactivated or overwritten. With `ECC_GMAIL_REQUIRE_IDENTITY_MATCH` on, the Google account's email must equal the member's own ECC email (`403 GMAIL_ACCOUNT_IDENTITY_MISMATCH`).
 - **Reactivation authz** (unflagged). `POST /engineering/connectors` that would reactivate an existing `disconnected` row requires `read` on it (else `404 CONNECTOR_NOT_FOUND`) and `write` (else `403 INSUFFICIENT_ROLE`). The refusal is audited as `connector_account.enrollment_refused`. A `workspace`-visible engineering connector still grants write to every member, so any member may reactivate it with their own credentials (decision C15-a).
 - **Integrity errors** (unflagged). Only the duplicate-account unique violation (`uq_connector_accounts_workspace_provider_external_id`) is treated as "already exists". Any other `IntegrityError` on connector create, in the engineering endpoint or the Gmail callback, is `500 CONNECTOR_ACCOUNT_PERSIST_FAILED`, and only its SQLSTATE and constraint name are logged.
@@ -192,4 +192,5 @@ No sync/adapter code path ever writes the confirmed `team_entity_id` column itse
 | Version | Date | Summary | Author |
 |---|---|---|---|
 | 0.16.0 | 2026-10-01 | Security Remediation Spec A (T19): personal connectors owner-only behind `ECC_PERSONAL_DATA_ISOLATION`, one owner per mailbox (`409 CONNECTOR_OWNED_BY_ANOTHER_MEMBER`), reactivation authz (`404`/`403`), removal disconnect (flag on only), non-unique integrity errors -> `500 CONNECTOR_ACCOUNT_PERSIST_FAILED`, `revoke_is_safe` scopes, membership-lock re-checks | Lucky Jain |
+| 0.16.1 | 2026-10-11 | The engineering views' unconditional exclusion of personal providers is merged (T17, #353), not pending | Lucky Jain |
 | 0.15.0 | 2026-09-29 | Security Remediation FX6: `disconnect()` raises when a provider grant may still be live (Gmail `GmailRevokeFailed`), so `ecc_connector_revoke_total{result="error"}` is truthful; no-op adapters unchanged | Lucky Jain |

@@ -2,7 +2,7 @@
 id: SPEC-A-ROLLOUT
 title: Security Remediation Spec A Rollout Runbook
 status: Active
-version: 1.8.0
+version: 1.9.0
 owner: Lucky Jain
 created: 2026-10-01
 updated: 2026-10-11
@@ -17,16 +17,16 @@ This is the operator sequence for turning on connector ownership and personal-da
 
 It is a separate runbook rather than a section of [`PHASE-10-GMAIL-RECOVERY.md`](PHASE-10-GMAIL-RECOVERY.md) for two reasons. That runbook covers ongoing Gmail operations; this one is a one-time, ordered rollout that also touches member removal, sharing, search, meeting prep and the knowledge projections. And this one closes when the flags are removed (plan task T20), while the Gmail runbook stays. Detailed procedures that already exist are linked, not copied: the backfill, its reasons, the restore and the rebuild are in [`docs/SETUP.md`](../SETUP.md) and [`PHASE-2-DEPLOYMENT.md`](PHASE-2-DEPLOYMENT.md), and the remediation command documents itself (`scripts/remediate_connector_ownership.py`).
 
-## Where things stand (2026-10-01)
+## Where things stand (2026-10-11)
 
-- On `main`: every Spec A code task except the frontend (T17) and flag removal (T20), plus fix wave FX1–FX6 (PRs #282–#312). The three settings default to their safe values, so deploying `main` changes nothing that is flag-gated.
+- On `main`: every Spec A task except flag removal (T20). That includes the frontend (T17, #353) and these docs (T19, #354), fix waves FX1–FX6 (PRs #282–#312), and the follow-ups #396–#403 (meeting-pack read-time visibility, prep-summary AI runs private to their actor and not blocking removal, the consent cascade redacting email AI runs, and test and dependency fixes). The three settings default to their safe values, so deploying `main` changes nothing that is flag-gated. For the review packet to hand to the people who sign off, see [`SPEC-A-READINESS.md`](SPEC-A-READINESS.md).
 - **Unflagged changes are live as soon as `main` is deployed.** Callers and the frontend see them before any flag is on:
   - new error codes: 409 `CONNECTOR_OWNED_BY_ANOTHER_MEMBER`, 403 `MEMBERSHIP_INACTIVE`, 500 `CONNECTOR_ACCOUNT_PERSIST_FAILED`, 404/403 on engineering reactivation, 422 on `POST /recommendations` for `email_action_detected`, 403 `EMAIL_CONSENT_NOT_ACTIVE` on Gmail sync and email confirm;
   - search filtered by visibility;
   - meeting packs that store only workspace-visible sources;
   - revokes guarded and truthfully counted.
   
-  See [`../phases/phase-010/API-SCHEMAS.md`](../phases/phase-010/API-SCHEMAS.md#security-remediation-spec-a). Until T17 ships, the Gmail panel shows some of these codes raw.
+  See [`../phases/phase-010/API-SCHEMAS.md`](../phases/phase-010/API-SCHEMAS.md#security-remediation-spec-a). The Gmail panel maps these codes to plain messages (T17).
 - Sign-offs: only **A2** is signed (see [Sign-off checklist](#sign-off-checklist)). R5 cannot start until the rest are.
 
 ## Flags and processes
@@ -154,7 +154,8 @@ Exit 0 means nothing was found; exit 1 means rows were found (checks A–E, CSV 
 
 - [ ] R4 gate met; migrations 0083/0084 applied (R1); alert rules live.
 - [ ] **Database backup.** Take a full backup immediately before R5 (`make backup`, `docs/operations/PHASE-0-BACKUP-RESTORE.md`), verify it (`make verify-restore BACKUP=<file>`), and record its name in the change record. The backfill log and the snapshot tables below make the R5 changes reversible row by row; the backup covers anything they do not (the grants the backfill revokes, a mistaken manual statement).
-- [ ] **`<fx1_deploy_time>`** in every statement below is the moment the FX1 build (PR #308) went live, written with an explicit UTC offset, for example `'2026-09-29T14:00:00+00:00'`. **`<fx10_deploy_time>`** (the AI-run statements only) is the moment the FX10 build (#399, prep-summary runs private to their actor) went live, written the same way; every `meeting.prep_summary` run since then is already private. Run these statements only once the FX10 build is live (see the deploy check below). The block also sets `SET LOCAL TimeZone = 'UTC'`, so the recorded `cleanup_ts` prints in UTC; a literal without an offset would otherwise be read in the session's time zone.
+- [ ] **`<fx1_deploy_time>`** in every statement below is the moment the FX1 build (PR #308) went live, written with an explicit UTC offset, for example `'2026-09-29T14:00:00+00:00'`. **`<fx10_deploy_time>`** (the AI-run statements only) is the moment the FX10 build (#399, prep-summary runs private to their actor) went live, written the same way; every `meeting.prep_summary` run since then is already private. Run these statements only once the FX10 build is live (see the deploy check in the next item). The block also sets `SET LOCAL TimeZone = 'UTC'`, so the recorded `cleanup_ts` prints in UTC; a literal without an offset would otherwise be read in the session's time zone.
+- [ ] **FX7 (#396), FX10 (#399) and the DS2 cascade build (#403) deployed (closes FX1 #308 M1). Confirm this before running any statement below.** A row narrowed after its pack was generated (by a grant narrowing, a delegation, or the backfill making a row private) is dropped from every read by members who can no longer read it, and the pack's stored AI summary is withheld from them. Confirm the FX7 build, the FX10 build (prep-summary AI runs private to their actor) and the DS2 build (#403, the consent cascade redacting email AI runs) are live before R5; the DS2 one-off below is only complete if members who withdraw afterwards are redacted by the cascade. The stored pack content still holds the row until refresh, so database access to `meeting_packs` stays restricted as before.
 - [ ] **Snapshot before the FX1 clean-up.** The two statements below change rows that no log records, so first copy what they will change into snapshot tables (ids, owners, visibility, status only; no content). The snapshot block below, the pack archive (if you archive rather than refresh) and the AI-run narrowing form **one transaction** in one `psql` session: the block opens it with `BEGIN` and the narrowing ends it with `COMMIT`. If you refresh packs through the API instead, do that after the `COMMIT`; the snapshot still lists which packs to refresh.
 
   ```sql
@@ -294,13 +295,40 @@ Exit 0 means nothing was found; exit 1 means rows were found (checks A–E, CSV 
   COMMIT;
   ```
 
-- [ ] **DS2 one-off: redact email AI content for members who already withdrew consent.** The consent cascade now redacts a member's `email.detect_action` AI runs and steps, deletes the sync site's cached replay records (`email-detect-action:*` idempotency keys) and nulls `proposed_fields` on their executed recommendations (DS2, decided 2026-10-11). Members who withdrew before this deploy still hold that content. Run this once after the DS2 build is live, in a quiet period. It covers every member whose `email` domain is not enabled, and it is irreversible by design (redaction), so there is no snapshot. A member who withdrew and later re-enabled email is not covered; their earlier content is redacted at their next withdrawal. Record the `members_covered` count:
+- [ ] **DS2 one-off: redact email AI content for members who already withdrew consent.** The consent cascade now redacts a member's `email.detect_action` AI runs and steps, deletes the sync site's cached replay records (`email-detect-action:*` idempotency keys) and nulls `proposed_fields` on their executed recommendations (DS2, decided 2026-10-11). Members who withdrew before this deploy still hold that content. Run this once after the DS2 build is live, in a quiet period. It covers every member whose `email` domain is not enabled, and it is irreversible by design (redaction), so there is no snapshot. A member who withdrew and later re-enabled email is not covered; their earlier content is redacted at their next withdrawal. Record the `members_in_scope` count: it is every member who has an `email.detect_action` run and whose email domain is off, including members already redacted, so a re-run returns the same number. A member who re-enables email while this runs may have their new runs redacted; that is bounded loss, not a leak, so run it in a quiet period. `lock_timeout` only bounds waiting for locks, not the run time on a large `ai_runs` table; a lock timeout is safe to retry:
 
   ```sql
-
+  \set ON_ERROR_STOP on
+  BEGIN;
+  SET LOCAL lock_timeout = '5s';
+  -- "Withdrew" = the member's email domain is not enabled.
+  CREATE TEMP TABLE ds2_actors ON COMMIT DROP AS
+    SELECT DISTINCT r.workspace_id, r.actor_id FROM ai_runs r
+    WHERE r.task_type = 'email.detect_action'
+      AND NOT EXISTS (SELECT 1 FROM personal_domains d
+                      WHERE d.workspace_id = r.workspace_id AND d.owner_id = r.actor_id
+                        AND d.domain_key = 'email' AND d.enabled);
+  UPDATE ai_run_steps st SET trace = '{}'::jsonb
+  FROM ai_runs r JOIN ds2_actors a ON a.workspace_id = r.workspace_id AND a.actor_id = r.actor_id
+  WHERE r.task_type = 'email.detect_action' AND r.id = st.run_id
+    AND r.workspace_id = st.workspace_id AND st.trace <> '{}'::jsonb;
+  UPDATE ai_runs r SET output = NULL, evidence = '[]'::jsonb, input_ref = '{}'::jsonb, updated_at = now()
+  FROM ds2_actors a
+  WHERE a.workspace_id = r.workspace_id AND a.actor_id = r.actor_id
+    AND r.task_type = 'email.detect_action'
+    AND (r.output IS NOT NULL OR r.evidence <> '[]'::jsonb OR r.input_ref <> '{}'::jsonb);
+  DELETE FROM idempotency_records i USING ds2_actors a
+  WHERE i.workspace_id = a.workspace_id AND i.actor_id = a.actor_id
+    AND i.key LIKE 'email-detect-action:%';
+  UPDATE recommendations rec SET proposed_fields = NULL
+  FROM ds2_actors a
+  WHERE rec.workspace_id = a.workspace_id AND rec.owner_id = a.actor_id
+    AND rec.recommendation_type = 'email_action_detected' AND rec.status = 'executed'
+    AND rec.proposed_fields IS NOT NULL;
+  SELECT count(*) AS members_in_scope FROM ds2_actors;
+  COMMIT;
   ```
 
-- [ ] **FX7 (#396) deployed (closes FX1 #308 M1).** A row narrowed after its pack was generated (by a grant narrowing, a delegation, or the backfill making a row private) is dropped from every read by members who can no longer read it, and the pack's stored AI summary is withheld from them. Confirm the FX7 build, and the FX10 build (prep-summary AI runs private to their actor), are live before R5. The stored pack content still holds the row until refresh, so database access to `meeting_packs` stays restricted as before.
 
 ### Order
 
@@ -342,7 +370,7 @@ What the restore does **not** undo:
 
 ## R6: identity binding
 
-1. Deploy T17 (frontend codes) and this documentation (T19). T08 is already on `main`.
+1. T17 (frontend codes), T19 (this documentation) and T08 are already on `main`; deploy `main` if the build from R1 predates them.
 2. Set `ECC_GMAIL_REQUIRE_IDENTITY_MATCH=true` and restart every process.
 3. Verify: a connect whose Google email differs from the member's ECC email returns 403 `GMAIL_ACCOUNT_IDENTITY_MISMATCH`, and no row is written. On the process that served the request, `/metrics` showed `ecc_connector_enrollment_refused_total{provider="gmail",reason="identity_mismatch"} 0.0` before the test and now shows `1.0`; `EccGmailIdentityMismatchRefused` fires within a scrape and evaluation interval and stays firing for a day (its `increase()` window). A matching connect succeeds.
 4. Rollback: flag off and restart. Nothing else changed.
@@ -405,6 +433,7 @@ Decided 2026-10-11, not a sign-off: owners may not share their **own** email-der
 
 | Version | Date | Summary | Author |
 |---|---|---|---|
+| 1.9.0 | 2026-10-11 | "Where things stand" brought up to date (T17, T19 and #396–#403 are on `main`); links the new readiness packet `SPEC-A-READINESS.md`; **the DS2 one-off SQL block, which #403 merged empty, is filled in**; the FX7/FX10 deploy check now comes before the statements that depend on it; R6 no longer says to deploy T17 and T19; the DS2 one-off now also waits for the DS2 build (#403), its count is relabelled `members_in_scope`, and its limits (quiet period, lock timeout) are stated | Lucky Jain |
 | 1.8.0 | 2026-10-11 | DS2 decided: the consent cascade redacts `email.detect_action` AI runs and steps in place (limitation and DS2 wording updated); R5 gains a one-off redaction for members who already withdrew; the cascade also deletes the `email-detect-action:*` idempotency records and nulls `proposed_fields` on executed recommendations; the owner-sharing question is decided (keep refusing) | Lucky Jain |
 | 1.7.0 | 2026-10-11 | With the flag on, a member's prep-summary AI runs and steps no longer block their removal (retained, private to them) | Lucky Jain |
 | 1.6.0 | 2026-10-10 | FX10: `meeting.prep_summary` AI runs are written private to their actor; the R5 AI-run narrowing covers every run before the FX10 deploy (`<fx10_deploy_time>`), replacing the post-backfill repeat; limitation updated | Lucky Jain |
