@@ -113,8 +113,10 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext
 from ecc.platform.connector_security import (
+    ACTOR_PRIVATE_ROW_PREDICATES,
     PERSONAL_DERIVED_PREDICATES,
     PERSONAL_ROW_PREDICATES,
+    actor_private_sql_params,
     lock_membership_shared,
     personal_data_isolation_enabled,
     personal_sql_params,
@@ -417,6 +419,13 @@ def _owned_count_sql(resource_type: str, *, exclude_personal_data: bool) -> str:
     not_blocking = (
         _PERSONAL_ROWS_NOT_BLOCKING_REMOVAL.get(resource_type) if exclude_personal_data else None
     )
+    actor_private = (
+        ACTOR_PRIVATE_ROW_PREDICATES.get(resource_type) if exclude_personal_data else None
+    )
+    if actor_private:
+        # Retained with the member who ran them (`ACTOR_PRIVATE_ROW_
+        # PREDICATES`); OR-ed with the personal rule the same table has.
+        not_blocking = f"({not_blocking}) OR ({actor_private})" if not_blocking else actor_private
     if not not_blocking:
         extra = ""
     elif resource_type in PERSONAL_DERIVED_PREDICATES:
@@ -469,7 +478,8 @@ def owned_resource_summary(
 
     `exclude_personal_data=True` (the caller passes `ECC_PERSONAL_DATA_
     ISOLATION`) additionally skips `_PERSONAL_ROWS_NOT_BLOCKING_REMOVAL`'s
-    rows. `COALESCE(..., false)`: a NULL predicate (e.g. a NULL
+    rows and `ACTOR_PRIVATE_ROW_PREDICATES`' (a member's own prep-summary AI
+    runs and steps, retained with them). `COALESCE(..., false)`: a NULL predicate (e.g. a NULL
     `task_type`) counts the row as blocking -- never silently unblocks.
 
     Read-only -- see `current_role`'s own docstring for why this never
@@ -480,6 +490,7 @@ def owned_resource_summary(
     params: dict[str, object] = {"workspace_id": workspace_id, "users_id": users_id}
     if exclude_personal_data:
         params.update(personal_sql_params())
+        params.update(actor_private_sql_params())
     for resource_type in sorted(_RESOURCE_TABLES - excluded):
         count = session.execute(
             text(_owned_count_sql(resource_type, exclude_personal_data=exclude_personal_data)),

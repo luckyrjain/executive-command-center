@@ -58,6 +58,7 @@ from ecc.observability import (
 from ecc.platform import audit_outbox, authz
 from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
 from ecc.platform.connector_security import (
+    ACTOR_PRIVATE_TASK_TYPES,
     EMAIL_TASK_TYPES,
     PersonalRowScope,
     personal_content_scope,
@@ -134,17 +135,6 @@ AiRunErrorCode = Literal[
 # Task ports -- THE allowlist. Application code, not a prompt-render-time
 # concept and not database-configurable (Decision 6).
 # ---------------------------------------------------------------------------
-
-
-# Task types whose run (and its steps) is private to its actor, with or
-# without ECC_PERSONAL_DATA_ISOLATION. A `meeting.prep_summary` run's
-# output is copied into a shared meeting pack, whose reads drop rows the
-# reader can no longer read and then withhold that summary (FX7); the run
-# row cannot do that, so leaving it `workspace`-visible kept serving a
-# summary (and tool output with full row text) quoting a row narrowed
-# after the run to every member through `GET /ai/runs/{id}`. Private to the
-# actor, like the R5 clean-up already makes every earlier one.
-ACTOR_PRIVATE_TASK_TYPES: frozenset[str] = frozenset({"meeting.prep_summary"})
 
 
 @dataclass(frozen=True, slots=True)

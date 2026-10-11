@@ -85,7 +85,7 @@ def get_prep_pack_tool(
     # enrichment` stores the summary in the pack every meeting reader gets.
     # Giving it the caller's private rows would copy them into that shared
     # pack (FX1). The run row itself is private to its actor
-    # (`runtime.ACTOR_PRIVATE_TASK_TYPES`), but its summary still reaches
+    # (`connector_security.ACTOR_PRIVATE_TASK_TYPES`), but its summary still reaches
     # every reader through the pack. A per-member AI view would need its own
     # run type, not this tool.
     #

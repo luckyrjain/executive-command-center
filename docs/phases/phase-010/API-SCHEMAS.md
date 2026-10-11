@@ -2,9 +2,9 @@
 id: PHASE-010-API-SCHEMAS
 title: Phase 10 Gmail API Schemas
 status: Approved for Implementation
-version: 1.8.0
+version: 1.9.0
 owner: Lucky Jain
-updated: 2026-10-10
+updated: 2026-10-11
 depends_on:
   - PHASE-010
   - PHASE-006-API-SCHEMAS
@@ -320,7 +320,7 @@ deployed.
 | `GET /api/v1/engineering/connectors`, `GET /sync-runs`, effective permissions | Flag: other members' Gmail connectors, runs and cursors are hidden (private to the owner) |
 | `POST .../connectors/{id}/sync`, `.../disable` | Flag: `404 CONNECTOR_NOT_FOUND` for a non-owner of a Gmail connector (see above). Sync, unflagged: `403 MEMBERSHIP_INACTIVE`, `403 EMAIL_CONSENT_NOT_ACTIVE` (see "Sync skips") |
 | `POST /api/v1/sharing/grants`, grant preview, `POST /api/v1/ownership/transfers`, `POST /api/v1/delegations` | Flag: `400 RESOURCE_TYPE_NOT_GRANTABLE` for a personal row (a Gmail connector, its sync runs/cursors, an email attention item, an `email_action_detected` recommendation, an `email.*` AI run or step, Gmail evidence) or an email-derived row (a task/commitment/risk created by confirming an `email_action_detected` recommendation, feedback on an email recommendation or email attention item). Each refusal writes a `denied` `personal_data.share_refused` audit event and counts `ecc_personal_data_share_refused_total{resource_type,path}`. Delegation accept skips such items. The refusal applies to the row's own owner too |
-| `DELETE /api/v1/identity/workspaces/{id}/members/{user_id}` | Flag: personal and email-derived rows no longer block removal (no `409 OWNED_RESOURCES_BLOCK_REMOVAL` for them). Removal disconnects the member's Gmail connectors (revoked at Google if safe), re-owns their Gmail-only person nodes and those nodes' Gmail-derived aliases to the earliest other active workspace owner, and keeps their other Gmail-derived rows, private to them (not purged) |
+| `DELETE /api/v1/identity/workspaces/{id}/members/{user_id}` | Flag: personal and email-derived rows, and the member's own `meeting.prep_summary` AI runs and their steps, no longer block removal (no `409 OWNED_RESOURCES_BLOCK_REMOVAL` for them); without the flag they still block. Removal disconnects the member's Gmail connectors (revoked at Google if safe), re-owns their Gmail-only person nodes and those nodes' Gmail-derived aliases to the earliest other active workspace owner, and keeps their other Gmail-derived rows, and their prep-summary AI runs, private to them (not purged) |
 | `POST /api/v1/recommendations` | Unflagged: `422 VALIDATION_ERROR` for `recommendation_type="email_action_detected"` (reserved for the detection hook; `docs/phases/phase-001/API-SCHEMAS.md`) |
 | `POST /api/v1/recommendations/{id}/confirm` (`email_action_detected`) | Unflagged: `403 EMAIL_CONSENT_NOT_ACTIVE`, `409 RECOMMENDATION_OWNER_CHANGED`. Flag: the created task/commitment/risk is owned by the recommendation's owner and `private` |
 | Recommendations, AI runs, evidence (list, detail, resolve, delete) | Flag: email recommendations, `email.*` AI runs and their steps, and Gmail evidence are visible only to the mailbox owner (`404` to others) |
@@ -361,3 +361,4 @@ is now closed out.
 | 1.6.0 | 2026-09-28 | Security Remediation FX5: documented the sync endpoint's `403 MEMBERSHIP_INACTIVE` and `403 EMAIL_CONSENT_NOT_ACTIVE` skips (run closed `failed`, cursor not advanced, no outcome/audit writes), replacing the previous `201` failed/partial/succeeded outcomes | Lucky Jain |
 | 1.7.0 | 2026-10-01 | Security Remediation Spec A (T19; review fix: only the four refusals write `enrollment_refused`, not `CONNECTOR_ACCOUNT_PERSIST_FAILED` / `GMAIL_ACCOUNT_ALREADY_CONNECTED`): documented the callback refusals (`GMAIL_ACCOUNT_IDENTITY_MISMATCH`, `CONNECTOR_OWNED_BY_ANOTHER_MEMBER`, `MEMBERSHIP_INACTIVE`, `INSUFFICIENT_ROLE`, `CONNECTOR_ACCOUNT_PERSIST_FAILED`), engineering reactivation `404`/`403`, the non-owner Gmail `sync`/`disable` `404` (was `409` for `disable`), and a Spec A summary table across sharing, removal, recommendations, readers, search and meeting prep | Lucky Jain |
 | 1.8.0 | 2026-10-10 | Spec A table: meeting-prep reads drop rows the caller can no longer read and withhold the summary (FX7); `meeting.prep_summary` AI runs are private to their actor (FX10) | Lucky Jain |
+| 1.9.0 | 2026-10-11 | Member removal (flag on): the member's prep-summary AI runs and steps are retained private to them and no longer block removal | Lucky Jain |
